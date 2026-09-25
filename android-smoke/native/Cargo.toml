@@ -1,0 +1,15 @@
+[package]
+name = "rivet-android-smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rivet = { package = "rivet-runtime", path = "../..", features = ["udp-offload"] }
+libc = "0.2"
+
+[profile.release]
+panic = "unwind"

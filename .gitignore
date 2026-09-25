@@ -1,0 +1,10 @@
+/target/
+/.gradle/
+/android-smoke/.gradle/
+/android-smoke/build/
+/android-smoke/app/build/
+/android-smoke/native/target/
+/tools/verification/__pycache__/
+/artifacts/
+*.apk
+*.aab

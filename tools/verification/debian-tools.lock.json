@@ -1,0 +1,315 @@
+{
+  "distribution": "Debian 13 (trixie), amd64",
+  "origin": "HTTPS Debian archives; SHA256 values observed in local APT Packages metadata on 2026-09-25",
+  "requirements": [
+    "Existing Debian 13 amd64 base libraries, python3, curl, dpkg-deb, sqv and ca-certificates. No packages are installed."
+  ],
+  "packages": [
+    {
+      "package": "libnss3",
+      "version": "2:3.110-1+deb13u4",
+      "architecture": "amd64",
+      "url": "https://security.debian.org/debian-security/pool/updates/main/n/nss/libnss3_3.110-1%2bdeb13u4_amd64.deb",
+      "bytes": 1394236,
+      "sha256": "8d20d0754039e15e9bd2c8484e98dc9c2982907d4f20834da29a9501913d00b5",
+      "file": "libnss3_3.110-1+deb13u4_amd64.deb"
+    },
+    {
+      "package": "busybox-static",
+      "version": "1:1.37.0-6+b8",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/b/busybox/busybox-static_1.37.0-6%2bb8_amd64.deb",
+      "bytes": 955448,
+      "sha256": "73efc773b070ea220c5d7cb2d12206ec235c46b03a9ad133d1f6a7ca62201e41",
+      "file": "busybox-static_1.37.0-6+b8_amd64.deb"
+    },
+    {
+      "package": "ipxe-qemu",
+      "version": "1.21.1+git20250501.dad20602+dfsg-1",
+      "architecture": "all",
+      "url": "https://deb.debian.org/debian/pool/main/i/ipxe/ipxe-qemu_1.21.1%2bgit20250501.dad20602%2bdfsg-1_all.deb",
+      "bytes": 1225404,
+      "sha256": "b3b799d90b87ef2d6defa925cd48cf1691a19806f08041733a4f884d4a218b17",
+      "file": "ipxe-qemu_1.21.1+git20250501.dad20602+dfsg-1_all.deb"
+    },
+    {
+      "package": "libaio1t64",
+      "version": "0.3.113-8+b1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/liba/libaio/libaio1t64_0.3.113-8%2bb1_amd64.deb",
+      "bytes": 14888,
+      "sha256": "490c8a2d116001a5f3b0a6d7a7aabf6a7b629366590dc5c3f75b078e931dd129",
+      "file": "libaio1t64_0.3.113-8+b1_amd64.deb"
+    },
+    {
+      "package": "libasound2-data",
+      "version": "1.2.14-1",
+      "architecture": "all",
+      "url": "https://snapshot.debian.org/archive/debian/20250414T210755Z/pool/main/a/alsa-lib/libasound2-data_1.2.14-1_all.deb",
+      "bytes": 21092,
+      "sha256": "fe973f6467a6fc553ead004bd5aebfea4eb45c5da827cd3fb32650d9672ac947",
+      "file": "libasound2-data_1.2.14-1_all.deb"
+    },
+    {
+      "package": "libasound2t64",
+      "version": "1.2.14-1",
+      "architecture": "amd64",
+      "url": "https://snapshot.debian.org/archive/debian/20250414T210755Z/pool/main/a/alsa-lib/libasound2t64_1.2.14-1_amd64.deb",
+      "bytes": 381012,
+      "sha256": "f03a2bd9d234f4e6d283c36520d66befd0952d6f5ba454badd8fae2305ad70a1",
+      "file": "libasound2t64_1.2.14-1_amd64.deb"
+    },
+    {
+      "package": "libbrlapi0.8",
+      "version": "6.7-3.1+deb13u3",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/b/brltty/libbrlapi0.8_6.7-3.1%2bdeb13u3_amd64.deb",
+      "bytes": 92960,
+      "sha256": "d8767805735bfae0edbe793fc8b6f6266ac9e55bec88c3d36b567c41b6438ca2",
+      "file": "libbrlapi0.8_6.7-3.1+deb13u3_amd64.deb"
+    },
+    {
+      "package": "libnspr4",
+      "version": "2:4.36-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/n/nspr/libnspr4_4.36-1_amd64.deb",
+      "bytes": 109800,
+      "sha256": "87fc2039ee89cff2b8010fa9535706b1def40031acfc52bf12197dcb3cb7b064",
+      "file": "libnspr4_4.36-1_amd64.deb"
+    },
+    {
+      "package": "libpcsclite1",
+      "version": "2.3.3-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/p/pcsc-lite/libpcsclite1_2.3.3-1_amd64.deb",
+      "bytes": 55248,
+      "sha256": "a8bc4725549060d1e696d358e32a3699d947d5381871553a290389830bebccbd",
+      "file": "libpcsclite1_2.3.3-1_amd64.deb"
+    },
+    {
+      "package": "libcacard0",
+      "version": "1:2.8.0-3+b2",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libc/libcacard/libcacard0_2.8.0-3%2bb2_amd64.deb",
+      "bytes": 90904,
+      "sha256": "1d6a8d17b893e54dfea8fe78df16c9a8ab4a6e626f9312881784592d480d9317",
+      "file": "libcacard0_2.8.0-3+b2_amd64.deb"
+    },
+    {
+      "package": "libcapstone5",
+      "version": "5.0.7-1~deb13u1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/c/capstone/libcapstone5_5.0.7-1%7edeb13u1_amd64.deb",
+      "bytes": 778216,
+      "sha256": "775187a7be26bb0b076d1979a02163b943dbc13eb4adb0efc503223a03c75422",
+      "file": "libcapstone5_5.0.7-1~deb13u1_amd64.deb"
+    },
+    {
+      "package": "libdaxctl1",
+      "version": "81-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/n/ndctl/libdaxctl1_81-1_amd64.deb",
+      "bytes": 22188,
+      "sha256": "6296eb5c976743ba0defb7a061ef081238ca072cf569c6bb96fd3f9095c58a30",
+      "file": "libdaxctl1_81-1_amd64.deb"
+    },
+    {
+      "package": "libexecs1",
+      "version": "1.4-2+b2",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libe/libexecs/libexecs1_1.4-2%2bb2_amd64.deb",
+      "bytes": 7820,
+      "sha256": "05b578fead365a81141fe834c3b3b6df89d17a050784a237f736489fbd426105",
+      "file": "libexecs1_1.4-2+b2_amd64.deb"
+    },
+    {
+      "package": "libfdt1",
+      "version": "1.7.2-2+b1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/d/device-tree-compiler/libfdt1_1.7.2-2%2bb1_amd64.deb",
+      "bytes": 19996,
+      "sha256": "8e37034d7864807ae2063efcc82fc79aad59069546212e6e0908ed67f9f7e107",
+      "file": "libfdt1_1.7.2-2+b1_amd64.deb"
+    },
+    {
+      "package": "libfuse3-4",
+      "version": "3.17.2-3",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/f/fuse3/libfuse3-4_3.17.2-3_amd64.deb",
+      "bytes": 98748,
+      "sha256": "92e2d521ff872755a13aa69dba7b24025a7dc0f0f5aa708c9a86cd3565f570da",
+      "file": "libfuse3-4_3.17.2-3_amd64.deb"
+    },
+    {
+      "package": "libnl-3-200",
+      "version": "3.7.0-2",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libn/libnl3/libnl-3-200_3.7.0-2_amd64.deb",
+      "bytes": 59432,
+      "sha256": "ce5c153953016be42def7b105f37d55eae07a9608d1dfe6bcb03cc017fc384cb",
+      "file": "libnl-3-200_3.7.0-2_amd64.deb"
+    },
+    {
+      "package": "libnl-route-3-200",
+      "version": "3.7.0-2",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libn/libnl3/libnl-route-3-200_3.7.0-2_amd64.deb",
+      "bytes": 181704,
+      "sha256": "1c8c95542688996cff8e954583642b10a3bd78b69954f565fda62144c2bc3897",
+      "file": "libnl-route-3-200_3.7.0-2_amd64.deb"
+    },
+    {
+      "package": "libibverbs1",
+      "version": "56.1-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/r/rdma-core/libibverbs1_56.1-1_amd64.deb",
+      "bytes": 62428,
+      "sha256": "4c3b889607586e6328964a5f98e01ef01daa415be24334d743d6654aab4c47a4",
+      "file": "libibverbs1_56.1-1_amd64.deb"
+    },
+    {
+      "package": "libjpeg62-turbo",
+      "version": "1:2.1.5-4",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libj/libjpeg-turbo/libjpeg62-turbo_2.1.5-4_amd64.deb",
+      "bytes": 168152,
+      "sha256": "5504299ad0e3c0a9ca9f962a68a650a040db52f9f416a109e74df48d55601d3f",
+      "file": "libjpeg62-turbo_2.1.5-4_amd64.deb"
+    },
+    {
+      "package": "libndctl6",
+      "version": "81-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/n/ndctl/libndctl6_81-1_amd64.deb",
+      "bytes": 62312,
+      "sha256": "fe60a05d42e61cb9f49a90b872aa5ca569363b13459ee0d405243c37a7de7c93",
+      "file": "libndctl6_81-1_amd64.deb"
+    },
+    {
+      "package": "libpixman-1-0",
+      "version": "0.44.0-3",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/p/pixman/libpixman-1-0_0.44.0-3_amd64.deb",
+      "bytes": 247888,
+      "sha256": "3862c87596f6b4b60fc916395fd69aa10af28a875a8e5c081a8cf30ddd120bd6",
+      "file": "libpixman-1-0_0.44.0-3_amd64.deb"
+    },
+    {
+      "package": "libpmem1",
+      "version": "1.13.1-1.1+b1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/p/pmdk/libpmem1_1.13.1-1.1%2bb1_amd64.deb",
+      "bytes": 91708,
+      "sha256": "7d972d6958e915ce602e4b90debc6b4b91a01dfea1fe003d0b013756e7d9d863",
+      "file": "libpmem1_1.13.1-1.1+b1_amd64.deb"
+    },
+    {
+      "package": "libpng16-16t64",
+      "version": "1.6.48-1+deb13u5",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libp/libpng1.6/libpng16-16t64_1.6.48-1%2bdeb13u5_amd64.deb",
+      "bytes": 283204,
+      "sha256": "2465b4e9fa85cff54dc10a6da3e64074d8d9292c86e4a8f989b809d6b158e97e",
+      "file": "libpng16-16t64_1.6.48-1+deb13u5_amd64.deb"
+    },
+    {
+      "package": "librdmacm1t64",
+      "version": "56.1-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/r/rdma-core/librdmacm1t64_56.1-1_amd64.deb",
+      "bytes": 70396,
+      "sha256": "5b56911725905b8e2a8389c99416ca078395c4ca8ce0d516bc758d5be0134687",
+      "file": "librdmacm1t64_56.1-1_amd64.deb"
+    },
+    {
+      "package": "libslirp0",
+      "version": "4.8.0-1+deb13u1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libs/libslirp/libslirp0_4.8.0-1%2bdeb13u1_amd64.deb",
+      "bytes": 66544,
+      "sha256": "6125698173f8be0d0de01ff897a0df3c5e50fb09f70238b26dd6574aaa0934e1",
+      "file": "libslirp0_4.8.0-1+deb13u1_amd64.deb"
+    },
+    {
+      "package": "liburing2",
+      "version": "2.9-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libu/liburing/liburing2_2.9-1_amd64.deb",
+      "bytes": 26448,
+      "sha256": "4b589c00c7a51172aace2cb2fb3d3ff32daf86c644023126dcfcaa840cc941ea",
+      "file": "liburing2_2.9-1_amd64.deb"
+    },
+    {
+      "package": "libusb-1.0-0",
+      "version": "2:1.0.28-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libu/libusb-1.0/libusb-1.0-0_1.0.28-1_amd64.deb",
+      "bytes": 59552,
+      "sha256": "bb6467a002915c4ac464aa1b22204907951a30e43bcb86596ebd3539e84458e9",
+      "file": "libusb-1.0-0_1.0.28-1_amd64.deb"
+    },
+    {
+      "package": "libusbredirparser1t64",
+      "version": "0.15.0-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/u/usbredir/libusbredirparser1t64_0.15.0-1_amd64.deb",
+      "bytes": 19560,
+      "sha256": "4b039802dac140bae5a6f3fb6341eeeb9ea8c3e4d7b95ad36a07a8c28572f177",
+      "file": "libusbredirparser1t64_0.15.0-1_amd64.deb"
+    },
+    {
+      "package": "libvdeplug2t64",
+      "version": "4.0.1-5.1+b1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/v/vdeplug4/libvdeplug2t64_4.0.1-5.1%2bb1_amd64.deb",
+      "bytes": 28456,
+      "sha256": "01291e2c8e28e91eac6b59c983a3a44e29ad0ddb8622699fbb84cbd5f26334a4",
+      "file": "libvdeplug2t64_4.0.1-5.1+b1_amd64.deb"
+    },
+    {
+      "package": "qemu-system-common",
+      "version": "1:10.0.11+ds-0+deb13u1",
+      "architecture": "amd64",
+      "url": "https://snapshot.debian.org/archive/debian/20260704T211317Z/pool/main/q/qemu/qemu-system-common_10.0.11%2Bds-0%2Bdeb13u1_amd64.deb",
+      "bytes": 993500,
+      "sha256": "35bbfdca8de3967a3412d1beff4309127de0c330e1430ddc1a458f4f1cc37c78",
+      "file": "qemu-system-common_10.0.11+ds-0+deb13u1_amd64.deb"
+    },
+    {
+      "package": "qemu-system-data",
+      "version": "1:10.0.11+ds-0+deb13u1",
+      "architecture": "all",
+      "url": "https://snapshot.debian.org/archive/debian/20260705T083637Z/pool/main/q/qemu/qemu-system-data_10.0.11%2Bds-0%2Bdeb13u1_all.deb",
+      "bytes": 2136216,
+      "sha256": "5ab6916f8cbda16c9bfee3bc4ebdad917b47c6cceeed9309d920f85c01a73c4e",
+      "file": "qemu-system-data_10.0.11+ds-0+deb13u1_all.deb"
+    },
+    {
+      "package": "seabios",
+      "version": "1.16.3-2",
+      "architecture": "all",
+      "url": "https://deb.debian.org/debian/pool/main/s/seabios/seabios_1.16.3-2_all.deb",
+      "bytes": 163272,
+      "sha256": "2b590534250b940f43222eeab9a8f57f337a9d9a73fc412a43ab8cd07a7e56f6",
+      "file": "seabios_1.16.3-2_all.deb"
+    },
+    {
+      "package": "qemu-system-x86",
+      "version": "1:10.0.11+ds-0+deb13u1",
+      "architecture": "amd64",
+      "url": "https://snapshot.debian.org/archive/debian/20260704T211317Z/pool/main/q/qemu/qemu-system-x86_10.0.11%2Bds-0%2Bdeb13u1_amd64.deb",
+      "bytes": 10300572,
+      "sha256": "ffc742bf02b818376f67ebd2bdb73b5add6239a6ea8d09557f6519b4ff0bb746",
+      "file": "qemu-system-x86_10.0.11+ds-0+deb13u1_amd64.deb"
+    },
+    {
+      "package": "zstd",
+      "version": "1.5.7+dfsg-1",
+      "architecture": "amd64",
+      "url": "https://deb.debian.org/debian/pool/main/libz/libzstd/zstd_1.5.7%2bdfsg-1_amd64.deb",
+      "bytes": 756244,
+      "sha256": "6da09b6aad171ef9b50d6a2bb4c62f756b3561aac5e05b452b80516223e5e0f5",
+      "file": "zstd_1.5.7+dfsg-1_amd64.deb"
+    }
+  ]
+}

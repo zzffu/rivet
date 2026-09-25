@@ -1,0 +1,68 @@
+[package]
+name = "rivet-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "Native completion-oriented TCP and UDP runtime"
+
+[lib]
+name = "rivet"
+path = "src/lib.rs"
+
+[features]
+default = []
+fixed-files = []
+direct-descriptors = ["fixed-files"]
+registered-buffers = []
+registered-ring = []
+registered-wait = []
+provided-buffers = []
+incremental-buffers = ["provided-buffers"]
+multishot-accept = []
+multishot-recv = ["provided-buffers"]
+multishot = ["multishot-accept", "multishot-recv"]
+buffer-bundles = ["provided-buffers"]
+sq-rewind = []
+mixed-cqe = []
+zc-tx = []
+zc-tx-fixed = ["zc-tx", "registered-buffers"]
+zc-tx-vectored = ["zc-tx"]
+zc-rx = []
+zc-rx-large-chunks = ["zc-rx"]
+zc-rx-shared = ["zc-rx"]
+zc-observe = []
+zc-rx-nodev = ["zc-rx"]
+zc = ["zc-tx", "zc-tx-fixed", "zc-tx-vectored", "zc-rx", "zc-rx-large-chunks", "zc-rx-shared"]
+uring-sqpoll = []
+uring-napi = []
+uring-msg-ring = []
+udp-gso = []
+udp-gro = []
+udp-offload = ["udp-gso", "udp-gro"]
+tcp-splice = []
+linux-full = ["fixed-files", "direct-descriptors", "registered-buffers", "registered-ring", "registered-wait", "provided-buffers", "incremental-buffers", "multishot", "buffer-bundles", "sq-rewind", "mixed-cqe", "zc", "zc-observe", "uring-sqpoll", "uring-napi", "uring-msg-ring", "udp-offload", "tcp-splice"]
+
+[dependencies]
+crossbeam-queue = "0.3.12"
+pin-project-lite = "0.2.16"
+socket2 = { version = "0.6", features = ["all"] }
+smallvec = "1.15"
+parking_lot = "0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading", "Win32_Security"] }
+
+[dev-dependencies]
+futures-lite = "2.6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

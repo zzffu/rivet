@@ -1,0 +1,31 @@
+{
+  "baseline": "7.2.7",
+  "release": "7.2.7-arch1-1",
+  "architecture": "x86_64",
+  "origin": "Arch Linux Archive, official linux package; upstream 7.2.7 plus Arch's arch1 packaging patches, not a relabelled WSL kernel",
+  "package": {
+    "file": "linux-7.2.7.arch1-1-x86_64.pkg.tar.zst",
+    "url": "https://archive.archlinux.org/packages/l/linux/linux-7.2.7.arch1-1-x86_64.pkg.tar.zst",
+    "sha256": "4c922b4be698a85e13647928992d4d099dc5a530915bf82a631c2624784802a4"
+  },
+  "signature": {
+    "file": "linux-7.2.7.arch1-1-x86_64.pkg.tar.zst.sig",
+    "url": "https://archive.archlinux.org/packages/l/linux/linux-7.2.7.arch1-1-x86_64.pkg.tar.zst.sig",
+    "sha256": "d617aff66bee034a1edf8b96c61153ac82d6ef366d993852555917ce5f60beba"
+  },
+  "certificate": {
+    "file": "heftig.asc",
+    "url": "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x83BC8889351B5DEBBB68416EB8AC08600F108CDF",
+    "sha256": "950f1064ad9dcc732f188b3dcfbf730a2ce7038ae69f9dc0664129a187fed5aa",
+    "fingerprint": "83BC8889351B5DEBBB68416EB8AC08600F108CDF",
+    "identity": "Jan Alexander Steffens (heftig), Arch Linux kernel maintainer",
+    "fingerprint_origin": "https://archlinux.org/people/developers/#heftig"
+  },
+  "recipe": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/raw/7.2.7.arch1-1/PKGBUILD",
+  "configuration_source": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/raw/7.2.7.arch1-1/config.x86_64",
+  "upstream_source": "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.7.tar.xz",
+  "upstream_source_sha256": "4ac34c47db2540ffb2713943f8d891ff1702e0ba6934525a493b7d1cad43145a",
+  "upstream_checksum_origin": "https://cdn.kernel.org/pub/linux/kernel/v7.x/sha256sums.asc",
+  "verification": "Detached package signature verified with Debian sqv on 2026-09-25; returned the exact pinned primary fingerprint. This is artifact verification, not a guest boot or runtime test.",
+  "scope": "The diskless guest has loopback networking only. It can exercise io_uring CPU-memory networking and explicit NODEV paths, but cannot establish real NIC RX zero-copy or hardware NAPI/RSS performance. Source config enables IO_URING and IO_URING_ZCRX; the runner checks the actual guest's embedded config after boot."
+}
