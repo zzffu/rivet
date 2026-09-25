@@ -19,6 +19,13 @@ use std::{
 struct CountingAllocator;
 
 thread_local! {
+    #[cfg_attr(
+        target_os = "android",
+        allow(
+            clippy::missing_const_for_thread_local,
+            reason = "Already const; Android std TLS false positive (rust-lang/rust-clippy#13422)."
+        )
+    )]
     static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
 }
 

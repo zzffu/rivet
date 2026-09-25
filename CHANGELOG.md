@@ -17,3 +17,6 @@
 - Linux 可选模块、原生资源及提交路径使用独立条件编译；无 feature、26 个独立 feature 与 14 个交叉组合的编译检查全部通过。
 - 修正未编译的 Auto 子优化仍展开隐式依赖、错误激活冲突 RX 模式的问题；保留显式禁用依赖的冲突检查，并用 NODEV-only 原生程序及配置回归验证。
 - 新增实际 loopback／混合负载程序、行为回归、签名内核隔离 runner 和支持 16KiB 页的普通 Android 验证 App。验证工具不修改主机全局网络、安全策略、WSL 内核或外部 VPS。
+- 补充 Windows 原生 IPv4／IPv6 loopback 验证；移除验证进程的 IPv4-only 限制后，31 项网络行为测试通过。
+- 补充 OnePlus 13／Android 15／ARM64／4KiB 页真机验证，普通 App 的 17 项场景全部通过。
+- 对 Android 标准库线程局部宏的已知 Clippy 误报添加两处平台限定的 lint 豁免，保留 const 初始化；Android 双架构及 Windows 严格 Clippy 检查通过。

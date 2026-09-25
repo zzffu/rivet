@@ -41,7 +41,16 @@ use std::{
 use task::{Admission, Launch, TaskSet};
 pub use task::{JoinError, JoinHandle, SpawnError, yield_now};
 
-thread_local! { static CURRENT: RefCell<Option<Rc<Worker>>> = const { RefCell::new(None) }; }
+thread_local! {
+    #[cfg_attr(
+        target_os = "android",
+        allow(
+            clippy::missing_const_for_thread_local,
+            reason = "Already const; Android std TLS false positive (rust-lang/rust-clippy#13422)."
+        )
+    )]
+    static CURRENT: RefCell<Option<Rc<Worker>>> = const { RefCell::new(None) };
+}
 pub(crate) fn current() -> stdio::Result<Rc<Worker>> {
     CURRENT.with(|slot| slot.borrow().clone()).ok_or_else(|| {
         stdio::Error::new(

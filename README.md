@@ -156,21 +156,22 @@ Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用
 
 | 环境 | 已观察结果 | 限制 |
 | --- | --- | --- |
-| Windows 11 x64，build 26200 | 61 项测试通过；RIO／IOCP loopback 及混合负载通过 | 主机 IPv4-only TUN，明确未运行 Windows IPv6 |
+| Windows 11 x64，build 26200 | 61 项既有测试通过；切换 HTTP PROXY 后，原生 IPv4／IPv6 loopback 与取消 IPv4-only 限制后的 31 项网络行为测试通过 | 本次验证直接连接 `127.0.0.1`／`::1`，不经过 HTTP 代理；不证明外部 IPv6 路由或 NIC 性能 |
 | 隔离 Linux 7.2.7-arch1-1 x86_64，musl 静态程序 | 全 feature 的 66 项测试、NODEV-only 的 11 项配置回归通过；IPv4／IPv6、splice、GSO／GRO、registered-wait、multishot、增量 buffers、bundles、SQPOLL、MSG_RING、ZC TX、共享 NODEV 组合通过 | guest 以 root 运行，loopback-only；不是普通用户权限或物理 NIC 证明 |
 | Android API29，x86_64，4KiB 页，kernel 4.14.175 | 普通 App UID 10116 的 16 项场景通过；分别确认不可用 GSO／GRO 的 Auto 报告及 RequireCapability 失败 | 1 项实际 offload 场景明确跳过，不声称旧内核支持 |
 | Android API37，x86_64，16KiB 页 | 普通 App UID 10230 的 17 项场景通过，包括 IPv4／IPv6、真实 Network 绑定与 GSO／GRO | 模拟器，不是 ARM64 真机性能结果 |
+| OnePlus 13 真机，Android 15／API35，ARM64，4KiB 页 | 普通 App UID 10385 的 17 项场景全部通过，包括 IPv4／IPv6、Network 绑定与 GSO／GRO；SELinux Enforcing | 本机 USB 连接，无 root 或安全策略修改；未覆盖 ARM64 16KiB 页设备 |
 
-Android 的 x86_64／aarch64 均通过无 feature、独立 `udp-gso`、独立 `udp-gro` 和 `udp-offload` 的编译检查；两个 ABI 的 API29 APK 均完成构建、16KiB 对齐及签名验证。ARM64 仅构建，未执行真机场景。
+Android 的 x86_64／aarch64 均通过无 feature、独立 `udp-gso`、独立 `udp-gro` 和 `udp-offload` 的编译检查；两个 ABI 的 API29 APK 均完成构建、16KiB 对齐及签名验证。ARM64 APK 已在 OnePlus 13 普通 App 进程中执行，通过全部 17 项场景；真机结果、环境、APK 散列和截图保存在 `artifacts/android-usb-arm64-*`。
 
 Linux GNU 的 x86_64／aarch64 release 库已构建，Windows GNU 目标完成编译检查；实际桌面运行来自 Windows MSVC 与 Linux x86_64 musl。Linux 的无 feature、26 个独立 feature 和 14 个组合共 41 组编译检查通过，结果保存在 `artifacts/linux-feature-checks.json`。仅编译 NODEV 时，不可编译的 Auto shared／large-chunk 子项不会激活冲突的硬件 RX 模式；该边界有失败前／修复后原生证据。
 
-Windows／Linux 的 `cargo clippy --all-features --all-targets -- -D warnings`（Linux 指定 musl target）通过。Clippy 0.1.98 的 Android target 对已经使用 `const { ... }` 的 `thread_local!` 发出 `missing_const_for_thread_local`；独立最小例已复现，证据在 `artifacts/android-clippy-const-tls.json`。保留正确的 const 初始化，未加 lint 屏蔽；Android Clippy 因该工具误报不是零警告。
+Windows／Linux 的 `cargo clippy --all-features --all-targets -- -D warnings`（Linux 指定 musl target）通过。Android 的两处 `thread_local!` 声明针对[上游 #13422](https://github.com/rust-lang/rust-clippy/issues/13422) 已知误报，使用仅限 Android 的 `cfg_attr(..., allow(clippy::missing_const_for_thread_local, reason = ...))` 定点豁免；保留正确的 const 初始化，不修改工具链或全局 lint 级别。aarch64／x86_64 Android 以及 Windows 的严格 Clippy 检查均通过。
 
 两个桌面后端的混合负载均完成 4096 次小 RPC、每方向 16MiB 大块 TCP、每方向 8192 个 UDP 数据报，未用重传掩盖丢包。独立空闲探针保持两个 worker 及已绑定 TCP／UDP，等待约 2 秒：Linux 进程 CPU 时间 5.294ms；Windows `GetProcessTimes` 读数为 0，受计时精度限制，不能解释为绝对零 CPU。
 
-验证总览在 `artifacts/verification-summary.json`。详细证据位于 `artifacts/windows-native-suite.log`、`artifacts/linux-native-results.json`、`artifacts/android-smoke-api29-4k-final.json`、`artifacts/android-smoke-api37-16k-final.json` 与同名 PNG；`artifacts/android-final-build-evidence.json` 记录执行 APK 的散列。Linux runner 在其 `--state` 目录的 `runs/<id>/report.json` 和 `serial.log` 保留内核、二进制散列、参数及实际结果，索引明确关联已修复的历史失败与后续通过记录。这些生成物不代替可重跑的测试／示例。
+验证总览在 `artifacts/verification-summary.json`。详细证据包括 `artifacts/windows-native-suite.log`、`artifacts/windows-ipv6-evidence.json`、`artifacts/linux-native-results.json`、`artifacts/android-usb-arm64-*`，以及 API29／API37 模拟器结果与截图；`artifacts/android-final-build-evidence.json` 记录模拟器执行 APK 的散列，USB 真机 APK 散列见其环境记录。Linux runner 在其 `--state` 目录的 `runs/<id>/report.json` 和 `serial.log` 保留内核、二进制散列、参数及实际结果，索引明确关联已修复的历史失败与后续通过记录。这些生成物不代替可重跑的测试／示例。
 
 真实硬件 RX ZC、large-chunk DMA、NIC NAPI／RSS 行为及线上吞吐仍需要满足要求且已由部署方配置好的 NIC／队列。NODEV 明确是复制验证；本机未配置此类硬件，也未为验证修改外部主机内核、NIC 或主机安全策略。
 
-Windows Server 2022 和 ARM64 设备未执行原生场景；上述构建结果不冒充这两类环境的运行证明。
+Windows Server 2022、Linux ARM64 及 Android ARM64 16KiB 页设备未执行原生场景；Android ARM64 的已验证范围为上述 API35／4KiB 页真机。
