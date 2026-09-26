@@ -367,8 +367,9 @@ struct Factory<F, T> {
 }
 impl<F, T> Drop for Factory<F, T> {
     fn drop(&mut self) {
-        if self.factory.is_some() {
+        if let Some(factory) = self.factory.take() {
             self.cell.complete(Err(JoinError::Cancelled));
+            let _ = catch_unwind(AssertUnwindSafe(|| drop(factory)));
         }
     }
 }

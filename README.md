@@ -50,10 +50,10 @@ fn main() -> io::Result<()> {
 ```
 
 - Worker 0 只在 `block_on` 内推进；根 Future 返回后，其既有本地任务暂停，下一次 `block_on` 恢复。后台 worker 持续运行至 Runtime 销毁。
-- 自动投递排除不活跃的 worker 0；单 worker 的外部 `Handle::spawn` 在未运行时返回 `NotRunning`，不默默挂起新工作。
-- `JoinHandle` 丢弃会取消任务；需要独立运行时显式 `detach()`。Future 的销毁发生在所属线程。
+- 自动投递排除不活跃的 worker 0；候选在准入前失活时继续选择其他活跃 worker。单 worker 的外部 `Handle::spawn` 在未运行时返回 `NotRunning`，不默默挂起新工作。
+- `JoinHandle` 丢弃会取消任务；需要独立运行时显式 `detach()`。Future 与已准入但未启动的工厂捕获值均在所属线程销毁；取消／shutdown 隔离其析构 panic，不中断其余清理。
 - `runtime::buffer_pool()` 返回当前 worker 已有的池，适用于自动放置的工厂；不要为每个数据包创建新池。
-- 任务、socket、操作、接收队列和池均有界。`idle_spin` 默认零；可选自旋受时间预算及下一定时器期限约束。
+- 任务、socket、操作、接收队列和池均有界。不可寻址的接收／接受／完成队列容量在配置阶段返回 `InvalidInput`。`idle_spin` 默认零；可选自旋受时间预算及下一定时器期限约束。
 
 ## 缓冲区、发送结果与关闭
 
@@ -83,6 +83,8 @@ async fn request(stream: &rivet::TcpStream) -> std::io::Result<()> {
 `UdpSocket` 支持连接／非连接收发、来源地址、截断和可用的原始长度信息。`send_batch` 接受可复用的 `Datagram` 数组并保留每项结果及所有权；`recv_batch` 填入调用方空槽，收到至少一项即可返回，不等待填满。
 
 Linux／Android 可选 `send_segments` 使用 UDP GSO；接收的 GRO 聚合由前端还原为数据报视图。组内只有一个目标地址与分段大小。不实现广播或多播。
+
+Linux 接管已启用 GRO 的 socket 时，即使没有编译 `udp-gro` 或策略为 `Off`，也会解析已有分段元数据并还原数据报边界；不会为迎合策略而关闭 GRO、破坏已排队的数据。feature／策略仍控制运行时是否主动启用优化。
 
 `TcpStream::splice_to` 与 `net::splice_bidirectional` 是显式 Linux 内核 socket→pipe→socket 转发；未启用／不支持时返回错误，不静默改成用户态复制。
 

@@ -1,7 +1,10 @@
 //! Startup configuration and legal optimization combinations.
 
-use crate::buffer::PoolConfig;
-use std::{collections::BTreeMap, io, time::Duration};
+use crate::{
+    buffer::PoolConfig,
+    driver::{Event, Received, SocketInfo},
+};
+use std::{alloc::Layout, collections::BTreeMap, io, time::Duration};
 
 /// What to do when an explicitly selected optimization is unavailable.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -346,6 +349,14 @@ impl RuntimeConfig {
                 "task, socket and operation limits exceed token index capacity",
             ));
         }
+        // Queue limits count elements, not bytes. Reject layouts that Vec and
+        // VecDeque cannot address before constructing a worker or a socket.
+        Layout::array::<io::Result<Received>>(l.max_pending_receives)
+            .map_err(|_| invalid("receive queue capacity exceeds addressable memory"))?;
+        Layout::array::<io::Result<SocketInfo>>(l.max_pending_accepts)
+            .map_err(|_| invalid("accept queue capacity exceeds addressable memory"))?;
+        Layout::array::<Event>(l.completion_budget)
+            .map_err(|_| invalid("completion queue capacity exceeds addressable memory"))?;
         if l.max_tasks.checked_mul(2).is_none() || self.workers.checked_mul(l.pool.bytes).is_none()
         {
             return Err(invalid("resource size overflow"));

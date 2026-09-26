@@ -394,6 +394,7 @@ pub struct Driver {
     stopping: bool,
     shutdown_error: Option<io::Error>,
     wake_armed: bool,
+    sq_deferred: bool,
     retry_deadline: Option<Instant>,
     #[cfg(all(feature = "zc-tx", feature = "zc-observe"))]
     stats: ZcStats,
@@ -1060,6 +1061,7 @@ impl Driver {
             stopping: false,
             shutdown_error: None,
             wake_armed: false,
+            sq_deferred: false,
             retry_deadline: None,
             #[cfg(all(feature = "zc-tx", feature = "zc-observe"))]
             stats: ZcStats::default(),
@@ -2194,7 +2196,11 @@ impl Driver {
         self.tokens.is_empty() && self.deferred.is_empty() && self.blocked_ingest.is_none()
     }
     fn arm_wake(&mut self) -> io::Result<()> {
-        if self.wake_armed || self.stopping || self.ring.available() == 0 {
+        if self.wake_armed || self.stopping {
+            return Ok(());
+        }
+        if self.ring.available() == 0 {
+            self.sq_deferred = true;
             return Ok(());
         }
         self.ring.push(Sqe {
@@ -2216,6 +2222,7 @@ impl Driver {
             return Ok(());
         }
         if self.ring.available() == 0 {
+            self.sq_deferred = true;
             self.schedule(key);
             return Ok(());
         }
@@ -2606,6 +2613,7 @@ impl Driver {
                 continue;
             }
             if self.ring.available() == 0 {
+                self.sq_deferred = true;
                 self.schedule(key);
                 continue;
             }
@@ -3107,6 +3115,7 @@ impl Driver {
         let initial = events.len();
         let limit = initial.saturating_add(self.config.limits.completion_budget);
         self.retry_deadline = None;
+        self.sq_deferred = false;
         self.pool.flush_recycles();
         #[cfg(feature = "provided-buffers")]
         if let Some(provided) = &mut self.provided {
@@ -3123,7 +3132,10 @@ impl Driver {
         self.drive_ready(events, limit)?;
         self.release_aborted_sockets()?;
         self.arm_wake()?;
-        let effective_timeout = if events.len() != initial {
+        // A full SQ can hold only sleeping receives. Submit without waiting for
+        // their CQEs while other submissions (including cancel/wake) are owed.
+        // Credit, buffer and retry-timer stalls do not set sq_deferred.
+        let effective_timeout = if self.sq_deferred || events.len() != initial {
             Some(Duration::ZERO)
         } else if let Some(deadline) = self.retry_deadline {
             let retry = deadline.saturating_duration_since(Instant::now());
@@ -3184,17 +3196,13 @@ fn datagram(
     } else {
         Some(net::decode(address_bytes)?)
     };
-    #[cfg(feature = "udp-gro")]
     let control_bytes = unsafe {
         std::slice::from_raw_parts(
             native.control.as_ptr().cast::<u8>(),
             message.msg_controllen.min(net::CONTROL_BYTES),
         )
     };
-    #[cfg(feature = "udp-gro")]
     let segment = net::gro_segment(control_bytes)?;
-    #[cfg(not(feature = "udp-gro"))]
-    let segment = None;
     let truncated = message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) as u32 != 0
         || original > data.len();
     Ok(Received {
@@ -3228,13 +3236,9 @@ fn parse_multishot_datagram(
             &data.as_slice()[header..header + (out.namelen as usize).min(name_space)],
         )?)
     };
-    #[cfg(feature = "udp-gro")]
     let controls = &data.as_slice()[header + name_space
         ..header + name_space + (out.controllen as usize).min(net::CONTROL_BYTES)];
-    #[cfg(feature = "udp-gro")]
     let segment = net::gro_segment(controls)?;
-    #[cfg(not(feature = "udp-gro"))]
-    let segment = None;
     // Later multishot attempts may use the entire provided buffer even when the
     // initial request was smaller. Preserve the socket's datagram receive cap.
     let length = (out.payloadlen as usize)

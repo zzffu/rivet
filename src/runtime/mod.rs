@@ -116,6 +116,43 @@ struct Group {
     cursor: AtomicUsize,
 }
 impl Group {
+    fn enqueue<F, Fut, T>(&self, start: usize, factory: F) -> Result<JoinHandle<T>, SpawnError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        let mut any_active = false;
+        for step in 0..self.workers.len() {
+            let worker = &self.workers[(start + step) % self.workers.len()];
+            let mut inbox = worker.inbox.lock();
+            if inbox.closed || self.stopping.load(Ordering::Acquire) {
+                drop(inbox);
+                return Err(SpawnError::ShuttingDown);
+            }
+            if !worker.active.load(Ordering::Acquire) {
+                continue;
+            }
+            any_active = true;
+            let Ok(admission) = worker.admit() else {
+                continue;
+            };
+            // Inactivity and shutdown use this same lock. Commit to exactly
+            // one owner only after checking that it can still drive the task.
+            let (command, join) = task::factory(factory, admission);
+            inbox.factories.push_back(command);
+            drop(inbox);
+            worker.notifier.notify();
+            return Ok(join);
+        }
+        Err(if self.stopping.load(Ordering::Acquire) {
+            SpawnError::ShuttingDown
+        } else if any_active {
+            SpawnError::AtCapacity
+        } else {
+            SpawnError::NotRunning
+        })
+    }
     fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
         for worker in &self.workers {
@@ -150,54 +187,22 @@ impl Handle {
         }
         let count = self.group.workers.len();
         let start = self.group.cursor.fetch_add(1, Ordering::Relaxed) % count;
-        let mut any_active = false;
         let mut selected = None;
-        // Least admitted load, with a rotating tie break. Admission itself is
-        // atomic, so concurrent producers cannot exceed the selected budget.
+        // Least admitted load, with a rotating tie break. This is only a
+        // placement hint; enqueue rechecks each candidate under its inbox lock.
         for step in 0..count {
             let index = (start + step) % count;
             let worker = &self.group.workers[index];
             if !worker.active.load(Ordering::Acquire) {
                 continue;
             }
-            any_active = true;
             let load = worker.admitted.load(Ordering::Acquire);
             if load < worker.limit && selected.is_none_or(|(_, best)| load < best) {
                 selected = Some((index, load));
             }
         }
-        let Some((index, _)) = selected else {
-            return Err(if any_active {
-                SpawnError::AtCapacity
-            } else {
-                SpawnError::NotRunning
-            });
-        };
-        let mut chosen = None;
-        for step in 0..count {
-            let worker = &self.group.workers[(index + step) % count];
-            if worker.active.load(Ordering::Acquire)
-                && let Ok(admission) = worker.admit()
-            {
-                chosen = Some((worker, admission));
-                break;
-            }
-        }
-        let Some((worker, admission)) = chosen else {
-            return Err(SpawnError::AtCapacity);
-        };
-        let mut inbox = worker.inbox.lock();
-        if inbox.closed || self.group.stopping.load(Ordering::Acquire) {
-            return Err(SpawnError::ShuttingDown);
-        }
-        if !worker.active.load(Ordering::Acquire) {
-            return Err(SpawnError::NotRunning);
-        }
-        let (command, join) = task::factory(factory, admission);
-        inbox.factories.push_back(command);
-        drop(inbox);
-        worker.notifier.notify();
-        Ok(join)
+        self.group
+            .enqueue(selected.map_or(start, |(index, _)| index), factory)
     }
 }
 
@@ -676,5 +681,81 @@ fn set_affinity(cpu: usize) -> stdio::Result<()> {
         Err(stdio::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_lite::future::{block_on, poll_once};
+
+    fn group(active: &[bool]) -> Group {
+        Group {
+            workers: active
+                .iter()
+                .map(|&active| {
+                    Arc::new(WorkerShared {
+                        notifier: Arc::new(Notifier::new().unwrap()),
+                        ready: ArrayQueue::new(1),
+                        inbox: Mutex::new(Inbox {
+                            closed: false,
+                            factories: VecDeque::with_capacity(1),
+                        }),
+                        admitted: AtomicUsize::new(0),
+                        retired: AtomicUsize::new(0),
+                        active: AtomicBool::new(active),
+                        limit: 1,
+                    })
+                })
+                .collect(),
+            stopping: AtomicBool::new(false),
+            cursor: AtomicUsize::new(0),
+        }
+    }
+
+    #[test]
+    fn admission_skips_inactive_candidate_and_uses_remaining_capacity() {
+        let group = group(&[false, true, true]);
+        let occupied = group.workers[1].admit().unwrap();
+        // Candidate zero became inactive after selection. The next worker is
+        // full, but the last worker must still accept exactly one factory.
+        let mut join = group.enqueue(0, || async { 7 }).unwrap();
+        assert_eq!(group.workers[0].admitted.load(Ordering::Acquire), 0);
+        assert!(group.workers[0].inbox.lock().factories.is_empty());
+        assert!(group.workers[1].inbox.lock().factories.is_empty());
+        assert_eq!(group.workers[2].admitted.load(Ordering::Acquire), 1);
+        assert_eq!(
+            group.enqueue(0, || async {}).unwrap_err(),
+            SpawnError::AtCapacity
+        );
+
+        let command = group.workers[2].inbox.lock().factories.pop_front().unwrap();
+        drop(command);
+        assert_eq!(block_on(poll_once(&mut join)), Some(Err(JoinError::Cancelled)));
+        assert_eq!(group.workers[2].admitted.load(Ordering::Acquire), 0);
+        assert!(group.workers[2].inbox.lock().factories.is_empty());
+        drop(occupied);
+        assert_eq!(group.workers[1].admitted.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn admission_distinguishes_inactive_full_and_stopped_workers() {
+        let group = group(&[false, false]);
+        assert_eq!(
+            group.enqueue(0, || async {}).unwrap_err(),
+            SpawnError::NotRunning
+        );
+        group.workers[1].active.store(true, Ordering::Release);
+        let occupied = group.workers[1].admit().unwrap();
+        assert_eq!(
+            group.enqueue(0, || async {}).unwrap_err(),
+            SpawnError::AtCapacity
+        );
+        group.stop();
+        assert_eq!(
+            group.enqueue(0, || async {}).unwrap_err(),
+            SpawnError::ShuttingDown
+        );
+        drop(occupied);
     }
 }

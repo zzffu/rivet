@@ -1,4 +1,3 @@
-#[cfg(any(feature = "udp-gso", feature = "udp-gro"))]
 use super::uapi::CmsgHdr;
 use crate::{
     driver::{SocketId, SocketInfo, SocketKind},
@@ -15,7 +14,6 @@ pub const CONTROL_BYTES: usize = 128;
 pub const ADDRESS_BYTES: usize = 128;
 #[cfg(feature = "udp-gso")]
 pub const UDP_SEGMENT: i32 = 103;
-#[cfg(feature = "udp-gro")]
 pub const UDP_GRO: i32 = 104;
 
 pub fn validate_address(addr: SocketAddr, destination: bool) -> io::Result<()> {
@@ -282,7 +280,6 @@ pub fn decode(bytes: &[u8]) -> io::Result<SocketAddr> {
     }
 }
 
-#[cfg(feature = "udp-gro")]
 pub fn gro_segment(control: &[u8]) -> io::Result<Option<u16>> {
     let align = size_of::<usize>();
     let header = size_of::<CmsgHdr>();

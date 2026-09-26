@@ -46,6 +46,59 @@ async fn pair(address: SocketAddr) -> (TcpStream, TcpStream) {
     (client.unwrap(), server.unwrap())
 }
 
+#[test]
+fn tiny_submission_queues_progress_past_background_udp_receives() {
+    for entries in [1, 2] {
+        let mut config = config();
+        config.linux.sq_entries = entries;
+        let mut runtime = Runtime::new(config).unwrap();
+        let pool = runtime.buffer_pool();
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            runtime.block_on(async {
+                rivet::time::timeout(Duration::from_secs(1), async {
+                    let address: SocketAddr = address.parse().unwrap();
+                    let mut options = SocketOptions::udp();
+                    options.receive_chunk = 8;
+                    // Each lane needs an exclusive endpoint even when binding port zero.
+                    options.reuse_address = false;
+                    let receivers: Vec<_> = (0..8)
+                        .map(|_| UdpSocket::bind_with_options(address, options.clone()).unwrap())
+                        .collect();
+                    for receiver in &receivers {
+                        let mut waiter = receiver.recv();
+                        assert!(poll_once(&mut waiter).await.is_none());
+                        drop(waiter);
+                    }
+                    let sender = UdpSocket::bind_with_options(address, options).unwrap();
+                    // The early SQ entries are receives with no incoming data.
+                    // The send must be submitted without waiting for their CQEs.
+                    for (sequence, receiver) in receivers.iter().enumerate().rev() {
+                        let expected = [sequence as u8; 4];
+                        assert_eq!(
+                            sender
+                                .send_to(
+                                    SendPayload::Single(filled(&pool, &expected)),
+                                    receiver.local_addr(),
+                                )
+                                .await
+                                .result
+                                .unwrap(),
+                            expected.len()
+                        );
+                        let packet = receiver.recv().await.unwrap();
+                        assert_eq!(packet.data.as_slice(), expected);
+                        assert_eq!(packet.peer, Some(sender.local_addr()));
+                        assert_eq!(packet.original_len, Some(expected.len()));
+                        assert!(!packet.truncated);
+                    }
+                })
+                .await
+                .expect("SQ pressure stalled UDP submission");
+            });
+        }
+    }
+}
+
 #[cfg(feature = "registered-wait")]
 #[test]
 fn registered_wait_preserves_timeouts_and_network_progress() {
@@ -367,6 +420,75 @@ fn provided_multishot_datagram_metadata_survives_deferred_completions() {
             .enable(rivet::Optimization::DirectDescriptors),
         4,
     );
+}
+
+#[test]
+fn imported_udp_gro_keeps_datagram_boundaries_with_off_policy() {
+    let configurations = [
+        config(),
+        #[cfg(feature = "provided-buffers")]
+        config().enable(rivet::Optimization::ProvidedBuffers),
+        #[cfg(feature = "multishot-recv")]
+        config().enable(rivet::Optimization::MultishotRecv),
+    ];
+    for config in configurations {
+        let mut runtime = Runtime::new(
+            config.with_policy(rivet::Optimization::UdpGro, rivet::Policy::Off),
+        )
+        .unwrap();
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let receiver = std::net::UdpSocket::bind(address).unwrap();
+            let sender = std::net::UdpSocket::bind(address).unwrap();
+            for (socket, option, value) in [
+                (&receiver, libc::UDP_GRO, 1i32),
+                (&sender, libc::UDP_SEGMENT, 4i32),
+            ] {
+                assert_eq!(
+                    unsafe {
+                        libc::setsockopt(
+                            socket.as_raw_fd(),
+                            libc::IPPROTO_UDP,
+                            option,
+                            (&value as *const i32).cast(),
+                            size_of::<i32>() as libc::socklen_t,
+                        )
+                    },
+                    0,
+                    "{}",
+                    io::Error::last_os_error()
+                );
+            }
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let local = receiver.local_addr().unwrap();
+            let peer = sender.local_addr().unwrap();
+            assert_eq!(sender.send_to(b"abcdEFGH", local).unwrap(), 8);
+            // std::net::UdpSocket::peek uses MSG_PEEK: require a real aggregate
+            // before import, rather than passing on two ordinary datagrams.
+            let mut aggregate = [0; 16];
+            assert_eq!(receiver.peek(&mut aggregate).unwrap(), 8);
+            assert_eq!(&aggregate[..8], b"abcdEFGH");
+            runtime.block_on(deadline(async {
+                let mut options = SocketOptions::udp();
+                options.receive_chunk = 8;
+                let receiver = UdpSocket::import(receiver.into(), options).unwrap();
+                let first = receiver.recv().await.unwrap();
+                assert_eq!(first.data.as_slice(), b"abcd");
+                assert_eq!(first.peer, Some(peer));
+                assert_eq!(first.original_len, Some(4));
+                assert_eq!(first.gro_segment_size, Some(4));
+                assert!(!first.truncated);
+                let second = receiver.recv().await.unwrap();
+                assert_eq!(second.data.as_slice(), b"EFGH");
+                assert_eq!(second.peer, Some(peer));
+                assert_eq!(second.original_len, Some(4));
+                assert_eq!(second.gro_segment_size, Some(4));
+                assert!(!second.truncated);
+                assert_eq!(first.data.as_slice(), b"abcd");
+            }));
+        }
+    }
 }
 
 #[cfg(all(feature = "udp-gso", feature = "udp-gro"))]

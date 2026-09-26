@@ -20,3 +20,8 @@
 - 补充 Windows 原生 IPv4／IPv6 loopback 验证；移除验证进程的 IPv4-only 限制后，31 项网络行为测试通过。
 - 补充 OnePlus 13／Android 15／ARM64／4KiB 页真机验证，普通 App 的 17 项场景全部通过。
 - 对 Android 标准库线程局部宏的已知 Clippy 误报添加两处平台限定的 lint 豁免，保留 const 初始化；Android 双架构及 Windows 严格 Clippy 检查通过。
+- 修正 Linux 小 SQ 下未提交操作、取消和唤醒注册被阻塞 CQ 等待阻断的问题；资源／额度等待仍允许休眠。
+- Linux 普通和 multishot recvmsg 始终解析已有 GRO 分段元数据，修复无 `udp-gro` feature 接管外部 socket 时合并数据报的问题；主动启用优化仍受 feature／策略控制。
+- 将自动投递的活跃状态复核、准入和入队串行化，失活候选不再导致仍有后台容量时错误返回 `NotRunning`。
+- 隔离尚未启动工厂捕获值的析构 panic，覆盖取消和 shutdown，保持所属线程销毁与准入额度回收。
+- 在配置阶段按实际队列元素布局拒绝不可寻址的接收、接受和完成队列容量，避免首次创建 socket 或 worker 时出现容量溢出 panic。

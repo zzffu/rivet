@@ -120,10 +120,60 @@ fn single_worker_handle_rejects_unprogressable_work() {
     assert_eq!(result, 7);
 }
 
+#[test]
+fn inactive_owner_and_full_background_worker_leave_other_capacity_usable() {
+    let mut limits = config(3);
+    limits.limits.max_tasks = 1;
+    let runtime = Runtime::new(limits).unwrap();
+    let handle = runtime.handle();
+    let owner = thread::current().id();
+    let (started, receive_started) = mpsc::sync_channel(1);
+    let occupied = handle
+        .spawn(move || async move {
+            started.send(thread::current().id()).unwrap();
+            pending::<()>().await;
+        })
+        .unwrap();
+    let occupied_worker = receive_started
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert_ne!(occupied_worker, owner);
+
+    let (completed, receive_completed) = mpsc::sync_channel(1);
+    let available = handle
+        .spawn(move || async move {
+            let worker = thread::current().id();
+            completed.send(worker).unwrap();
+            worker
+        })
+        .unwrap();
+    let available_worker = receive_completed
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert_ne!(available_worker, owner);
+    assert_ne!(available_worker, occupied_worker);
+    assert_eq!(
+        futures_lite::future::block_on(available),
+        Ok(available_worker)
+    );
+    assert_eq!(
+        futures_lite::future::block_on(occupied.cancel()),
+        Err(JoinError::Cancelled)
+    );
+}
+
 struct DropThread(Arc<Mutex<Option<thread::ThreadId>>>);
 impl Drop for DropThread {
     fn drop(&mut self) {
         *self.0.lock() = Some(thread::current().id());
+    }
+}
+
+struct PanicOnDrop(Arc<Mutex<Vec<thread::ThreadId>>>);
+impl Drop for PanicOnDrop {
+    fn drop(&mut self) {
+        self.0.lock().push(thread::current().id());
+        panic!("intentional capture drop panic");
     }
 }
 
@@ -222,6 +272,126 @@ fn panic_is_reported_without_killing_worker() {
             13
         );
     });
+}
+
+#[test]
+fn cancelled_factory_or_future_drop_panic_releases_admission_on_owner() {
+    for launch in [false, true] {
+        let mut limits = config(1);
+        limits.limits.max_tasks = 1;
+        let mut runtime = Runtime::new(limits).unwrap();
+        let owner = thread::current().id();
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let launched = Arc::new(AtomicBool::new(false));
+        runtime.block_on(async {
+            let probe = PanicOnDrop(dropped.clone());
+            let factory_launched = launched.clone();
+            let task = runtime::spawn(move || {
+                factory_launched.store(true, Ordering::Release);
+                async move {
+                    let _probe = probe;
+                    pending::<()>().await;
+                }
+            })
+            .unwrap();
+            if launch {
+                runtime::yield_now().await;
+            }
+            assert_eq!(launched.load(Ordering::Acquire), launch);
+            assert_eq!(
+                runtime::spawn(|| async {}).unwrap_err(),
+                SpawnError::AtCapacity
+            );
+            assert_eq!(task.cancel().await, Err(JoinError::Cancelled));
+            assert_eq!(launched.load(Ordering::Acquire), launch);
+            assert_eq!(*dropped.lock(), vec![owner]);
+
+            // One slot is returned, not leaked or returned twice: a replacement
+            // occupies the entire budget until its own cancellation completes.
+            let replacement = runtime::spawn(pending::<()>).unwrap();
+            assert_eq!(
+                runtime::spawn(|| async {}).unwrap_err(),
+                SpawnError::AtCapacity
+            );
+            assert_eq!(replacement.cancel().await, Err(JoinError::Cancelled));
+            assert_eq!(runtime::spawn(|| async { 13 }).unwrap().await, Ok(13));
+        });
+        drop(runtime);
+        assert_eq!(*dropped.lock(), vec![owner]);
+    }
+}
+
+#[test]
+fn shutdown_isolates_factory_and_future_drop_panics_and_finishes_owner_cleanup() {
+    for launch in [false, true] {
+        let mut limits = config(1);
+        limits.limits.max_tasks = 3;
+        let mut runtime = Runtime::new(limits).unwrap();
+        let handle = runtime.handle();
+        let owner = thread::current().id();
+        let panicking_drops = Arc::new(Mutex::new(Vec::new()));
+        let local_drop = Arc::new(Mutex::new(None));
+        let queued_drop = Arc::new(Mutex::new(None));
+        let launched = Arc::new(AtomicBool::new(false));
+        let queued_launched = Arc::new(AtomicBool::new(false));
+        let (mut panicking, mut queued, mut local) = runtime.block_on(async {
+            let probe = DropThread(local_drop.clone());
+            let local = runtime::spawn_local(async move {
+                let _probe = probe;
+                pending::<()>().await;
+            })
+            .unwrap();
+            runtime::yield_now().await;
+
+            let probe = PanicOnDrop(panicking_drops.clone());
+            let factory_launched = launched.clone();
+            let panicking = runtime::spawn(move || {
+                factory_launched.store(true, Ordering::Release);
+                async move {
+                    let _probe = probe;
+                    pending::<()>().await;
+                }
+            })
+            .unwrap();
+            if launch {
+                runtime::yield_now().await;
+            }
+            let probe = DropThread(queued_drop.clone());
+            let factory_launched = queued_launched.clone();
+            let queued = runtime::spawn(move || {
+                factory_launched.store(true, Ordering::Release);
+                async move {
+                    let _probe = probe;
+                    pending::<()>().await;
+                }
+            })
+            .unwrap();
+            (panicking, queued, local)
+        });
+        assert_eq!(launched.load(Ordering::Acquire), launch);
+        assert!(!queued_launched.load(Ordering::Acquire));
+        assert!(panicking_drops.lock().is_empty());
+        assert_eq!(*local_drop.lock(), None);
+        assert_eq!(*queued_drop.lock(), None);
+
+        drop(runtime);
+
+        assert_eq!(*panicking_drops.lock(), vec![owner]);
+        assert_eq!(launched.load(Ordering::Acquire), launch);
+        assert_eq!(*local_drop.lock(), Some(owner));
+        assert_eq!(*queued_drop.lock(), Some(owner));
+        assert!(!queued_launched.load(Ordering::Acquire));
+        for join in [&mut panicking, &mut queued, &mut local] {
+            assert_eq!(
+                futures_lite::future::block_on(poll_once(join)),
+                Some(Err(JoinError::Cancelled))
+            );
+        }
+        assert_eq!(
+            handle.spawn(|| async {}).unwrap_err(),
+            SpawnError::ShuttingDown
+        );
+    }
 }
 
 #[test]

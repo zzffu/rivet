@@ -136,6 +136,36 @@ fn invalid_resource_limits_do_not_reach_os_allocation() {
 }
 
 #[test]
+fn unaddressable_receive_queue_is_a_configuration_error() {
+    let mut config = RuntimeConfig::single_thread();
+    config.limits.max_pending_receives = isize::MAX as usize;
+    assert_eq!(
+        config.normalized().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn unaddressable_accept_queue_is_a_configuration_error() {
+    let mut config = RuntimeConfig::single_thread();
+    config.limits.max_pending_accepts = isize::MAX as usize;
+    assert_eq!(
+        config.normalized().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn unaddressable_completion_queue_is_a_configuration_error() {
+    let mut config = RuntimeConfig::single_thread();
+    config.limits.completion_budget = isize::MAX as usize;
+    assert_eq!(
+        config.normalized().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
 fn polling_durations_cannot_truncate_to_unbounded_spin() {
     let mut config = RuntimeConfig::single_thread();
     config.linux.sqpoll_idle = std::time::Duration::from_nanos(1);

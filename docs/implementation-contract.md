@@ -98,13 +98,23 @@ Cold socket creation/listen/bind/import may use synchronous nonblocking socket s
 
 `Ring` exposes native SQE reservation/submission, normalized CQE retrieval preserving enabled 32-byte extras, a registration syscall helper, raw ring fd, and feature bits. Optional implementation modules, native resources and submission branches follow their Cargo compile gates independently of runtime policy. Extension code must not approximate updated structures with older library bindings.
 
+A Linux poll distinguishes SQ-capacity-deferred submissions from requests waiting for credits, buffers or retry deadlines. It must not block for CQEs while an otherwise runnable operation, cancellation or wake registration is deferred solely because the SQ is full. Finite submission/completion budgets and ordinary idle blocking remain intact.
+
+Linux UDP ancillary decoding is required for correctness even without the `udp-gro` feature. Both ordinary and multishot recvmsg decode inherited `UDP_GRO` metadata through the same parser, so importing an already aggregated receive queue preserves individual datagrams. Compile/runtime optimization gates control actively enabling GRO, not interpreting data already supplied by an imported socket.
+
 ZCRX owns the mapped CPU area and refill memory, and returns exact region leases through the buffer seam. Shared import/export between workers uses a typed internal owner retaining the export fd, CPU area, refill mapping, sizes and offsets; a raw import fd alone does not describe these resources and is not a public configuration input. Shared import/export requires synchronized refill producers or a single owning producer; it must not treat a shared SPSC ring as lock-free MPSC. Shared mode is opt-in and cannot hide cross-core ownership violations.
 
 ## Runtime/Interface behavior
 
 `Runtime::new(RuntimeConfig)` constructs workers and returns initialization failures synchronously. `Runtime::block_on` polls the root future on the owning thread; the Runtime is not movable across threads after construction. A cloneable Send `Handle` supports automatic worker selection for Send factories that create local futures on their selected worker. `spawn_local` permits non-Send futures. Task cancellation drops the future on its owner.
 
+Configuration normalization validates addressable array layouts for receive results, accepted socket results and completion events before constructing native resources. Impossible capacities return `InvalidInput`; passing this check is not a guarantee that physical memory allocation will succeed.
+
 Worker zero progresses only inside `block_on`; its retained local tasks resume on the next call or cancel/drain on owner-thread Runtime drop. Background workers progress continuously. Automatic placement excludes inactive worker zero; a single-thread Handle cannot accept a factory outside `block_on` and silently strand it.
+
+Load-based placement is a hint. For each candidate, checking active/closed state, admitting the task and committing its factory are serialized by that worker's inbox lock. An inactive or full candidate does not prevent a bounded attempt at the remaining workers. Factory destruction is outside that lock.
+
+Cancellation and shutdown isolate panics when dropping the captures of an admitted but unlaunched factory, just as they isolate a launched future's destructor. Captures stay owner-thread-local at destruction, cancellation is still reported as `JoinError::Cancelled`, and admission is released exactly once.
 
 `runtime::buffer_pool() -> io::Result<BufferPool>` returns the current worker's existing pool, including inside automatically placed factories. `runtime::zc_stats()` snapshots the current driver; `Runtime::zc_stats()` snapshots only the owner/root driver, not an aggregate across workers. Shared ZCRX kernel-instance observations must not be summed repeatedly through imported views.
 
