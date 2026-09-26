@@ -7,20 +7,22 @@ pub use crate::driver::{Received, SendOutcome};
 use crate::{
     buffer::{ReadBuf, SendPayload},
     driver::{SocketInfo, SocketKind, Token},
-    runtime::{self, Worker, io::SendRequest},
+    runtime::{self, JoinError, TaskGroup, Worker, io::SendRequest},
     socket::{ImportError, OwnedSocket, SocketOptions},
+    sync::CancellationToken,
+    time::{self, TimeoutError},
 };
-use parking_lot::Mutex;
 use std::{
     cell::Cell,
     fmt,
-    future::Future,
+    future::{Future, pending, poll_fn},
     io,
     net::{Shutdown, SocketAddr},
-    pin::Pin,
+    pin::{Pin, pin},
     rc::{Rc, Weak},
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
+    time::Duration,
 };
 
 fn gone() -> io::Error {
@@ -186,6 +188,18 @@ impl TcpStream {
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.socket.shutdown(how)
     }
+    /// Consume this connection and request TCP reset, not an orderly FIN.
+    /// Setting abortive linger or initiating native close can fail; even then
+    /// the consumed connection is closed. Submitted send storage remains held
+    /// until the driver observes its real memory-release completion.
+    pub fn abort(self) -> io::Result<()> {
+        let result = self
+            .socket
+            .owner()
+            .and_then(|owner| owner.driver.borrow_mut().abort(self.socket.info.id));
+        drop(self);
+        result
+    }
     /// Explicit transparent kernel forwarding. Unsupported/unselected backends
     /// return Unsupported; this never silently copies bytes through userspace.
     pub fn splice_to<'a>(&'a self, destination: &'a TcpStream, bytes: usize) -> Splice<'a> {
@@ -264,6 +278,23 @@ impl Drop for Connect {
     }
 }
 
+/// Business-level connection admission and cooperative shutdown policy.
+/// The driver's separately bounded pre-accept queue does not consume a handler
+/// slot until the service admits that connection.
+#[derive(Clone, Copy, Debug)]
+pub struct ServeConfig {
+    pub max_connections: usize,
+    pub shutdown_grace: Duration,
+}
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 1024,
+            shutdown_grace: Duration::from_secs(30),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TcpListener {
     socket: Socket,
@@ -297,95 +328,132 @@ impl TcpListener {
             done: false,
         }
     }
-    /// Each connection is dispatched before any receive or send is started.
-    /// Handler factories are automatically placed; their futures stay local.
-    /// Admission/import errors are returned, never hidden in detached tasks.
+    /// Serve with bounded supervision and no external stop signal.
+    /// Every handler is owned until completion; dropping this wait requests
+    /// cancellation of all handlers. For cooperative draining use `serve_until`.
     pub async fn serve<F, Fut>(&self, handler: F) -> io::Result<()>
     where
         F: Fn(TcpStream) -> Fut + std::marker::Send + Sync + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        let handler = Arc::new(handler);
+        self.serve_until(ServeConfig::default(), pending(), move |stream, _| {
+            handler(stream)
+        })
+        .await
+    }
+
+    /// Stop takes priority over accept and handler completion. A business slot
+    /// is reserved before polling accept; idle sockets are then automatically
+    /// placed before their first data I/O. Each handler receives the same
+    /// cooperative cancellation token.
+    ///
+    /// Stop or an error cancels the token, drains for `shutdown_grace`, then
+    /// aborts and joins any remaining handlers. Execution panics, failed normal
+    /// destruction, and import failures are returned, never detached. Expected
+    /// abort remains cancellation even if a cancelled handler's destructor panics.
+    /// Cancelling this service future requests immediate handler cancellation;
+    /// awaiting its normal stop is required to prove all cleanup has finished.
+    pub async fn serve_until<S, F, Fut>(
+        &self,
+        config: ServeConfig,
+        stop: S,
+        handler: F,
+    ) -> io::Result<()>
+    where
+        S: Future<Output = ()>,
+        F: Fn(TcpStream, CancellationToken) -> Fut + std::marker::Send + Sync + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let mut tasks = TaskGroup::new(config.max_connections)?;
         let handle = runtime::Handle::current()?;
-        loop {
-            let stream = self.accept().await?;
-            let socket = stream.socket.take_idle()?;
+        let handler = Arc::new(handler);
+        let cancellation = CancellationToken::new();
+        let mut stop = pin!(stop);
+        let mut error = loop {
+            let mut accept = pin!(self.accept());
+            let event = poll_fn(|cx| {
+                if stop.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(ServeEvent::Stopped);
+                }
+                if let Poll::Ready(Some(result)) = tasks.poll_join_next(cx) {
+                    return Poll::Ready(ServeEvent::Completed(result));
+                }
+                if !tasks.is_full()
+                    && let Poll::Ready(result) = accept.as_mut().poll(cx)
+                {
+                    return Poll::Ready(ServeEvent::Accepted(result));
+                }
+                Poll::Pending
+            })
+            .await;
+            let stream = match event {
+                ServeEvent::Stopped => break None,
+                ServeEvent::Completed(result) => {
+                    if let Err(error) = handler_result(result) {
+                        break Some(error);
+                    }
+                    continue;
+                }
+                ServeEvent::Accepted(Ok(stream)) => stream,
+                ServeEvent::Accepted(Err(error)) => break Some(error),
+            };
+            let socket = match stream.socket.take_idle() {
+                Ok(socket) => socket,
+                Err(error) => break Some(error),
+            };
             let mut options = self.options.clone();
-            // This is an already configured accepted connection; Android
-            // Network/protection hooks must not run a second time on transfer.
+            // Already configured: Android Network/protection hooks must not
+            // run again when transferring this accepted socket.
             options.android_network = None;
             options.hook = None;
             let handler = handler.clone();
-            let acknowledgement = Arc::new(Mutex::new(DispatchState {
-                result: None,
-                waker: None,
-            }));
-            let sent = DispatchSender(Some(acknowledgement.clone()));
-            let task = handle
-                .spawn(move || async move {
-                    match TcpStream::import(socket, options) {
-                        Ok(stream) => {
-                            sent.complete(Ok(()));
-                            handler(stream).await;
-                        }
-                        Err(error) => sent.complete(Err(error.error)),
-                    }
-                })
-                .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?;
-            // Keep cancellation linked until successful import; a cancelled
-            // serve must not leave an unacknowledged accepted socket task.
-            Dispatch(acknowledgement).await?;
-            task.detach();
+            let cancellation = cancellation.clone();
+            if let Err(error) = tasks.spawn_on(&handle, move || async move {
+                let stream = TcpStream::import(socket, options).map_err(|error| error.error)?;
+                handler(stream, cancellation).await;
+                Ok(())
+            }) {
+                break Some(io::Error::new(io::ErrorKind::WouldBlock, error));
+            }
+        };
+        cancellation.cancel();
+        let drain = async {
+            while let Some(result) = tasks.join_next().await {
+                let panicked = matches!(&result, Err(JoinError::Panicked));
+                if let Err(next) = handler_result(result)
+                    && (error.is_none() || panicked)
+                {
+                    error = Some(next);
+                }
+            }
+        };
+        if let Err(TimeoutError::Timer(next)) = time::timeout(config.shutdown_grace, drain).await
+            && error.is_none()
+        {
+            error = Some(next);
         }
-    }
-}
-struct DispatchState {
-    result: Option<io::Result<()>>,
-    waker: Option<Waker>,
-}
-struct Dispatch(Arc<Mutex<DispatchState>>);
-struct DispatchSender(Option<Arc<Mutex<DispatchState>>>);
-impl DispatchSender {
-    fn complete(mut self, result: io::Result<()>) {
-        if let Some(state) = self.0.take() {
-            dispatch_complete(&state, result);
+        if let Err(panic) = tasks.shutdown().await {
+            error = Some(io::Error::other(panic));
         }
+        error.map_or(Ok(()), Err)
     }
 }
-impl Drop for DispatchSender {
-    fn drop(&mut self) {
-        if let Some(state) = self.0.take() {
-            dispatch_complete(
-                &state,
-                Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "connection dispatch cancelled before import",
-                )),
-            );
-        }
-    }
+enum ServeEvent {
+    Stopped,
+    Completed(Result<io::Result<()>, JoinError>),
+    Accepted(io::Result<TcpStream>),
 }
-fn dispatch_complete(state: &Mutex<DispatchState>, result: io::Result<()>) {
-    let wake = {
-        let mut state = state.lock();
-        state.result = Some(result);
-        state.waker.take()
-    };
-    if let Some(wake) = wake {
-        wake.wake();
-    }
-}
-impl Future for Dispatch {
-    type Output = io::Result<()>;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.0.lock();
-        if let Some(result) = state.result.take() {
-            Poll::Ready(result)
-        } else {
-            state.waker = Some(cx.waker().clone());
-            Poll::Pending
-        }
-    }
+
+fn handler_result(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
+    result.map_err(|error| {
+        io::Error::new(
+            match error {
+                JoinError::Cancelled => io::ErrorKind::Interrupted,
+                JoinError::Panicked => io::ErrorKind::Other,
+            },
+            error,
+        )
+    })?
 }
 #[must_use]
 pub struct Accept<'a> {

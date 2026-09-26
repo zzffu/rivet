@@ -432,10 +432,9 @@ fn imported_udp_gro_keeps_datagram_boundaries_with_off_policy() {
         config().enable(rivet::Optimization::MultishotRecv),
     ];
     for config in configurations {
-        let mut runtime = Runtime::new(
-            config.with_policy(rivet::Optimization::UdpGro, rivet::Policy::Off),
-        )
-        .unwrap();
+        let mut runtime =
+            Runtime::new(config.with_policy(rivet::Optimization::UdpGro, rivet::Policy::Off))
+                .unwrap();
         for address in ["127.0.0.1:0", "[::1]:0"] {
             let receiver = std::net::UdpSocket::bind(address).unwrap();
             let sender = std::net::UdpSocket::bind(address).unwrap();

@@ -163,12 +163,33 @@ impl Default for LinuxConfig {
     }
 }
 
+/// Independent bounds for blocking closures, separate from async worker tasks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockingConfig {
+    /// Maximum number of blocking threads, started only when work needs them.
+    pub threads: usize,
+    /// Maximum number of closures waiting to start; running work is separate.
+    pub queue_capacity: usize,
+}
+
+impl Default for BlockingConfig {
+    fn default() -> Self {
+        Self {
+            threads: 4,
+            queue_capacity: 128,
+        }
+    }
+}
+
 /// A zero-copy threshold is a configurable starting point, not a measured optimum.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub workers: usize,
     pub affinity: Option<Vec<usize>>,
     pub limits: Limits,
+    pub blocking: BlockingConfig,
+    /// Runtime-wide bound for non-socket native registrations.
+    pub max_async_io: usize,
     pub linux: LinuxConfig,
     pub idle_spin: Duration,
     pub optimizations: BTreeMap<Optimization, Policy>,
@@ -182,6 +203,8 @@ impl Default for RuntimeConfig {
                 .unwrap_or(1),
             affinity: None,
             limits: Limits::default(),
+            blocking: BlockingConfig::default(),
+            max_async_io: 256,
             linux: LinuxConfig::default(),
             idle_spin: Duration::ZERO,
             optimizations: BTreeMap::new(),
@@ -318,6 +341,10 @@ impl RuntimeConfig {
         {
             return Err(invalid("affinity must contain one CPU per worker"));
         }
+        if self.blocking.threads == 0 || self.blocking.threads > u16::MAX as usize {
+            return Err(invalid("blocking threads must be in 1..=65535"));
+        }
+        crate::io::Registry::validate_capacity(self.max_async_io)?;
         if [
             l.max_tasks,
             l.max_sockets,
@@ -331,6 +358,7 @@ impl RuntimeConfig {
             l.pool.bytes,
             l.pool.block_size,
             l.pool.max_leases,
+            self.blocking.queue_capacity,
         ]
         .contains(&0)
         {
@@ -357,6 +385,18 @@ impl RuntimeConfig {
             .map_err(|_| invalid("accept queue capacity exceeds addressable memory"))?;
         Layout::array::<Event>(l.completion_budget)
             .map_err(|_| invalid("completion queue capacity exceeds addressable memory"))?;
+        Layout::array::<Box<dyn FnOnce() + Send>>(self.blocking.queue_capacity)
+            .map_err(|_| invalid("blocking queue capacity exceeds addressable memory"))?;
+        Layout::array::<std::thread::JoinHandle<()>>(self.blocking.threads)
+            .map_err(|_| invalid("blocking thread capacity exceeds addressable memory"))?;
+        if self
+            .blocking
+            .threads
+            .checked_add(self.blocking.queue_capacity)
+            .is_none()
+        {
+            return Err(invalid("blocking admission size overflow"));
+        }
         if l.max_tasks.checked_mul(2).is_none() || self.workers.checked_mul(l.pool.bytes).is_none()
         {
             return Err(invalid("resource size overflow"));

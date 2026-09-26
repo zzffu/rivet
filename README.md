@@ -1,6 +1,6 @@
 # Rivet
 
-原生 Rust `Future` 网络运行时。TCP／UDP 使用操作系统协议栈；不提供 Tokio 兼容层、TLS、DNS、HTTP、QUIC、文件 I/O、用户态协议栈、DMA-BUF 或 BPF 执行路径。
+原生 Rust `Future` 网络运行时。TCP／UDP 使用操作系统协议栈；提供有界阻塞执行、非 socket 原生等待和通用异步协调。不提供 Tokio 兼容层、TLS、DNS、HTTP、QUIC、原生异步文件 I/O、用户态协议栈、DMA-BUF 或 BPF 执行路径。
 
 系统设计与平台契约：[`docs/architecture.md`](docs/architecture.md)、[`docs/implementation-contract.md`](docs/implementation-contract.md)。
 
@@ -23,7 +23,7 @@ rivet = { package = "rivet-runtime", path = "../rivet" }
 
 `Runtime`、socket 和缓冲区租约均为 `!Send`。`Handle::spawn` 接受 `Send` 工厂，在自动选出的 worker 内创建本地 Future；Future 本身不必 `Send`。`spawn_local` 直接在当前 worker 创建本地任务。已经创建的 Future、正在收发的 socket 和租约不做任意跨核迁移。
 
-`TcpListener::serve` 将刚接收、尚未开始数据 I/O 的 socket 自动移交到选出的 worker，再构造处理 Future。不需要应用划分工作负载组。
+`TcpListener::serve` 将刚接收、尚未开始数据 I/O 的 socket 自动移交到选出的 worker，再构造处理 Future；handler 由有界任务组监督，不再 detach。不需要应用划分工作负载组。需要自定义连接额度和优雅停止时使用 `serve_until`。
 
 ```rust
 use rivet::{Runtime, RuntimeConfig, SendPayload, TcpListener, TcpStream};
@@ -51,9 +51,35 @@ fn main() -> io::Result<()> {
 
 - Worker 0 只在 `block_on` 内推进；根 Future 返回后，其既有本地任务暂停，下一次 `block_on` 恢复。后台 worker 持续运行至 Runtime 销毁。
 - 自动投递排除不活跃的 worker 0；候选在准入前失活时继续选择其他活跃 worker。单 worker 的外部 `Handle::spawn` 在未运行时返回 `NotRunning`，不默默挂起新工作。
-- `JoinHandle` 丢弃会取消任务；需要独立运行时显式 `detach()`。Future 与已准入但未启动的工厂捕获值均在所属线程销毁；取消／shutdown 隔离其析构 panic，不中断其余清理。
+- `JoinHandle` 丢弃会取消任务；需要独立运行时显式 `detach()`。Future 与已准入但未启动的工厂捕获值均在所属线程销毁，之后才发布完成结果。取消／shutdown 隔离其析构 panic，仍报告 `Cancelled`；执行或正常完成时的析构 panic 报告 `Panicked`。
 - `runtime::buffer_pool()` 返回当前 worker 已有的池，适用于自动放置的工厂；不要为每个数据包创建新池。
 - 任务、socket、操作、接收队列和池均有界。不可寻址的接收／接受／完成队列容量在配置阶段返回 `InvalidInput`。`idle_spin` 默认零；可选自旋受时间预算及下一定时器期限约束。
+
+## 通用运行时能力
+
+### 阻塞执行和任务所有权
+
+- `spawn_blocking`／`Handle::spawn_blocking` 接收 `Send` 闭包，返回 `BlockingJoinHandle<T>`。`RuntimeConfig.blocking` 的默认线程上限为 4、排队上限为 128；按需启动，满额显式返回 `BlockingSpawnError::AtCapacity`。外部 `Handle` 可在异步 worker 暂停时提交阻塞工作。
+- 排队中的阻塞工作可以取消；已开始的同步代码不能强杀。丢弃句柄不提前释放仍执行工作的额度。Runtime 先停止准入、取消排队工作并清理异步 worker，再等待正在运行的阻塞工作及原生线程退出。阻塞闭包必须能够自行结束，不能依赖 Runtime 销毁后继续推进的异步任务。
+- `runtime::TaskGroup<T>::new(capacity)` 拥有有界子任务集合。`spawn`／`spawn_on` 投递工厂，`spawn_local` 接收本地 Future；`join_next` 按就绪顺序取结果。完成但尚未 join 的任务仍占容量。
+- `JoinHandle::abort_handle()` 和任务组 spawn 返回的 `AbortHandle` 可克隆，只提供取消／完成状态，不转移结果所有权。`TaskGroup::shutdown().await` 关闭准入、abort 并排空；取消一次等待可以重试。组 Drop 只请求取消，不能冒充已经 join。
+- `TcpListener::serve_until(ServeConfig, stop, handler)` 在 `max_connections` 名额可用后轮询 accept；停止信号优先，handler 收到 `sync::CancellationToken`，经过 `shutdown_grace` 后才强制 abort 并 join。导入失败和任务 panic 作为错误返回。简单 `serve` 默认最多 1024 个 handler、30 秒错误清理宽限期。
+
+### 非 socket I/O
+
+`RuntimeConfig.max_async_io` 默认 256，约束整个 Runtime 的原生注册数。导入失败返回 `io::ImportError { error, resource }`，保留原句柄所有权。
+
+- Linux／Android：`io::AsyncFd::import(OwnedFd)` 接管已经非阻塞、可轮询的 FD。`readable`／`writable` 等待 readiness；`try_io(Interest, closure)` 临时借出 `BorrowedFd`，遇到 `WouldBlock` 清除对应 readiness。闭包不得关闭／保留句柄、改变非阻塞模式或执行阻塞工作。该专用等待路径不是 TCP／UDP 的 epoll 回退。
+- Windows：`io::AsyncHandle::import(OwnedHandle)` 支持具有 `SYNCHRONIZE` 权限的 Event、Semaphore、Timer、Process、Thread、Job。`wait` 缓存自动复位对象已经取得的通知，取消等待不会丢掉该通知；持续 signaled 不导致后台自旋。不接受普通文件和拥有线程归属的 mutex。
+- 对象保持 `!Send/!Sync`。等待 Future 不借用对象；`close`／Runtime 停止会唤醒它并返回 `BrokenPipe`。取消等待不关闭对象。Runtime 停止注销等待；外部对象仍拥有的句柄在该对象析构时释放。
+
+### 协调、计时与退出事件
+
+`sync` 不要求当前 Runtime：提供有界 `mpsc::bounded`、`oneshot`、`Mutex`、`RwLock`、`Semaphore`、`watch::channel`、`Notify` 和 `CancellationToken`。channel／锁复用执行器无关的成熟实现；不是 Tokio 兼容层。watch 合并更新，最后发送者关闭后仍可读取最终未读值；不要跨 `.await` 持有同步 watch 借用。Notify 保存至多一个单次通知许可，`notify_waiters` 只唤醒已经开始等待的调用。
+
+`Sleep::reset(Instant)` 原位调整计时器，完成后也能复用。`time::interval`／`interval_at` 返回周期计时器，`tick` 返回计划时刻；取消等待不消费 tick。`MissedTickBehavior` 支持 `Burst`、`Skip`、`Delay`，默认 `Skip`；零周期和时间溢出报错。
+
+`signal::ShutdownSignals::new()` 显式订阅 Unix SIGINT／SIGTERM 或 Windows Ctrl+C／Ctrl+Break；`recv()` 返回 `SignalKind`，不主动退出进程。每个订阅者独立接收，两种事件分别合并。最后一个订阅释放时注销处理器并停止辅助线程。Unix 已有自定义 handler 时返回 `AlreadyExists`，原有默认／忽略 disposition 会恢复；宿主必须串行化其他 `sigaction` 修改。Windows 订阅期间不能更换 console。自定义 Waker 若在信号辅助线程中释放最后订阅，该线程在回调返回后自行退出，不能同步 join 自身。
 
 ## 缓冲区、发送结果与关闭
 
@@ -76,6 +102,7 @@ async fn request(stream: &rivet::TcpStream) -> std::io::Result<()> {
 - 接收 Future 是队列等待者；丢弃它不清除已经到达的 TCP 字节。TCP EOF 与合法的零长度 UDP 数据报分别表示。
 - 已发布租约可以跨越 socket／Runtime 的销毁继续读取；池和外部映射按实际引用释放。共享 refill 的队列满时保留返还 token，不丢弃它。
 - 普通 TCP 关闭不默认设置 abortive linger。整个 Runtime 销毁会取消未结束业务；Linux 会中止剩余 TCP 传输并等待真实内核释放。需要完整交付时，先完成半关闭和对端协议确认。
+- `TcpStream::abort(self)` 显式选择 RST 式关闭，设置失败可观察；它不改变普通 Drop／半关闭的语义，也不提前释放在途发送的内核内存引用。
 - 原生 TCP socket 的正值 `SO_LINGER` 会阻塞关闭或导致非阻塞关闭失败，因此在接管及配置钩子后拒绝；不偷偷改成 abortive linger。
 
 ## UDP、接管与宿主接入
@@ -129,11 +156,14 @@ Cargo feature 只纳入实现，**不自动启用运行策略**。默认所有�
 
 ```text
 cargo run --example loopback
+cargo run --example runtime_services
 cargo run --example mixed_load
 cargo test --all-targets
 ```
 
 `loopback` 覆盖 IPv4／IPv6、向量前缀、取消接收等待、持有旧租约继续接收、UDP 空包与来源信息，以及 Runtime 销毁后的读取。`mixed_load` 同时运行小 RPC、大块 TCP 和有界窗口 UDP，自动分配 worker；输出不是 NIC 吞吐／延迟保证。
+
+`runtime_services` 覆盖真实阻塞任务与异步网络并行、非 socket pipe／Windows event、任务组、计时器重置与周期、watch 最终值、受监督 echo／停止和对端 RST。相同场景也集成到 Android 普通 App。`cargo test --test signal_behavior` 在隔离子进程中验证真实退出信号及默认处理恢复，不向运行测试的宿主发送信号。
 
 Windows 主机明确只允许 IPv4 时，可为**验证进程**设置 `RIVET_VERIFY_IPV4_ONLY=1`。相关测试／示例明确打印未执行 IPv6；默认仍测试两个地址族，生产库不读取此变量。
 
@@ -158,21 +188,23 @@ Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用
 
 | 环境 | 已观察结果 | 限制 |
 | --- | --- | --- |
-| Windows 11 x64，build 26200 | 61 项既有测试通过；切换 HTTP PROXY 后，原生 IPv4／IPv6 loopback 与取消 IPv4-only 限制后的 31 项网络行为测试通过 | 本次验证直接连接 `127.0.0.1`／`::1`，不经过 HTTP 代理；不证明外部 IPv6 路由或 NIC 性能 |
-| 隔离 Linux 7.2.7-arch1-1 x86_64，musl 静态程序 | 全 feature 的 66 项测试、NODEV-only 的 11 项配置回归通过；IPv4／IPv6、splice、GSO／GRO、registered-wait、multishot、增量 buffers、bundles、SQPOLL、MSG_RING、ZC TX、共享 NODEV 组合通过 | guest 以 root 运行，loopback-only；不是普通用户权限或物理 NIC 证明 |
+| Windows 11 x64，build 26200 | 121 项全 feature 构建测试通过；`runtime_services` 实际阻塞任务、事件等待、受监督 TCP／RST 场景通过 | IPv4／IPv6 loopback，不经过 HTTP 代理；不证明外部路由或 NIC 性能 |
+| 隔离 Linux 7.2.7-arch1-1 x86_64，musl 静态程序 | 129 项全 feature 构建测试与 `runtime_services` 通过，包括非 socket pipe、子进程信号、direct/fixed／ZC 发送中止回收；既有可选优化组合证据保留在验证索引 | guest 以 root 运行，loopback-only；不是普通用户权限或物理 NIC 证明 |
 | Android API29，x86_64，4KiB 页，kernel 4.14.175 | 普通 App UID 10116 的 16 项场景通过；分别确认不可用 GSO／GRO 的 Auto 报告及 RequireCapability 失败 | 1 项实际 offload 场景明确跳过，不声称旧内核支持 |
-| Android API37，x86_64，16KiB 页 | 普通 App UID 10230 的 17 项场景通过，包括 IPv4／IPv6、真实 Network 绑定与 GSO／GRO | 模拟器，不是 ARM64 真机性能结果 |
+| Android API37，x86_64，16KiB 页 | 普通 App UID 10230 的 18 项场景通过，包含新增通用能力及 IPv4／IPv6、真实 Network 绑定、GSO／GRO；另有 adb shell 下 45 项通用能力回归通过 | shell 回归不冒充 App 沙箱验证；模拟器，不是 ARM64 真机性能结果 |
 | OnePlus 13 真机，Android 15／API35，ARM64，4KiB 页 | 普通 App UID 10385 的 17 项场景全部通过，包括 IPv4／IPv6、Network 绑定与 GSO／GRO；SELinux Enforcing | 本机 USB 连接，无 root 或安全策略修改；未覆盖 ARM64 16KiB 页设备 |
 
 Android 的 x86_64／aarch64 均通过无 feature、独立 `udp-gso`、独立 `udp-gro` 和 `udp-offload` 的编译检查；两个 ABI 的 API29 APK 均完成构建、16KiB 对齐及签名验证。ARM64 APK 已在 OnePlus 13 普通 App 进程中执行，通过全部 17 项场景；真机结果、环境、APK 散列和截图保存在 `artifacts/android-usb-arm64-*`。
 
 Linux GNU 的 x86_64／aarch64 release 库已构建，Windows GNU 目标完成编译检查；实际桌面运行来自 Windows MSVC 与 Linux x86_64 musl。Linux 的无 feature、26 个独立 feature 和 14 个组合共 41 组编译检查通过，结果保存在 `artifacts/linux-feature-checks.json`。仅编译 NODEV 时，不可编译的 Auto shared／large-chunk 子项不会激活冲突的硬件 RX 模式；该边界有失败前／修复后原生证据。
 
-Windows／Linux 的 `cargo clippy --all-features --all-targets -- -D warnings`（Linux 指定 musl target）通过。Android 的两处 `thread_local!` 声明针对[上游 #13422](https://github.com/rust-lang/rust-clippy/issues/13422) 已知误报，使用仅限 Android 的 `cfg_attr(..., allow(clippy::missing_const_for_thread_local, reason = ...))` 定点豁免；保留正确的 const 初始化，不修改工具链或全局 lint 级别。aarch64／x86_64 Android 以及 Windows 的严格 Clippy 检查均通过。
+Windows／Linux 的 `cargo clippy --all-features --all-targets -- -D warnings`（Linux 指定 musl target）通过。Android 的两处生产代码及一处阻塞线程退出测试的 `thread_local!` 声明针对[上游 #13422](https://github.com/rust-lang/rust-clippy/issues/13422) 已知误报，使用仅限 Android 的 `cfg_attr(..., allow(clippy::missing_const_for_thread_local, reason = ...))` 定点豁免；保留正确的 const 初始化，不修改工具链或全局 lint 级别。aarch64／x86_64 Android 的全 feature、全 target 严格 Clippy 检查均通过。
 
 两个桌面后端的混合负载均完成 4096 次小 RPC、每方向 16MiB 大块 TCP、每方向 8192 个 UDP 数据报，未用重传掩盖丢包。独立空闲探针保持两个 worker 及已绑定 TCP／UDP，等待约 2 秒：Linux 进程 CPU 时间 5.294ms；Windows `GetProcessTimes` 读数为 0，受计时精度限制，不能解释为绝对零 CPU。
 
 验证总览在 `artifacts/verification-summary.json`。详细证据包括 `artifacts/windows-native-suite.log`、`artifacts/windows-ipv6-evidence.json`、`artifacts/linux-native-results.json`、`artifacts/android-usb-arm64-*`，以及 API29／API37 模拟器结果与截图；`artifacts/android-final-build-evidence.json` 记录模拟器执行 APK 的散列，USB 真机 APK 散列见其环境记录。Linux runner 在其 `--state` 目录的 `runs/<id>/report.json` 和 `serial.log` 保留内核、二进制散列、参数及实际结果，索引明确关联已修复的历史失败与后续通过记录。这些生成物不代替可重跑的测试／示例。
+
+通用宿主能力的本轮证据在 `artifacts/runtime-services-verification.json`，包含 Linux 各 suite 的独立 guest 报告和 Android 普通 App 原始结果。本轮没有重新执行 API29、ARM64 真机、Server 2022 或硬件 NIC 场景；这些既有结果不能替代新增功能在相应设备上的原生验证。公开 rustdoc（warnings 为错误）、Linux 无 feature 构建和 Android ARM64 编译检查同时通过。
 
 真实硬件 RX ZC、large-chunk DMA、NIC NAPI／RSS 行为及线上吞吐仍需要满足要求且已由部署方配置好的 NIC／队列。NODEV 明确是复制验证；本机未配置此类硬件，也未为验证修改外部主机内核、NIC 或主机安全策略。
 

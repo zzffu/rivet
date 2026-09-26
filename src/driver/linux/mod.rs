@@ -211,6 +211,7 @@ struct SocketEntry {
     active: usize,
     native_pending: usize,
     closing: bool,
+    aborting: bool,
     receive: Option<u64>,
     accept: Option<u64>,
     sending: Option<u64>,
@@ -392,6 +393,7 @@ pub struct Driver {
     scratch: Vec<u64>,
     send_bytes: usize,
     stopping: bool,
+    aborting_sockets: usize,
     shutdown_error: Option<io::Error>,
     wake_armed: bool,
     sq_deferred: bool,
@@ -1059,6 +1061,7 @@ impl Driver {
             report,
             send_bytes: 0,
             stopping: false,
+            aborting_sockets: 0,
             shutdown_error: None,
             wake_armed: false,
             sq_deferred: false,
@@ -1414,6 +1417,7 @@ impl Driver {
             active: 0,
             native_pending: 0,
             closing: false,
+            aborting: false,
             receive: None,
             accept: None,
             sending: None,
@@ -2103,6 +2107,20 @@ impl Driver {
             Ok(())
         }
     }
+    pub fn abort(&mut self, socket: SocketId) -> io::Result<()> {
+        let entry = self.check_socket(socket, Some(SocketKind::TcpStream))?;
+        // Direct sockets retain the native fd installed at creation/accept.
+        // It refers to the same socket as the fixed table entry, so this
+        // changes the real socket rather than merely closing one descriptor.
+        let fd = entry
+            .fd
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+        net::abort_on_close(fd.as_raw_fd())?;
+        self.sockets.get_mut(socket.0).unwrap().aborting = true;
+        self.aborting_sockets += 1;
+        self.close(socket)
+    }
     fn close_if_idle(&mut self, socket: SocketId) -> io::Result<()> {
         let Some(entry) = self.sockets.get(socket.0) else {
             return Ok(());
@@ -2114,6 +2132,9 @@ impl Driver {
         if let Some(index) = entry.fixed {
             self.fixed.as_mut().unwrap().remove(&self.ring, index)?;
         }
+        if entry.aborting {
+            self.aborting_sockets -= 1;
+        }
         self.sockets.remove(socket.0);
         Ok(())
     }
@@ -2123,7 +2144,8 @@ impl Driver {
             .get_mut(socket.0)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
         entry.closing = true;
-        let half_close = if entry.kind == SocketKind::TcpStream {
+        let aborting = entry.aborting;
+        let half_close = if entry.kind == SocketKind::TcpStream && !aborting {
             entry
                 .fd
                 .as_ref()
@@ -2136,7 +2158,7 @@ impl Driver {
             let affects = op.socket == socket;
             #[cfg(feature = "tcp-splice")]
             let affects = affects || op.destination == Some(socket);
-            if op.kind != Kind::Idle && op.kind != Kind::Send && affects {
+            if op.kind != Kind::Idle && (op.kind != Kind::Send || aborting) && affects {
                 self.scratch.push(op.key(index));
             }
         }
@@ -2145,6 +2167,7 @@ impl Driver {
             self.schedule(key);
         }
         self.close_if_idle(socket)?;
+        self.release_aborted_sockets()?;
         half_close
     }
     pub fn cancel(&mut self, token: Token) -> io::Result<()> {
@@ -3322,14 +3345,14 @@ impl Driver {
         }
     }
     fn release_aborted_sockets(&mut self) -> io::Result<()> {
-        if !self.stopping {
+        if !self.stopping && self.aborting_sockets == 0 {
             return Ok(());
         }
         for (_, socket) in self.sockets.iter_mut() {
             // SPLICE resolves its input descriptor in io-wq. Wait for native
             // requests to retire before freeing descriptor numbers; a send's
             // separate ZC notification does not hold this barrier open.
-            if socket.native_pending != 0 {
+            if socket.native_pending != 0 || (!self.stopping && !socket.aborting) {
                 continue;
             }
             #[cfg(feature = "fixed-files")]
@@ -3338,6 +3361,10 @@ impl Driver {
                 socket.fixed = None;
             }
             socket.fd.take();
+            if socket.aborting {
+                socket.aborting = false;
+                self.aborting_sockets -= 1;
+            }
         }
         Ok(())
     }

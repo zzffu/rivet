@@ -10,16 +10,19 @@ compile_error!("rivet supports Linux 7.2.7+, Windows, and Android");
 pub mod buffer;
 pub mod capability;
 pub mod config;
+pub mod io;
 pub mod net;
 pub mod runtime;
+pub mod signal;
 pub mod socket;
+pub mod sync;
 pub mod time;
 
 pub(crate) mod driver;
 
 pub use buffer::{BufferPool, ReadBuf, SendBuf, SendPayload, WriteBuf};
 pub use capability::{CapabilityReport, OptimizationState, ZcStats};
-pub use config::{Optimization, Policy, RuntimeConfig};
+pub use config::{BlockingConfig, Optimization, Policy, RuntimeConfig};
 pub use net::{TcpListener, TcpStream, UdpSocket};
-pub use runtime::{Handle, Runtime, spawn, spawn_local};
+pub use runtime::{Handle, Runtime, spawn, spawn_blocking, spawn_local};
 pub use socket::{ImportError, SocketOptions};

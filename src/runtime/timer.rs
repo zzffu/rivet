@@ -15,6 +15,7 @@ pub(crate) struct TimerQueue {
     slots: Box<[Slot]>,
     free: Vec<u32>,
     heap: Vec<u32>,
+    closed: bool,
 }
 impl TimerQueue {
     pub fn new(capacity: usize) -> Self {
@@ -27,9 +28,16 @@ impl TimerQueue {
                 .collect(),
             free: (0..capacity as u32).rev().collect(),
             heap: Vec::with_capacity(capacity),
+            closed: false,
         }
     }
     pub fn insert(&mut self, deadline: Instant, waker: Waker) -> io::Result<u64> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "timer runtime has stopped",
+            ));
+        }
         let index = self.free.pop().ok_or_else(|| {
             io::Error::new(io::ErrorKind::WouldBlock, "timer admission limit reached")
         })?;
@@ -57,6 +65,26 @@ impl TimerQueue {
         };
         if !entry.waker.will_wake(waker) {
             entry.waker = waker.clone();
+        }
+        true
+    }
+    pub fn reset(&mut self, token: u64, deadline: Instant) -> bool {
+        let Some(slot) = self.slots.get_mut(token as u32 as usize) else {
+            return false;
+        };
+        if slot.generation != (token >> 32) as u32 {
+            return false;
+        }
+        let Some(entry) = slot.entry.as_mut() else {
+            return false;
+        };
+        let previous = entry.deadline;
+        let position = entry.heap_index;
+        entry.deadline = deadline;
+        if deadline < previous {
+            self.up(position);
+        } else if deadline > previous {
+            self.down(position);
         }
         true
     }
@@ -161,9 +189,122 @@ impl TimerQueue {
             self.remove_at(0).wake();
         }
     }
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
     pub fn clear(&mut self) {
+        self.closed = true;
         while !self.heap.is_empty() {
             self.remove_at(0).wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Wake,
+        time::Duration,
+    };
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl WakeCount {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn reset_moves_deadlines_in_both_heap_directions() {
+        let now = Instant::now();
+        let mut timers = TimerQueue::new(3);
+        let first = Arc::new(WakeCount::default());
+        let second = Arc::new(WakeCount::default());
+        let third = Arc::new(WakeCount::default());
+        let first_token = timers
+            .insert(now + Duration::from_secs(20), Waker::from(first.clone()))
+            .unwrap();
+        timers
+            .insert(now + Duration::from_secs(30), Waker::from(second.clone()))
+            .unwrap();
+        let third_token = timers
+            .insert(now + Duration::from_secs(40), Waker::from(third.clone()))
+            .unwrap();
+
+        assert!(timers.reset(third_token, now + Duration::from_secs(10)));
+        timers.expire(now + Duration::from_secs(9), 3);
+        assert_eq!((first.count(), second.count(), third.count()), (0, 0, 0));
+        timers.expire(now + Duration::from_secs(10), 3);
+        assert_eq!((first.count(), second.count(), third.count()), (0, 0, 1));
+
+        assert!(timers.reset(first_token, now + Duration::from_secs(50)));
+        timers.expire(now + Duration::from_secs(30), 3);
+        assert_eq!((first.count(), second.count(), third.count()), (0, 1, 1));
+        timers.expire(now + Duration::from_secs(49), 3);
+        assert_eq!(first.count(), 0);
+        timers.expire(now + Duration::from_secs(50), 3);
+        assert_eq!(first.count(), 1);
+        assert!(timers.next_deadline().is_none());
+    }
+
+    #[test]
+    fn reset_stays_bounded_and_expired_tokens_cannot_touch_reused_slots() {
+        let now = Instant::now();
+        let mut timers = TimerQueue::new(1);
+        let heap_capacity = timers.heap.capacity();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(wakes.clone());
+        let token = timers
+            .insert(now + Duration::from_secs(10), waker.clone())
+            .unwrap();
+        for iteration in 0..8192 {
+            let seconds = if iteration % 2 == 0 { 5 } else { 10 };
+            assert!(timers.reset(token, now + Duration::from_secs(seconds)));
+        }
+        assert_eq!(timers.heap.len(), 1);
+        assert_eq!(timers.heap.capacity(), heap_capacity);
+        assert_eq!(
+            timers.insert(now, waker.clone()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        timers.expire(now + Duration::from_secs(9), 1);
+        assert_eq!(wakes.count(), 0);
+        timers.expire(now + Duration::from_secs(10), 1);
+        assert_eq!(wakes.count(), 1);
+
+        timers.insert(now + Duration::from_secs(20), waker).unwrap();
+        assert!(!timers.reset(token, now));
+        timers.remove(token);
+        timers.expire(now + Duration::from_secs(19), 1);
+        assert_eq!(wakes.count(), 1);
+        timers.expire(now + Duration::from_secs(20), 1);
+        assert_eq!(wakes.count(), 2);
+    }
+
+    #[test]
+    fn shutdown_wakes_waiters_and_permanently_closes_admission() {
+        let mut timers = TimerQueue::new(1);
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(wakes.clone());
+        timers.insert(Instant::now(), waker.clone()).unwrap();
+        timers.clear();
+        timers.clear();
+        assert_eq!(wakes.count(), 1);
+        assert!(timers.is_closed());
+        assert_eq!(
+            timers.insert(Instant::now(), waker).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 }

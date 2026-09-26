@@ -2,7 +2,7 @@
 
 ## 1. 范围与不可变约束
 
-Rivet 是 Rust 原生网络异步运行时。Linux 基线为 7.2.7，Windows 使用 RIO + IOCP，Android 普通应用使用 epoll 和非阻塞 socket。公开 Interface 使用标准 `Future`，不依赖 Tokio，不提供 TLS、DNS、HTTP、QUIC、RPC 编解码、文件 I/O、用户态协议栈、DMA-BUF 或 BPF 执行。
+Rivet 是 Rust 原生网络异步运行时。Linux 基线为 7.2.7，Windows 使用 RIO + IOCP，Android 普通应用使用 epoll 和非阻塞 socket。公开 Interface 使用标准 `Future`，不依赖 Tokio，不提供 TLS、DNS、HTTP、QUIC、RPC 编解码、原生异步文件 I/O、用户态协议栈、DMA-BUF 或 BPF 执行。同步文件及 FFI 工作可交给有界阻塞执行通道。
 
 支持 IPv4/IPv6、TCP 客户端与服务端、UDP connected/unconnected、批量数据报、分段发送、外部 socket 接管以及 Android Network/VPN 接入。广播和组播不在交付范围内。TCP splice 是纯字节流透明转发优化，不是文件 I/O 或协议代理框架。
 
@@ -132,7 +132,51 @@ Linux 的 UDP 分段元数据解析属于数据报语义，不属于可选的优
 
 Android 允许指定 Network，并提供连接/首次发送前的宿主保护钩子。宿主负责 Android 权限和 Java/JNI 对象生命周期。保护或绑定失败必须阻止继续连接。核心不附带 Kotlin SDK、VPN 应用、TUN 或后台保活机制。
 
-## 8. 验证
+## 8. 通用宿主能力设计
+
+以下设计先于实现确定。目标是让应用适配 Rivet，而非模拟 Tokio；网络 worker、socket 和缓冲区继续保持本地所有权。协议、路由、网络代际、启动事务和业务排空顺序仍属于应用。
+
+### 8.1 阻塞执行
+
+Runtime 拥有独立阻塞池；`RuntimeConfig` 指定线程上限和排队上限。`Handle::spawn_blocking` 与当前 worker 的 `runtime::spawn_blocking` 接收 `Send + 'static` 闭包，返回可异步等待的拥有型任务句柄。池按需启动，不为每个调用创建线程；满额和停止均显式拒绝，不静默产生无界队列。
+
+取消区分排队与运行：尚未执行的闭包可取消；开始运行的同步代码不能安全强杀。丢弃等待者不能提前释放仍运行工作的额度或关联资源。执行 panic 转成任务失败，取消期析构 panic 则隔离并保留 `Cancelled` 分类，不能杀死执行通道。关闭先停止准入并取消尚未开始的工作，再回收异步 worker，最后等待所有已开始阻塞工作及其线程真正结束。阻塞代码不得依赖在 Runtime 销毁之后继续执行的异步任务；库不提供会暂停本地网络 worker 的 `block_in_place`。
+
+### 8.2 非 socket I/O
+
+`io` Module 为每个 Runtime 管理有界原生注册表，独立于 TCP/UDP driver。Linux/Android 提供拥有型 `AsyncFd`：仅接管可轮询的非阻塞描述符，分别等待读/写 readiness，通过同步 `try_io` 闭包执行实际操作；`WouldBlock` 清除相应 readiness 后重新等待。Windows 提供拥有型 `AsyncHandle`，异步等待原生可等待对象；不把普通文件或任意 HANDLE 冒充 socket 或异步文件。
+
+注册返回前验证容量和原生句柄；失败返还所有权。事件使用不可复用的代际身份，避免迟到通知命中复用的描述符。取消等待不关闭描述符，也不丢掉尚未消费的 readiness；关闭或 Runtime 停止注销原生等待并唤醒等待者。注册表按需使用共享原生等待设施，不为每个 FD 创建线程。Unix 非 socket readiness 的专用等待路径不是 Linux TCP/UDP 的 epoll 回退。
+
+### 8.3 TCP 中止
+
+`TcpStream::abort` 消费连接，先选择 abortive close，再经现有关闭路径收敛请求。正常 Drop 和 `shutdown(Write)` 的语义不变。设置失败必须可观察；即使中止连接，已提交发送的存储也保留至真实内核释放。三个网络后端均实现这项 TCP 语义，包括 Linux direct descriptor 路径；不向调用方泄露可随意关闭或长期持有的裸句柄。
+
+### 8.4 任务组和受监督连接
+
+`runtime::TaskGroup` 有明确容量，接收自动放置工厂或本地 Future，拥有所有子任务句柄。支持等待任意完成、统一 abort，以及可重试的异步 shutdown；取消一次 join/shutdown 等待不丢失其余任务的回收责任。组 Drop 请求取消，只有实际 join 才证明子任务已经终止。可克隆的 abort 控制不转移结果接收权。
+
+`TcpListener` 的受监督服务 Interface 在业务名额可用后才轮询下一次 accept，转交 idle socket 后把 handler 纳入任务组。停止信号优先于新准入；已有连接先获得协作取消通知并在宽限期内排空，超时才 abort 并 join。handler panic 和原生接管失败不能隐藏在 detached 任务中。业务名额与 driver 的有界预接受队列分别计数。简单 `serve` 也使用受监督实现，不再遗留无主 handler。
+
+### 8.5 执行器无关的同步
+
+`sync` Module 选用成熟、执行器无关的有界 channel、oneshot、Mutex、RwLock 和 Semaphore 实现，不重写其竞争算法。补充 watch 最新值广播、Notify 和协作 `CancellationToken`。所有等待通过标准 Waker；注册等待与再次检查状态必须闭合丢失唤醒窗口。channel 背压、关闭后排空、watch 合并更新、Notify 单个保留许可与取消广播分别具有明确契约。同步原语不需要当前 Runtime，也不把 `!Send` payload 伪装成可跨线程数据。
+
+### 8.6 定时器
+
+`Sleep::reset` 在已注册的索引堆槽中更新 deadline，不累积旧节点；完成后的 Sleep 可重新启动。周期 `Interval` 使用单个 Sleep，返回计划 tick 时刻，取消等待不消费 tick；零周期和时间溢出显式报错。错过 tick 的策略显式区分补发、跳过和从当前时间延后，不用忙循环追赶。已有 timeout 的“同时就绪时操作优先”不变。
+
+### 8.7 宿主信号
+
+`signal` Module 显式订阅宿主退出事件：Unix SIGINT/SIGTERM，Windows Ctrl+C/Ctrl+Break。无订阅时不安装处理器；订阅释放后解除本次注册，不吞掉宿主后续默认行为。信号回调只做平台允许的标记/通知，不分配、不运行应用代码。等待可取消，重复事件允许合并，停止订阅必须回收原生等待和辅助线程。该 Module 只发出事件，不主动退出进程或规定应用的关闭顺序。
+
+Unix 仅接管默认／忽略 disposition，遇到现有自定义 handler 返回 `AlreadyExists`；宿主负责把其他 `sigaction` 修改与订阅构造／销毁串行化。Windows 订阅期间不更换 console。原生 handler 使用在途读者协议保护通知句柄的关闭／复用；dispatcher 在注册锁外唤醒。自定义 Waker 若在 dispatcher 自身释放最后订阅，停止标记保证回调返回后退出，不尝试 join 自身。
+
+### 8.8 验收
+
+验证必须覆盖真实阻塞任务及其排队/运行取消、真实 pipe 或 waitable event、真实 TCP RST、跨 worker 任务组与服务排空、同步竞争和定时器重置/错过 tick。进程信号只在隔离子进程中触发，不能向开发宿主发送退出信号。Windows 原生执行及隔离 Linux guest 执行分别提供证据；Android 编译和普通 App 场景不以桌面结果代替。
+
+## 9. 验证
 
 - Windows 实际 RIO/IOCP TCP/UDP、IPv4/IPv6、接管、超时、关闭和数据完整性。
 - Linux 7.2.7 实际 syscall 与网络路径；分别验证各优化和合法组合。

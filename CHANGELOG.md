@@ -2,6 +2,14 @@
 
 ## 0.1.0
 
+- 新增按需启动的有界阻塞池，区分排队取消与运行中工作，Runtime 停止时保留额度、清理责任和原生线程 join。
+- 新增 Runtime 级有界非 socket 注册表：Linux／Android `AsyncFd` readiness 与 Windows `AsyncHandle` 原生等待；保留失败接管所有权、取消安全和迟到事件隔离。
+- 新增三后端 `TcpStream::abort`，显式触发 TCP RST，并保持 direct/fixed socket、在途发送及 ZC 内存释放的真实生命周期。
+- 新增 `TaskGroup`、可克隆 `AbortHandle` 和 `serve_until`；连接分发不再 detach，支持有界准入、协作停止、宽限期及强制回收。任务完成回执推迟到 Future／工厂销毁之后。
+- 新增执行器无关的 channel、oneshot、异步锁、Semaphore、watch、Notify 和 `CancellationToken`。
+- 新增原位 `Sleep::reset`、可取消等待的 `Interval` 及 Burst／Skip／Delay 错过 tick 策略。
+- 新增作用域退出信号订阅，多订阅广播并在释放后恢复宿主处理；Unix 不覆盖已有自定义 handler，真实信号回归仅操作隔离子进程。
+- 新增跨平台 `runtime_services` 可执行场景，并复用于 Android 普通 App；补充系统设计、生命周期契约与消费者行为回归。
 - 新增原生 Rust Future 网络运行时：自动初始放置、本地任务、跨线程唤醒、有界定时器／资源与空闲等待。
 - 新增 TCP／UDP IPv4／IPv6、半关闭、批量数据报、拥有型 socket 接管及 Android Network／宿主配置钩子。
 - 新增 Linux 7.2.7 io_uring、Windows RIO＋IOCP、Android 普通 App epoll 后端；不以其他后端静默替代明确请求的路径。

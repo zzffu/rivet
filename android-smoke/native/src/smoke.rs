@@ -16,6 +16,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "../../../examples/support/services.rs"]
+mod runtime_services;
+
 pub struct CaseResult {
     pub name: &'static str,
     pub status: &'static str,
@@ -967,6 +970,11 @@ fn record_async(
 
 pub fn suite(network: u64) -> Vec<CaseResult> {
     let mut cases = Vec::new();
+    record(
+        "runtime_host_services",
+        runtime_services::run(config()),
+        &mut cases,
+    );
     record_async(
         "tcp_ipv4_full_duplex_half_close",
         tcp_full_duplex(Ipv4Addr::LOCALHOST.into()),

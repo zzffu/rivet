@@ -5,9 +5,14 @@
 //! on the next call. Other workers run continuously. Automatic placement never
 //! chooses an inactive caller worker; in a single-thread runtime an external
 //! spawn while `block_on` is not running returns `SpawnError::NotRunning`.
-//! Dropping the runtime cancels local tasks and drains native memory releases on
-//! every owner thread before joining those threads.
+//! Dropping the runtime stops admission, cancels queued blocking work, reclaims
+//! native registrations, and drains async tasks and native memory releases on
+//! every owner thread. It then joins all started blocking work. Blocking closures
+//! cannot be forcibly stopped and must not depend on async tasks that runtime
+//! destruction has stopped, even when their result handles were detached.
 
+mod blocking;
+mod group;
 pub(crate) mod io;
 mod task;
 pub(crate) mod timer;
@@ -18,7 +23,9 @@ use crate::{
     config::RuntimeConfig,
     driver::{Driver, Event, Notifier, Shared},
 };
+pub use blocking::{BlockingJoinHandle, BlockingSpawnError};
 use crossbeam_queue::ArrayQueue;
+pub use group::TaskGroup;
 use parking_lot::Mutex;
 use std::{
     cell::RefCell,
@@ -38,8 +45,8 @@ use std::{
     thread::{self, JoinHandle as Thread},
     time::{Duration, Instant},
 };
+pub use task::{AbortHandle, JoinError, JoinHandle, SpawnError, yield_now};
 use task::{Admission, Launch, TaskSet};
-pub use task::{JoinError, JoinHandle, SpawnError, yield_now};
 
 thread_local! {
     #[cfg_attr(
@@ -59,7 +66,18 @@ pub(crate) fn current() -> stdio::Result<Rc<Worker>> {
         )
     })
 }
-struct Enter;
+pub(crate) fn io_registry() -> stdio::Result<Arc<crate::io::Registry>> {
+    let worker = current()?;
+    let group = worker
+        .group
+        .upgrade()
+        .filter(|group| !group.stopping.load(Ordering::Acquire))
+        .ok_or_else(|| stdio::Error::new(stdio::ErrorKind::BrokenPipe, "runtime has stopped"))?;
+    Ok(group.io.clone())
+}
+struct Enter {
+    previous: Option<Rc<Worker>>,
+}
 impl Enter {
     fn new(worker: &Rc<Worker>) -> Self {
         CURRENT.with(|slot| {
@@ -67,13 +85,20 @@ impl Enter {
             assert!(slot.is_none(), "nested Rivet execution is not supported");
             *slot = Some(worker.clone());
         });
-        Self
+        Self { previous: None }
+    }
+    fn shutdown(worker: &Rc<Worker>) -> Self {
+        // An idle runtime may be destroyed from another runtime's root. Local
+        // destructors still need their own worker, then the caller is restored.
+        Self {
+            previous: CURRENT.with(|slot| slot.replace(Some(worker.clone()))),
+        }
     }
 }
 impl Drop for Enter {
     fn drop(&mut self) {
         CURRENT.with(|slot| {
-            slot.borrow_mut().take();
+            slot.replace(self.previous.take());
         });
     }
 }
@@ -112,6 +137,8 @@ impl WorkerShared {
 }
 struct Group {
     workers: Vec<Arc<WorkerShared>>,
+    blocking: Arc<blocking::Pool>,
+    io: Arc<crate::io::Registry>,
     stopping: AtomicBool,
     cursor: AtomicUsize,
 }
@@ -155,6 +182,7 @@ impl Group {
     }
     fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
+        self.blocking.stop();
         for worker in &self.workers {
             worker.inbox.lock().closed = true;
             worker.notifier.notify();
@@ -175,6 +203,25 @@ impl Handle {
             .upgrade()
             .map(|group| Self { group })
             .ok_or_else(|| stdio::Error::new(stdio::ErrorKind::BrokenPipe, "runtime has stopped"))
+    }
+    /// Submit a `Send` closure to the runtime-wide bounded blocking pool.
+    ///
+    /// Unlike async placement, this also works while worker zero is inactive.
+    /// No blocking thread is created until needed; queue pressure and native
+    /// thread creation failures are returned without running the closure.
+    pub fn spawn_blocking<F, T>(
+        &self,
+        function: F,
+    ) -> Result<BlockingJoinHandle<T>, BlockingSpawnError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.group.stopping.load(Ordering::Acquire) {
+            blocking::drop_safely(function);
+            return Err(BlockingSpawnError::ShuttingDown);
+        }
+        self.group.blocking.spawn(function)
     }
     pub fn spawn<F, Fut, T>(&self, factory: F) -> Result<JoinHandle<T>, SpawnError>
     where
@@ -215,6 +262,22 @@ where
     Handle::current()
         .map_err(|_| SpawnError::NotRunning)?
         .spawn(factory)
+}
+/// Submit blocking work from the current Rivet worker.
+///
+/// Use [`Handle::spawn_blocking`] to submit from outside a running worker.
+pub fn spawn_blocking<F, T>(function: F) -> Result<BlockingJoinHandle<T>, BlockingSpawnError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match Handle::current() {
+        Ok(handle) => handle.spawn_blocking(function),
+        Err(_) => {
+            blocking::drop_safely(function);
+            Err(BlockingSpawnError::NotRunning)
+        }
+    }
 }
 pub fn spawn_local<F: Future + 'static>(future: F) -> Result<JoinHandle<F::Output>, SpawnError>
 where
@@ -267,15 +330,26 @@ impl Runtime {
         }
         let group = Arc::new(Group {
             workers,
+            blocking: blocking::Pool::new(config.blocking)?,
+            io: Arc::new(crate::io::Registry::new(config.max_async_io)?),
             stopping: AtomicBool::new(false),
             cursor: AtomicUsize::new(0),
         });
         let worker = Worker::new(config.clone(), 0, &group, backend_shared.clone())?;
-        let mut capabilities = vec![worker.driver.borrow().capabilities().clone()];
-        let mut threads = Vec::with_capacity(config.workers - 1);
+        let mut capabilities = Vec::with_capacity(config.workers);
+        capabilities.push(worker.driver.borrow().capabilities().clone());
+        // Install the cleanup owner before any thread is created. Every later
+        // initialization error or panic follows the same full shutdown path.
+        let mut runtime = Self {
+            worker,
+            group,
+            threads: Vec::with_capacity(config.workers - 1),
+            capabilities,
+            _local: PhantomData,
+        };
         for index in 1..config.workers {
             let config = config.clone();
-            let group_thread = group.clone();
+            let group_thread = runtime.group.clone();
             let shared = backend_shared.clone();
             let (sender, receiver) = mpsc::sync_channel(1);
             let thread = thread::Builder::new()
@@ -298,10 +372,18 @@ impl Runtime {
                     }
                     let run = catch_unwind(AssertUnwindSafe(|| worker.run_background()));
                     worker.shared.active.store(false, Ordering::Release);
-                    let cleanup = worker.shutdown();
-                    match run {
-                        Ok(result) => result.and(cleanup),
-                        Err(panic) => {
+                    if run.is_err() {
+                        group_thread.stop();
+                    }
+                    let cleanup = catch_unwind(AssertUnwindSafe(|| worker.shutdown()));
+                    match (run, cleanup) {
+                        (Ok(result), Ok(cleanup)) => result.and(cleanup),
+                        (Err(panic), cleanup) => {
+                            group_thread.stop();
+                            blocking::drop_safely(cleanup);
+                            resume_unwind(panic)
+                        }
+                        (_, Err(panic)) => {
                             group_thread.stop();
                             resume_unwind(panic)
                         }
@@ -309,35 +391,16 @@ impl Runtime {
                 });
             let initialization = match thread {
                 Ok(thread) => {
-                    threads.push(thread);
+                    runtime.threads.push(thread);
                     receiver.recv().unwrap_or_else(|_| {
                         Err(stdio::Error::other("worker exited during initialization"))
                     })
                 }
                 Err(error) => Err(error),
             };
-            match initialization {
-                Ok(report) => capabilities.push(report),
-                Err(error) => {
-                    group.stop();
-                    {
-                        let _enter = Enter::new(&worker);
-                        let _ = worker.shutdown();
-                    }
-                    for thread in threads {
-                        let _ = thread.join();
-                    }
-                    return Err(error);
-                }
-            }
+            runtime.capabilities.push(initialization?);
         }
-        Ok(Self {
-            worker,
-            group,
-            threads,
-            capabilities,
-            _local: PhantomData,
-        })
+        Ok(runtime)
     }
     pub fn handle(&self) -> Handle {
         Handle {
@@ -402,13 +465,15 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.group.stop();
-        {
-            let _enter = Enter::new(&self.worker);
+        blocking::ignore_panic(|| self.group.io.shutdown());
+        blocking::ignore_panic(|| {
+            let _enter = Enter::shutdown(&self.worker);
             let _ = self.worker.shutdown();
-        }
+        });
         for thread in self.threads.drain(..) {
-            let _ = thread.join();
+            blocking::drop_safely(thread.join());
         }
+        self.group.blocking.join();
     }
 }
 /// Snapshot of the current driver. Shared ZCRX instance counters are not
@@ -566,7 +631,9 @@ impl Worker {
                 let body = self.tasks.borrow_mut().finish(running, finished);
                 // A future's destructor may close sockets or spawn work. Never
                 // drop it while borrowing the task table or driver.
-                let _ = catch_unwind(AssertUnwindSafe(|| drop(body)));
+                if let Some(body) = body {
+                    blocking::ignore_panic(|| body.complete());
+                }
             }
         }
     }
@@ -592,18 +659,15 @@ impl Worker {
         loop {
             let command = self.shared.inbox.lock().factories.pop_front();
             match command {
-                Some(command) => drop(command),
+                Some(command) => blocking::drop_safely(command),
                 None => break,
             }
         }
         while !self.tasks.borrow().is_empty() {
             let body = self.tasks.borrow_mut().take_shutdown();
-            let _ = catch_unwind(AssertUnwindSafe(|| {
-                if let Some(body) = body {
-                    body.as_ref().fail(JoinError::Cancelled);
-                    drop(body);
-                }
-            }));
+            if let Some(body) = body {
+                blocking::ignore_panic(|| body.complete());
+            }
         }
         self.timers.borrow_mut().clear();
         self.io
@@ -709,6 +773,8 @@ mod tests {
                 })
                 .collect(),
             stopping: AtomicBool::new(false),
+            blocking: blocking::Pool::new(crate::config::BlockingConfig::default()).unwrap(),
+            io: Arc::new(crate::io::Registry::new(1).unwrap()),
             cursor: AtomicUsize::new(0),
         }
     }
@@ -731,7 +797,10 @@ mod tests {
 
         let command = group.workers[2].inbox.lock().factories.pop_front().unwrap();
         drop(command);
-        assert_eq!(block_on(poll_once(&mut join)), Some(Err(JoinError::Cancelled)));
+        assert_eq!(
+            block_on(poll_once(&mut join)),
+            Some(Err(JoinError::Cancelled))
+        );
         assert_eq!(group.workers[2].admitted.load(Ordering::Acquire), 0);
         assert!(group.workers[2].inbox.lock().factories.is_empty());
         drop(occupied);

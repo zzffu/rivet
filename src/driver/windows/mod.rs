@@ -927,6 +927,23 @@ impl Driver {
         Ok(())
     }
 
+    pub fn abort(&mut self, socket: SocketId) -> io::Result<()> {
+        let record = self.socket(socket)?;
+        if record.info.kind != SocketKind::TcpStream {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "abortive close requires a TCP stream",
+            ));
+        }
+        record
+            .handle
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
+            .set_linger(Some(Duration::ZERO))?;
+        // Preserve RIO/OVERLAPPED storage until actual completion dequeue.
+        self.close(socket)
+    }
+
     pub fn close(&mut self, socket: SocketId) -> io::Result<()> {
         let record = self.sockets.get_mut(socket.0).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "stale socket identifier")

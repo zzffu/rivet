@@ -8,6 +8,8 @@ This document specifies the internal ownership and completion contracts. The sys
 
 `buffer` owns reusable leases; `net` exposes concrete network futures; `time` owns timer futures. Native implementations are isolated in `driver::linux`, `driver::windows` and `driver::android`. Platform details remain behind the driver contract rather than leaking into public network types.
 
+`runtime::blocking` owns bounded synchronous work independently of the network workers. `io` owns bounded non-socket native registrations; `sync` supplies executor-independent coordination; `signal` owns explicitly scoped process-signal subscriptions. None of these modules implements a Tokio reactor or a protocol stack.
+
 ## Platform handles
 
 `socket::OwnedSocket` and `socket::BorrowedSocket<'a>` are aliases to the standard owning/borrowing socket handles on Windows and `OwnedFd`/`BorrowedFd` on Unix. `RawSocket` is the corresponding platform raw type.
@@ -82,6 +84,7 @@ Required methods:
 - `Driver::splice(&mut self, token: Token, source: SocketId, destination: SocketId, bytes: usize) -> io::Result<()>`.
 - `Driver::shutdown(&mut self, socket: SocketId, how: std::net::Shutdown) -> io::Result<()>`.
 - `Driver::close(&mut self, socket: SocketId) -> io::Result<()>` and `cancel(&mut self, token: Token) -> io::Result<()>`.
+- Abortive-close setup must select zero linger on the same underlying TCP socket, including Linux fixed/direct references, before entering the existing close path. It must not fabricate send completion or native memory release.
 - `Driver::poll(&mut self, timeout: Option<Duration>, events: &mut Vec<Event>) -> io::Result<()>`; `Some(Duration::ZERO)` is nonblocking. Append events to caller-reused storage, bounded by its configured completion budget. Wake-only events are consumed internally.
 - `Driver::is_idle(&self) -> bool` and `begin_shutdown(&mut self)` for deterministic owner-thread cleanup. Drop must not release memory still referenced by the OS.
 - `Driver::zc_stats(&self) -> ZcStats` returns counters only when observation is enabled, never fabricates zero-copy success from opcode support.
@@ -114,7 +117,7 @@ Worker zero progresses only inside `block_on`; its retained local tasks resume o
 
 Load-based placement is a hint. For each candidate, checking active/closed state, admitting the task and committing its factory are serialized by that worker's inbox lock. An inactive or full candidate does not prevent a bounded attempt at the remaining workers. Factory destruction is outside that lock.
 
-Cancellation and shutdown isolate panics when dropping the captures of an admitted but unlaunched factory, just as they isolate a launched future's destructor. Captures stay owner-thread-local at destruction, cancellation is still reported as `JoinError::Cancelled`, and admission is released exactly once.
+Cancellation and shutdown isolate panics when dropping the captures of an admitted but unlaunched factory, just as they isolate a launched future's destructor. Captures stay owner-thread-local at destruction, cancellation is still reported as `JoinError::Cancelled`, and admission is released exactly once. Join results and the shared finished flag are published only after future/factory destruction. Execution and normal-completion destructor panics are `JoinError::Panicked`; native I/O convergence remains a separate lifetime.
 
 `runtime::buffer_pool() -> io::Result<BufferPool>` returns the current worker's existing pool, including inside automatically placed factories. `runtime::zc_stats()` snapshots the current driver; `Runtime::zc_stats()` snapshots only the owner/root driver, not an aggregate across workers. Shared ZCRX kernel-instance observations must not be summed repeatedly through imported views.
 
@@ -123,3 +126,17 @@ Public network operations are concrete futures; they do not box each I/O. TCP/UD
 Socket closure, task cancellation, operation retirement and kernel memory release are separate transitions. Driver completion events wake the matching operation/receive waiter; stale generations cannot affect a newer object. The root loop drains shutdown and backend completions before destroying the Driver.
 
 Default optional policies are Off until explicitly requested. `RuntimeConfig::enable(Optimization)` requests RequireCapability. Explicit Auto permits fallback only for that optimization. CPU/queue sizes and memory budgets are machine-level configuration, not manual per-workload scheduling groups.
+
+## Generic host services
+
+`BlockingConfig { threads, queue_capacity }` bounds a lazy, runtime-owned blocking pool. Accepted closures and results are `Send + 'static`. `BlockingJoinHandle` can cancel queued work, but running synchronous code is not forcibly interrupted. Dropping a waiter does not free a still-running slot; rejected/cancelled captures and discarded results are destroyed outside admission locks with panic isolation. Completion is published after cleanup and running-slot release. Runtime shutdown closes admission, cancels queued work, stops native registrations, cleans/joins asynchronous workers, then joins blocking workers. A blocking closure must not depend on async work that shutdown has stopped.
+
+`TaskGroup<T>` retains every admitted join handle, including completed results until consumed. `join_next` is ready-driven; cancelling it or `shutdown` does not detach children. `shutdown` permanently closes group admission and remembers an observed failure across retries. Group drop requests abort, whereas successful joining proves future cleanup. `serve_until` owns its handler group, prioritizes stop over accept, sends cooperative cancellation, observes the grace deadline, then aborts/joins. Its business capacity and the driver's bounded pre-accept queue are distinct.
+
+`io::Registry` is runtime-owned and capacity-checked before allocation. Generation identities are never reused after wrapping. Unix registrations cache edge-triggered readiness; `try_io` clears only the matching direction/epoch on `WouldBlock`, so a concurrent newer edge survives. The shared epoll helper is only for explicitly imported non-socket I/O, not a network fallback. Windows validates object type/access without consuming a signal: mutex and file handles are rejected; threadpool waits arm only when a waiter is polled, cache one completion, and do not rearm merely because a manual-reset object remains signaled. Close disables rearming and joins callbacks before native ownership can be released. Runtime shutdown invalidates retained wait futures with `BrokenPipe`, even when their object outlives the runtime.
+
+`sync` uses async-channel, async-lock, futures-channel and event-listener without requiring an executor context. Custom watch updates are published under a value/version lock before notification; the final unread version takes precedence over last-sender closure. User value destructors run outside publication locks. Notify's single stored permit is independent of its broadcast generation; cancelling a broadcast listener must not turn that broadcast into a notification for a later waiter. Cancellation tokens remain sticky and broadcast, not cleanup acknowledgements.
+
+Timer reset adjusts an existing indexed-heap node instead of accumulating stale deadlines. Expired slots retain generation checks; queue shutdown permanently rejects re-admission. An interval owns one Sleep and commits its next deadline only on successful tick delivery. Burst advances one period, Skip advances to the next future grid point, and Delay schedules relative to the current instant. Zero periods and arithmetic overflow fail explicitly.
+
+Native signal callbacks only mark bounded pending bits and notify the OS wake object. A static in-flight-reader protocol guards route lookup against descriptor/HANDLE reuse during last-subscription teardown. Unix saves/restores default or ignored dispositions, rejects pre-existing custom handlers, and never overwrites a later replacement; external disposition changes must be serialized by the host. Windows uses the current console and unregisters its own handler. The shared dispatcher wakes subscribers outside registry locks. Last-subscription drop joins the dispatcher except when invoked by a custom Waker on that same thread; then the stop flag ensures exit and resource release after the callback returns.

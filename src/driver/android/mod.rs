@@ -511,6 +511,15 @@ impl Driver {
         Ok(())
     }
 
+    pub fn abort(&mut self, socket: SocketId) -> io::Result<()> {
+        let state = self.get(socket)?;
+        if state.kind != SocketKind::TcpStream {
+            return Err(invalid("abortive close requires a TCP stream"));
+        }
+        socket2::SockRef::from(&state.socket).set_linger(Some(Duration::ZERO))?;
+        self.close(socket)
+    }
+
     pub fn close(&mut self, socket: SocketId) -> io::Result<()> {
         let Some(state) = self.sockets.get(socket.0) else {
             return Ok(());

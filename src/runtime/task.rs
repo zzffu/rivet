@@ -27,8 +27,8 @@ pub enum SpawnError {
 impl fmt::Display for SpawnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::AtCapacity => "all workers are at their task admission limit",
-            Self::ShuttingDown => "the runtime is shutting down",
+            Self::AtCapacity => "task admission capacity is exhausted",
+            Self::ShuttingDown => "task admission is closed",
             Self::NotRunning => "no worker is currently driving this runtime",
         })
     }
@@ -90,6 +90,29 @@ impl<T> JoinCell<T> {
     }
 }
 
+/// Cloneable cancellation control without ownership of the task's result.
+/// Cancellation is observed on the task's owner thread; `is_finished` becomes
+/// true only after its future or unstarted factory has been destroyed.
+#[derive(Clone)]
+pub struct AbortHandle {
+    control: Arc<Control>,
+}
+impl AbortHandle {
+    pub fn abort(&self) {
+        self.control.cancel();
+    }
+    pub fn is_finished(&self) -> bool {
+        self.control.done.load(Ordering::Acquire)
+    }
+}
+impl fmt::Debug for AbortHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AbortHandle")
+            .field("finished", &self.is_finished())
+            .finish()
+    }
+}
+
 /// Joining transfers the result. Dropping a live handle requests owner-thread
 /// cancellation; use `detach` to let a task outlive its handle.
 pub struct JoinHandle<T> {
@@ -109,6 +132,11 @@ impl<T> JoinHandle<T> {
     }
     pub fn abort(&self) {
         self.cell.control.cancel();
+    }
+    pub fn abort_handle(&self) -> AbortHandle {
+        AbortHandle {
+            control: self.cell.control.clone(),
+        }
     }
     pub fn detach(mut self) {
         self.cancel_on_drop = false;
@@ -218,24 +246,45 @@ impl Wake for TaskWake {
 
 pub(crate) trait Body {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()>;
-    fn fail(self: Pin<&Self>, error: JoinError);
+    fn complete(self: Pin<Box<Self>>, error: Option<JoinError>);
 }
 pin_project_lite::pin_project! {
-    struct TypedBody<F: Future> { #[pin] future: F, cell: Arc<JoinCell<F::Output>> }
+    struct TypedBody<F: Future> {
+        #[pin] future: F,
+        cell: Arc<JoinCell<F::Output>>,
+        result: Option<F::Output>,
+    }
 }
 impl<F: Future> Body for TypedBody<F> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.project();
         match this.future.poll(cx) {
             Poll::Ready(result) => {
-                this.cell.complete(Ok(result));
+                *this.result = Some(result);
                 Poll::Ready(())
             }
             Poll::Pending => Poll::Pending,
         }
     }
-    fn fail(self: Pin<&Self>, error: JoinError) {
-        self.cell.complete(Err(error));
+    fn complete(mut self: Pin<Box<Self>>, error: Option<JoinError>) {
+        let cell = self.cell.clone();
+        let result = self.as_mut().project().result.take();
+        // Publish only after all future captures have been destroyed. Joining
+        // an aborted task therefore proves its socket guards have run.
+        let destroyed = catch_unwind(AssertUnwindSafe(|| drop(self)));
+        // Cancellation keeps its established classification even when cleanup
+        // panics; otherwise destruction is part of successful task completion.
+        let error = error.or_else(|| destroyed.is_err().then_some(JoinError::Panicked));
+        if let Some(mut error) = error {
+            if catch_unwind(AssertUnwindSafe(|| drop(result))).is_err()
+                && error != JoinError::Cancelled
+            {
+                error = JoinError::Panicked;
+            }
+            cell.complete(Err(error));
+        } else {
+            cell.complete(Ok(result.expect("completed task has a result")));
+        }
     }
 }
 
@@ -253,6 +302,17 @@ pub(crate) struct Running {
     body: Pin<Box<dyn Body>>,
     wake: Arc<TaskWake>,
     control: Arc<Control>,
+    error: Option<JoinError>,
+}
+
+pub(crate) struct Completed {
+    body: Pin<Box<dyn Body>>,
+    error: Option<JoinError>,
+}
+impl Completed {
+    pub fn complete(self) {
+        let _ = catch_unwind(AssertUnwindSafe(|| self.body.complete(self.error)));
+    }
 }
 impl TaskSet {
     pub fn new(capacity: usize) -> Self {
@@ -274,6 +334,7 @@ impl TaskSet {
             body: Some(Box::pin(TypedBody {
                 future,
                 cell: cell.clone(),
+                result: None,
             })),
             wake: Arc::new(TaskWake {
                 state: AtomicU8::new(0),
@@ -305,9 +366,10 @@ impl TaskSet {
             body,
             wake: entry.wake.clone(),
             control: entry.control.clone(),
+            error: None,
         })
     }
-    pub fn finish(&mut self, running: Running, finished: bool) -> Option<Pin<Box<dyn Body>>> {
+    pub fn finish(&mut self, running: Running, finished: bool) -> Option<Completed> {
         if !finished {
             self.entries.get_mut(running.id).unwrap().body = Some(running.body);
             return None;
@@ -316,7 +378,10 @@ impl TaskSet {
         if old & QUEUED == 0 {
             self.retire(running.id);
         }
-        Some(running.body)
+        Some(Completed {
+            body: running.body,
+            error: running.error,
+        })
     }
     fn retire(&mut self, id: u64) {
         if let Some(entry) = self.entries.remove(id)
@@ -325,14 +390,17 @@ impl TaskSet {
             entry._admission.0.retired.fetch_add(1, Ordering::AcqRel);
         }
     }
-    pub fn take_shutdown(&mut self) -> Option<Pin<Box<dyn Body>>> {
+    pub fn take_shutdown(&mut self) -> Option<Completed> {
         let key = self.entries.iter().next().map(|(key, _)| key)?;
         let mut entry = self.entries.remove(key).unwrap();
         entry.wake.state.fetch_or(CLOSED, Ordering::AcqRel);
         // Shutdown has closed admission. Late foreign wakes may enqueue only
         // integer tombstones, so owner cleanup need not wait for that thread
         // to resume between its scheduling CAS and queue publication.
-        entry.body.take()
+        entry.body.take().map(|body| Completed {
+            body,
+            error: Some(JoinError::Cancelled),
+        })
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -341,7 +409,7 @@ impl TaskSet {
 impl Running {
     pub fn poll(&mut self) -> bool {
         if self.control.cancelled.load(Ordering::Acquire) {
-            self.body.as_ref().fail(JoinError::Cancelled);
+            self.error = Some(JoinError::Cancelled);
             return true;
         }
         let waker = Waker::from(self.wake.clone());
@@ -350,7 +418,7 @@ impl Running {
             Ok(Poll::Ready(())) => true,
             Ok(Poll::Pending) => false,
             Err(_) => {
-                self.body.as_ref().fail(JoinError::Panicked);
+                self.error = Some(JoinError::Panicked);
                 true
             }
         }
@@ -368,8 +436,9 @@ struct Factory<F, T> {
 impl<F, T> Drop for Factory<F, T> {
     fn drop(&mut self) {
         if let Some(factory) = self.factory.take() {
-            self.cell.complete(Err(JoinError::Cancelled));
             let _ = catch_unwind(AssertUnwindSafe(|| drop(factory)));
+            self.admission.take();
+            self.cell.complete(Err(JoinError::Cancelled));
         }
     }
 }
@@ -390,7 +459,10 @@ where
                 self.cell.clone(),
                 self.admission.take().unwrap(),
             ),
-            Err(_) => self.cell.complete(Err(JoinError::Panicked)),
+            Err(_) => {
+                self.admission.take();
+                self.cell.complete(Err(JoinError::Panicked));
+            }
         }
     }
 }
