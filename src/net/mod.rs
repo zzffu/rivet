@@ -25,6 +25,116 @@ use std::{
     time::Duration,
 };
 
+/// Receive owned byte blocks from a full-duplex stream.
+///
+/// Only one active waiter may own the receive direction; a competing waiter
+/// returns [`io::ErrorKind::WouldBlock`]. Cancelling a receive wait must not
+/// discard queued, undelivered bytes. Receiving and sending progress
+/// independently: implementations must not hold a whole-stream lock across a
+/// network wait that prevents the other direction from progressing.
+pub trait StreamRecv {
+    /// Receive the next block, or `None` at EOF.
+    fn recv(&self) -> impl Future<Output = io::Result<Option<ReadBuf>>>;
+}
+
+/// Send immutable payloads without blocking the independent receive direction.
+///
+/// Every byte count describes the caller's original input, even when an
+/// implementation encodes or encrypts it. Accepted output may be buffered, but
+/// an implementation must not also return that output as unaccepted input.
+/// Success does not imply peer delivery or release of the kernel's read-only
+/// memory lease.
+///
+/// Dropping a submitted send future abandons observation, not already-submitted
+/// output. Retrying the original payload blindly can duplicate bytes. Native
+/// leases remain protected until the underlying operation releases them.
+///
+/// [`TcpStream`] retains its bounded logical send sequence: admission, not
+/// future construction, determines ordering, and exhausted admission limits
+/// can return [`io::ErrorKind::WouldBlock`].
+pub trait StreamSend {
+    /// Attempt a send, returning the original immutable payload even on error.
+    ///
+    /// A successful result counts accepted input bytes and may be short.
+    fn send(&self, data: SendPayload) -> impl Future<Output = SendOutcome>;
+
+    /// Send all input as one ordered logical send, retaining short-write progress.
+    ///
+    /// The outcome's payload is the unaccepted suffix, empty on success. An
+    /// error still returns only that suffix, so accepted input is not resent.
+    /// A successful result counts all accepted bytes in the original input
+    /// domain. Other sends must not interleave between this send's short writes.
+    /// The native implementation uses [`SendAll`], not a loop of independent
+    /// [`send`](Self::send) calls.
+    fn send_all(&self, data: SendPayload) -> impl Future<Output = SendOutcome>;
+
+    /// Drain this layer's accepted buffered output and flush the lower layer.
+    ///
+    /// Finish your own send futures first. This does not implicitly join newly
+    /// submitted concurrent sends, wait for peer acknowledgement, or wait for
+    /// read-only lease reclamation.
+    ///
+    /// Native TCP has no additional user-space output buffer. Its lazy flush
+    /// validates socket ownership on first poll and completes without another
+    /// driver operation or allocation. Missing current worker, wrong worker,
+    /// and destroyed runtime still report the native context errors.
+    fn flush(&self) -> impl Future<Output = io::Result<()>>;
+}
+
+/// Orderly, lazy shutdown of only a stream's write direction.
+///
+/// Constructing or dropping an unpolled future must not close anything.
+/// Buffered or transforming implementations drain accepted output and protocol
+/// trailers before shutting down the lower write direction. Callers first
+/// finish their own sends; concurrently submitted sends are not implicitly
+/// joined. After success, callers must not send more application data, but the
+/// receive direction remains usable for the peer's response.
+///
+/// Cancellation after polling does not promise rollback. Dropping or aborting
+/// the stream is not a substitute for orderly draining. [`TcpStream`] invokes
+/// its existing [`shutdown`](TcpStream::shutdown) with [`Shutdown::Write`] only
+/// when polled, preserving native errors without adding socket state.
+pub trait StreamShutdown {
+    /// Drain accepted output and half-close writing, leaving receiving open.
+    fn shutdown_write(&self) -> impl Future<Output = io::Result<()>>;
+}
+
+/// Receive datagrams with their boundaries and native metadata intact.
+///
+/// Only one active receive waiter is allowed; a competing waiter returns
+/// [`io::ErrorKind::WouldBlock`]. Cancelling the wait does not discard queued,
+/// undelivered datagrams. Sending and receiving progress independently;
+/// implementations must not hold a whole-socket lock across a network wait
+/// that prevents the other direction from progressing.
+pub trait DatagramRecv {
+    /// Receive one datagram, preserving its source, truncation and original
+    /// length when available. A zero-length datagram is a message, not EOF.
+    fn recv(&self) -> impl Future<Output = io::Result<Received>>;
+}
+
+/// Send individual datagrams without blocking the receive direction.
+///
+/// Each operation preserves a datagram boundary, including an empty payload.
+/// Both methods return the original immutable payload even on error; successful
+/// byte counts describe the caller's input, not an encoded representation.
+/// Success does not imply peer delivery or release of a read-only memory lease.
+///
+/// Native operation and in-flight byte limits remain bounded and can reject
+/// admission with [`io::ErrorKind::WouldBlock`]. Dropping a submitted future
+/// abandons observation, not already-submitted output; blindly retrying can
+/// duplicate a datagram. Native leases remain protected until memory release.
+pub trait DatagramSend {
+    /// Send one datagram to the socket's connected peer.
+    fn send(&self, data: SendPayload) -> impl Future<Output = SendOutcome>;
+
+    /// Send one datagram to `destination`.
+    fn send_to(
+        &self,
+        data: SendPayload,
+        destination: SocketAddr,
+    ) -> impl Future<Output = SendOutcome>;
+}
+
 fn gone() -> io::Error {
     io::Error::new(
         io::ErrorKind::BrokenPipe,
@@ -210,6 +320,32 @@ impl TcpStream {
             token: None,
             done: false,
         }
+    }
+}
+
+impl StreamRecv for TcpStream {
+    fn recv(&self) -> impl Future<Output = io::Result<Option<ReadBuf>>> {
+        TcpStream::recv(self)
+    }
+}
+
+impl StreamSend for TcpStream {
+    fn send(&self, data: SendPayload) -> impl Future<Output = SendOutcome> {
+        TcpStream::send(self, data)
+    }
+
+    fn send_all(&self, data: SendPayload) -> impl Future<Output = SendOutcome> {
+        TcpStream::send_all(self, data)
+    }
+
+    async fn flush(&self) -> io::Result<()> {
+        self.socket.owner().map(|_| ())
+    }
+}
+
+impl StreamShutdown for TcpStream {
+    async fn shutdown_write(&self) -> io::Result<()> {
+        self.shutdown(Shutdown::Write)
     }
 }
 
@@ -844,6 +980,27 @@ impl UdpSocket {
         }
     }
 }
+
+impl DatagramRecv for UdpSocket {
+    fn recv(&self) -> impl Future<Output = io::Result<Received>> {
+        UdpSocket::recv(self)
+    }
+}
+
+impl DatagramSend for UdpSocket {
+    fn send(&self, data: SendPayload) -> impl Future<Output = SendOutcome> {
+        UdpSocket::send(self, data)
+    }
+
+    fn send_to(
+        &self,
+        data: SendPayload,
+        destination: SocketAddr,
+    ) -> impl Future<Output = SendOutcome> {
+        UdpSocket::send_to(self, data, destination)
+    }
+}
+
 #[must_use]
 pub struct RecvDatagram<'a> {
     socket: &'a Socket,

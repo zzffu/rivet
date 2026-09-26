@@ -1,5 +1,5 @@
 //! Worker-local, bounded timers, reusable sleeps, and periodic schedules.
-use crate::runtime::{Worker, current};
+use crate::runtime::{Current, Worker, current};
 use std::{
     fmt,
     future::Future,
@@ -9,6 +9,29 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+
+/// Construct reusable native sleeps without borrowing the capability.
+///
+/// [`Current`] delegates to the free constructors: creating a sleep requires no
+/// running worker, captures no worker identity, and reserves no timer slot. The
+/// returned [`Sleep`] binds to the current worker on its first poll, even for an
+/// elapsed deadline; a missing worker then returns `NotConnected`. Admission
+/// pressure returns `WouldBlock`, a stopped owner returns `BrokenPipe`, and use
+/// from a different current worker returns `InvalidInput`.
+///
+/// [`Sleep::reset`] reuses the native timer and preserves a bound sleep's owner,
+/// including after completion. Moving or copying `Current` cannot rebind it.
+/// Dropping the sleep releases its timer admission immediately.
+pub trait Timer {
+    /// Create a sleep with a deadline relative to this invocation.
+    ///
+    /// As with [`sleep`], a deadline that overflows [`Instant`] is reported as
+    /// `InvalidInput` when the sleep is polled, not when it is constructed.
+    fn sleep(&self, duration: Duration) -> Sleep;
+
+    /// Create a sleep for a deadline, binding to a worker only on first poll.
+    fn sleep_until(&self, deadline: Instant) -> Sleep;
+}
 
 /// A worker-local deadline future that can be reused with [`Sleep::reset`].
 ///
@@ -38,6 +61,17 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
         done: false,
     }
 }
+
+impl Timer for Current {
+    fn sleep(&self, duration: Duration) -> Sleep {
+        sleep(duration)
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> Sleep {
+        sleep_until(deadline)
+    }
+}
+
 impl Sleep {
     /// Replace the deadline without changing this sleep's worker.
     ///

@@ -55,6 +55,47 @@ fn main() -> io::Result<()> {
 - `runtime::buffer_pool()` 返回当前 worker 已有的池，适用于自动放置的工厂；不要为每个数据包创建新池。
 - 任务、socket、操作、接收队列和池均有界。不可寻址的接收／接受／完成队列容量在配置阶段返回 `InvalidInput`。`idle_spin` 默认零；可选自旋受时间预算及下一定时器期限约束。
 
+## 面向上层库的原生 trait
+
+这些开放 Interface 让上层协议／代理库不绑定具体 socket 类型，但仍使用 Rivet 的拥有型缓冲区和运行时模型；不是 Tokio 兼容层，也不是跨运行时抽象。
+
+| Module | 能力 | 原生实现 |
+| --- | --- | --- |
+| `net` | `StreamRecv`、`StreamSend`、`StreamShutdown` | `TcpStream` |
+| `net` | `DatagramRecv`、`DatagramSend` | `UdpSocket` |
+| `runtime` | `LocalSpawn` | `Current` |
+| `runtime` | `Spawn`、`BlockingSpawn` | `Handle` |
+| `time` | `Timer` | `runtime::Current` |
+
+网络方法使用 `&self` 和静态分发的 Future，不逐操作装箱，不统一要求 `Send`／`Sync`／`Unpin`。接收仍只允许一个活动等待者，冲突返回 `WouldBlock`；一读一写独立推进。`send` 返还原始 payload，`send_all` 返还未接受后缀，原生发送分组不会被普通循环替换。上层编码／加密包装也必须按调用方输入字节计数，不能把编码后字节数或已接受数据作为未发送输入返还。
+
+`StreamSend::flush` 排空包装层已接受的输出，并 flush 下层；不代表对端收到或内核释放租约。原生 TCP 没有额外发送缓存，但 flush 仍在首次 poll 时检查所属 worker 与 Runtime 存活状态。`StreamShutdown::shutdown_write` 是惰性异步半关闭：未轮询不会关闭，完成后接收方向仍可返回响应。调用方先完成自己的发送，再 flush／关闭；取消已提交发送不是撤销，不能直接重发原始数据。
+
+```rust
+use rivet::{
+    SendPayload,
+    net::{StreamRecv, StreamSend, StreamShutdown},
+};
+
+async fn forward<R, W>(reader: &R, writer: &W) -> std::io::Result<()>
+where
+    R: StreamRecv + ?Sized,
+    W: StreamSend + StreamShutdown + ?Sized,
+{
+    while let Some(data) = reader.recv().await? {
+        writer.send_all(SendPayload::Single(data)).await.result?;
+        writer.flush().await?;
+    }
+    writer.shutdown_write().await
+}
+```
+
+双向代理同时推进两个 `forward`，一个方向 EOF 只关闭相对端的写方向，不提前终止反向响应。缓冲区池由上层显式传入编码逻辑；`Connector`／`Acceptor`、域名处理、路由、代理握手和会话信息由上层定义。原生 connect/bind/accept 与 `serve_until` 仍可直接使用；新连接先完成 worker 放置，再做握手，不能跨线程移动已经开始 I/O 的连接。
+
+`Current` 是无状态的当前上下文入口，不捕获 Runtime／worker，也不延长它们的生命周期。`LocalSpawn` 保留本地 Future／输出可为 `!Send` 但须 `'static` 的约束；`Handle` 的 `Spawn` 仍投递 `Send` 工厂，产生的 Future 可为 `!Send`，输出须 `Send`。`BlockingSpawn` 保留独立阻塞池及原生取消语义。所有任务返回现有句柄／错误，不改变 Drop 取消和显式 detach。
+
+`Timer::sleep`／`sleep_until` 返回原生 `Sleep`，不提前绑定 worker，保留 `reset`、取消释放额度与原生计时错误；timeout／interval 继续复用现有函数。有限的出站实现可由上层枚举组合；这些 trait 不承诺 `dyn` 兼容，不要求为每次 I/O 做类型擦除。批量数据报、splice、GSO 等仍为独立能力。
+
 ## 通用运行时能力
 
 ### 阻塞执行和任务所有权
@@ -157,6 +198,7 @@ Cargo feature 只纳入实现，**不自动启用运行策略**。默认所有�
 ```text
 cargo run --example loopback
 cargo run --example runtime_services
+cargo run --example native_traits
 cargo run --example mixed_load
 cargo test --all-targets
 ```
@@ -164,6 +206,10 @@ cargo test --all-targets
 `loopback` 覆盖 IPv4／IPv6、向量前缀、取消接收等待、持有旧租约继续接收、UDP 空包与来源信息，以及 Runtime 销毁后的读取。`mixed_load` 同时运行小 RPC、大块 TCP 和有界窗口 UDP，自动分配 worker；输出不是 NIC 吞吐／延迟保证。
 
 `runtime_services` 覆盖真实阻塞任务与异步网络并行、非 socket pipe／Windows event、任务组、计时器重置与周期、watch 最终值、受监督 echo／停止和对端 RST。相同场景也集成到 Android 普通 App。`cargo test --test signal_behavior` 在隔离子进程中验证真实退出信号及默认处理恢复，不向运行测试的宿主发送信号。
+
+`native_traits` 是仅使用 IPv4 回环的可执行代理场景：原生 `serve_until` 放置连接，泛型转发保留写半关闭后的反向响应；同时验证泛型 UDP 空报文／来源、`!Send` 本地任务输出、工厂投递、阻塞执行和计时器原位重置。它不建立外部连接，也不修改宿主 TUN、路由或 IPv6 设置。
+
+本次原生 trait 验证：Windows IPv4 模式下 124 项回归通过，`native_traits` 默认双 worker／单 worker 与原有 `loopback` 均通过；严格 Clippy、rustdoc 和变更 Rust 文件格式检查通过。Linux x86_64 GNU／musl、Android ARM64／x86_64、Windows GNU 完成所有 feature／target 的编译检查；这些检查不代替原生执行。本次没有执行 IPv6 连通性或 Linux／Android 原生场景，没有修改宿主 TUN／网络设置。
 
 Windows 主机明确只允许 IPv4 时，可为**验证进程**设置 `RIVET_VERIFY_IPV4_ONLY=1`。相关测试／示例明确打印未执行 IPv6；默认仍测试两个地址族，生产库不读取此变量。
 

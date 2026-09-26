@@ -23,10 +23,9 @@ fn runtime(capacity: usize) -> Runtime {
 
 #[test]
 fn sleep_reset_reuses_unpolled_active_and_completed_timers_at_capacity_one() {
-    let mut runtime = runtime(1);
-    runtime.block_on(async {
+    async fn exercise(timer: &impl time::Timer) {
         let distant = Instant::now() + Duration::from_secs(3600);
-        let mut sleep = time::sleep_until(Instant::now());
+        let mut sleep = timer.sleep(Duration::ZERO);
         sleep.reset(distant).unwrap();
         assert!(poll_once(&mut sleep).await.is_none());
 
@@ -36,7 +35,7 @@ fn sleep_reset_reuses_unpolled_active_and_completed_timers_at_capacity_one() {
                 .unwrap();
         }
         assert_eq!(
-            time::sleep_until(distant).await.unwrap_err().kind(),
+            timer.sleep_until(distant).await.unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         sleep.reset(Instant::now()).unwrap();
@@ -53,7 +52,9 @@ fn sleep_reset_reuses_unpolled_active_and_completed_timers_at_capacity_one() {
             .reset(Instant::now() + Duration::from_millis(1))
             .unwrap();
         (&mut sleep).await.unwrap();
-    });
+    }
+    let mut runtime = runtime(1);
+    runtime.block_on(exercise(&runtime::Current));
 }
 
 #[test]

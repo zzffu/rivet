@@ -2,6 +2,10 @@
 
 ## 0.1.0
 
+- 新增开放的 Rivet 原生流／数据报收发 trait，直接复用拥有型缓冲区、原生 Future 和发送分组；包含惰性 flush 与异步写半关闭，保留接收等待者冲突、取消、输入字节计数和租约回收契约，不引入逐操作装箱或 payload 复制。
+- 新增 `LocalSpawn`、`Spawn`、`BlockingSpawn`、`Timer` 与无状态 `Current` 入口；保留 `!Send` 本地 Future、工厂跨 worker 投递、原生任务句柄／错误及 `Sleep::reset`。Connector／Acceptor 和代理策略仍由上层定义。
+- 新增 `native_traits` IPv4 回环代理示例和 flush／半关闭生命周期回归；泛型双向转发保留请求 EOF 后的反向响应，并覆盖数据报、任务执行和可重置计时。补充系统架构、接口契约和使用文档。
+- 本次原生 trait 验证在 TUN／IPv6 阻断保持不变的条件下进行：Windows IPv4 模式 124 项回归通过，默认双 worker／单 worker 代理与原有 loopback 通过；严格 Clippy、rustdoc、变更 Rust 文件格式检查及 Linux GNU／musl、Android ARM64／x86_64、Windows GNU 跨目标检查通过。本次未执行 IPv6 连通性或 Linux／Android 原生运行。
 - 修复 Android 导入 TCP 仍有宿主 FD 别名时 `abort` 不能立即中止连接的问题；使用 `AF_UNSPEC` 断开底层 TCP，补充 IPv4／IPv6 保留别名时的真实 RST 回归。
 - 修复信号 Waker 同步销毁等待任务及最后订阅时的重入死锁；改用单等待者 `AtomicWaker`，取消等待注销 Waker 但保留待处理信号，补充隔离子进程销毁／重新订阅回归。
 - 新增按需启动的有界阻塞池，区分排队取消与运行中工作，Runtime 停止时保留额度、清理责任和原生线程 join。

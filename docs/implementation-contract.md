@@ -127,6 +127,32 @@ Socket closure, task cancellation, operation retirement and kernel memory releas
 
 Default optional policies are Off until explicitly requested. `RuntimeConfig::enable(Optimization)` requests RequireCapability. Explicit Auto permits fallback only for that optimization. CPU/queue sizes and memory budgets are machine-level configuration, not manual per-workload scheduling groups.
 
+## Native library capability interfaces
+
+The public traits live in the existing `net`, `runtime`, and `time` modules. They are open for downstream implementations, use static dispatch, and introduce no per-operation boxing, payload copy, global configuration, or alternative scheduler. Native methods remain usable directly. `Connector`, `Acceptor`, proxy protocols, routing, resolution policy, and session metadata belong to downstream libraries, not this crate.
+
+The network interfaces take `&self` and return `impl Future` without `Send`, `Sync`, `Unpin`, or `'static` supertraits:
+
+- `StreamRecv::recv` returns `io::Result<Option<ReadBuf>>`.
+- `StreamSend::{send, send_all}` take `SendPayload` and return `SendOutcome`; `flush` returns `io::Result<()>`.
+- `StreamShutdown::shutdown_write` returns `io::Result<()>`.
+- `DatagramRecv::recv` returns `io::Result<Received>`.
+- `DatagramSend::{send, send_to}` take native payloads, with `send_to` additionally taking `SocketAddr`, and return `SendOutcome`.
+
+`TcpStream` implements the three stream traits; `UdpSocket` implements the two datagram traits. Adapters delegate to the existing native futures. `send_all` is required, not a default loop over `send`: its logical send group must survive short writes without interleaving another send. One receive waiter owns each receive lane; a competing waiter gets `WouldBlock`. Reading and writing remain independent. Datagram operations preserve empty messages, boundaries, source addresses, and truncation rather than treating a short message as stream EOF.
+
+Send results always describe the caller's input byte domain, including for downstream transforming streams. `send` returns the original immutable payload even on errors; `send_all` returns the unaccepted suffix. An implementation must not both retain a suffix as accepted buffered output and return it as unaccepted input. Success does not imply peer delivery or kernel memory release. Dropping a submitted send future abandons observation, not already-submitted output; blindly retrying the original payload can duplicate bytes.
+
+`flush` drains accepted data retained in this layer and flushes the lower layer. Callers first finish their own sends; concurrent newly submitted sends are not implicitly joined. Native TCP has no additional user-space send buffer, so its lazy flush validates `Socket::owner` on first poll and then completes without another native operation. It must still report missing/wrong worker and stopped-runtime errors. It does not wait for peer acknowledgement or read-only lease reclamation.
+
+`shutdown_write` is lazy: constructing or dropping an unpolled future does not close anything. A buffered/transforming implementation must drain accepted output and protocol trailers before closing its lower write direction. Native TCP calls its existing synchronous write shutdown only when polled; no new driver or socket state is needed. Receiving remains possible after write shutdown. Close cancellation does not promise rollback, and Drop/abort are not substitutes for orderly draining.
+
+`runtime::Current` is a copyable stateless capability entry point, not a captured worker handle. It implements `LocalSpawn`; `spawn_local<F>` accepts `F: Future + 'static`, `F::Output: 'static`, and returns `Result<JoinHandle<F::Output>, SpawnError>` using the current worker at invocation. It is legal to construct Current outside a runtime; operations retain their native missing-context errors.
+
+`Handle` implements `Spawn` with `F: FnOnce() -> Fut + Send + 'static`, `Fut: Future<Output = T> + 'static`, and `T: Send + 'static`, returning the native join handle and spawn error. It also implements `BlockingSpawn` with the existing `Send + 'static` closure/output bounds and native blocking handle/error. No borrowed/scoped spawning, implicit detach, additional queues, or handle-to-worker-local execution is introduced.
+
+`time::Timer::{sleep(Duration), sleep_until(Instant)}` take `&self` and return native `Sleep`. The implementation for `Current` delegates to the existing constructors without binding early, capturing the entry point, or allocating. Reset, first-poll worker binding, overflow, capacity, cancellation, shutdown errors, interval behavior, and timeout precedence remain unchanged.
+
 ## Generic host services
 
 `BlockingConfig { threads, queue_capacity }` bounds a lazy, runtime-owned blocking pool. Accepted closures and results are `Send + 'static`. `BlockingJoinHandle` can cancel queued work, but running synchronous code is not forcibly interrupted. Dropping a waiter does not free a still-running slot; rejected/cancelled captures and discarded results are destroyed outside admission locks with panic isolation. Completion is published after cleanup and running-slot release. Runtime shutdown closes admission, cancels queued work, stops native registrations, cleans/joins asynchronous workers, then joins blocking workers. A blocking closure must not depend on async work that shutdown has stopped.

@@ -180,6 +180,49 @@ Unix 仅接管默认／忽略 disposition，遇到现有自定义 handler 返回
 
 验证必须覆盖真实阻塞任务及其排队/运行取消、真实 pipe 或 waitable event、真实 TCP RST、跨 worker 任务组与服务排空、同步竞争和定时器重置/错过 tick。进程信号只在隔离子进程中触发，不能向开发宿主发送退出信号。Windows 原生执行及隔离 Linux guest 执行分别提供证据；Android 编译和普通 App 场景不以桌面结果代替。
 
+### 8.9 面向上层库的原生能力 Interface
+
+#### 8.9.1 范围与职责
+
+上层代理／协议库通过开放 trait 使用 Rivet 的网络、任务执行和计时能力，不绑定具体 socket 类型。该 seam 是 Rivet 原生 Interface，不是跨运行时兼容层：缓冲区、发送结果、任务句柄、计时器和错误直接复用已有类型。原生具体方法仍可直接使用，Driver、资源准入、worker 放置和回收机制不另建 Implementation。
+
+`Connector`／`Acceptor` 的定义与 Implementation 留给需要它们的上层库；域名处理、路由、认证、代理链、协议握手和会话元数据同样属于上层。Rivet 保留原生 connect/bind/accept 和 `serve_until`：新连接先完成 worker 放置，再进行上层握手；已使用的 `!Send` 连接不得借 trait 任意跨 worker 迁移。该设计不引入业务 Handler 框架或 TLS/DNS/代理协议 Implementation。
+
+| Module | Interface | 原生 Adapter |
+| --- | --- | --- |
+| `net` | `StreamRecv::recv` | `TcpStream` |
+| `net` | `StreamSend::{send, send_all, flush}` | `TcpStream` |
+| `net` | `StreamShutdown::shutdown_write` | `TcpStream` |
+| `net` | `DatagramRecv::recv` | `UdpSocket` |
+| `net` | `DatagramSend::{send, send_to}` | `UdpSocket` |
+| `runtime` | `LocalSpawn::spawn_local` | `Current` |
+| `runtime` | `Spawn::spawn`、`BlockingSpawn::spawn_blocking` | `Handle` |
+| `time` | `Timer::{sleep, sleep_until}` | `runtime::Current` |
+
+#### 8.9.2 收发、排空与关闭
+
+网络异步方法使用 `&self` 和返回 `impl Future` 的静态分发 Interface，不要求 `Send`／`Sync`／`Unpin`，不装箱每次操作。`StreamRecv` 返回 `io::Result<Option<ReadBuf>>`，`None` 是 EOF；数据报返回 `io::Result<Received>`，空报文不是 EOF，保留来源、截断及可用的原始长度。收发方向独立推进；一个接收方向只有一个活动等待者，冲突返回 `WouldBlock`。上层包装不得跨网络等待占用会阻断另一方向的整连接锁。
+
+`send` 返回原始 payload 和接受字节数；`send_all` 返回未发送后缀，成功时后缀为空。上层编码／加密包装也必须按调用方输入字节计数，不能返还密文字节数，不能既保存待发送数据又把同一部分作为未接受数据返还。原生 `send_all` 直接复用已有发送分组，不用普通 `send` 循环替换；顺序以实际进入发送序列为准，不以 Future 构造顺序为准。
+
+发送成功允许包装层保留已接受数据，因此 `flush` 是发送 Interface 的必要方法：排空本层已接受数据并完成下层相应的排空，不代表对端收到，也不代表内核释放内存。原生 TCP 没有额外发送缓存，`flush` 首次 poll 时验证 socket 所属 worker 和存活状态即可完成；不能用无条件成功掩盖错误上下文或已停止 Runtime。调用方须先完成自己的发送，再 flush／关闭；不承诺等待与它并发的新发送。
+
+`shutdown_write` 是惰性的异步写半关闭：构造或丢弃未轮询 Future 不产生关闭副作用。包装层须排空自身已接受数据及协议尾部，再关闭下层写方向。成功后不能继续发送应用数据，但接收方向仍可推进；代理一个方向 EOF 不能立即终止反向响应。TCP Adapter 首次 poll 执行原有 `shutdown(Write)`；不模拟额外关闭状态，不改变原生错误。整体 Drop、立即 abort 和有序半关闭分开，Drop 不承诺数据交付。
+
+取消接收等待不丢弃尚未交付的排队数据；丢弃已提交发送 Future 不撤销发送，也不能整体重试原始数据。内核仍使用的租约继续受原生回收机制保护。`BufferPool` 由调用方显式传入编码逻辑，不增加通用分配器 trait，不逐包创建池。trait 层本身不增加 payload 复制；这不承诺上层变换操作没有自身必要的存储成本。
+
+#### 8.9.3 执行能力与计时
+
+`Current` 是可复制、无状态的当前上下文入口，不持有 Runtime 或 worker 身份，不延长其生命周期。`LocalSpawn` 在调用时选择当前 worker，Future 和输出可为 `!Send`，但均保持现有 `'static` 要求。`Handle` 实现的 `Spawn` 接收 `Send + 'static` 工厂，在目标 worker 内产生可为 `!Send` 的 Future，输出仍须 `Send + 'static`；`BlockingSpawn` 保留独立阻塞池及其准入、排队取消和不可强杀运行中闭包的语义。
+
+任务直接返回原生 `JoinHandle`／`BlockingJoinHandle` 和错误；不引入通用 join/abort trait，不改变 Drop 取消、显式 detach 或任务组所有权。`Timer` 返回原生 `Sleep`，保留 `reset` 和取消释放额度的能力；`sleep` 的溢出处理与 `sleep_until` 的首次 poll 绑定均沿用原生 Implementation。`Current` 不把已绑定 Sleep 转移给另一个 worker。现有 timeout、interval 和错误分类继续复用，不添加虚拟时钟或第二套调度系统。
+
+#### 8.9.4 组合与验收
+
+上层有限出站集合优先使用枚举和静态分发，本 Interface 不承诺 `dyn` 兼容，不默认引入类型擦除。真实 socket 地址和代理会话元数据由上层携带，不要求所有包装流暴露原生句柄或伪造 socket 地址。批量 UDP、splice、GSO 等仍使用已有独立能力，不塞入基础 trait 或静默降级。
+
+验收使用真实回环代理：泛型双向转发、请求写半关闭后仍返回响应、flush 上下文错误、未轮询关闭无副作用、数据报空包和元数据，以及本地任务、自动放置工厂、阻塞执行和可重置计时。已有取消、发送分组、额度与回收回归继续执行。宿主使用 TUN 且阻断 IPv6 时，验证进程设置 `RIVET_VERIFY_IPV4_ONLY=1`，仅运行 IPv4 回环并明确记录 IPv6 未执行；不更改 TUN、路由、代理或 IPv6 阻断，也不让生产库读取这个验证开关。
+
 ## 9. 验证
 
 - Windows 实际 RIO/IOCP TCP/UDP、IPv4/IPv6、接管、超时、关闭和数据完整性。

@@ -48,6 +48,95 @@ use std::{
 pub use task::{AbortHandle, JoinError, JoinHandle, SpawnError, yield_now};
 use task::{Admission, Launch, TaskSet};
 
+/// A stateless entry point for current-worker execution and timers.
+///
+/// Unlike [`Handle`], this captures neither a runtime nor a worker, and may be
+/// constructed outside a runtime. [`LocalSpawn`] resolves the current worker
+/// when called; [`crate::time::Timer`] constructs a sleep that binds on its first
+/// poll instead. Copying or moving `Current` does not move an existing local task
+/// or a bound sleep, and does not keep any runtime alive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Current;
+
+/// Spawn an owned future on the current worker without requiring `Send`.
+///
+/// The future and its output may both be `!Send`, but must be `'static`: this is
+/// not scoped spawning and cannot borrow caller-owned stack data. Dropping the
+/// returned [`JoinHandle`] requests owner-thread cancellation; use
+/// [`JoinHandle::detach`] explicitly to let a task outlive its handle.
+pub trait LocalSpawn {
+    /// Admit a local task, resolving the current worker at invocation.
+    ///
+    /// [`Current`] preserves [`spawn_local`]'s errors: no running worker returns
+    /// [`SpawnError::NotRunning`], exhausted admission returns
+    /// [`SpawnError::AtCapacity`], and closed admission returns
+    /// [`SpawnError::ShuttingDown`].
+    fn spawn_local<F: Future + 'static>(
+        &self,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, SpawnError>
+    where
+        F::Output: 'static;
+}
+
+/// Submit a thread-safe factory that creates a worker-local future.
+///
+/// The factory crosses threads, but its future is created and remains on the
+/// selected worker, so that future may be `!Send`. The factory and result must
+/// both be `Send`; all three remain `'static`, rather than borrowing the caller.
+/// The native [`JoinHandle`] requests owner-thread cancellation on drop unless
+/// explicitly detached with [`JoinHandle::detach`].
+pub trait Spawn {
+    /// Submit a factory using the runtime's existing placement and admission.
+    ///
+    /// [`Handle`] does not require a current worker on the submitting thread.
+    /// It returns [`SpawnError::NotRunning`] if no worker can make progress,
+    /// [`SpawnError::AtCapacity`] if admission is exhausted, or
+    /// [`SpawnError::ShuttingDown`] after admission closes.
+    fn spawn<F, Fut, T>(&self, factory: F) -> Result<JoinHandle<T>, SpawnError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static;
+}
+
+/// Submit owned synchronous work to the runtime's bounded blocking pool.
+///
+/// Both the closure and its output must be `Send + 'static`. This pool is
+/// independent of async worker placement: [`Handle`] can submit from outside a
+/// running worker, including while worker zero is inactive. Rejected work never
+/// runs and retains the native [`BlockingSpawnError`] admission and thread-start
+/// errors.
+///
+/// Dropping or aborting a [`BlockingJoinHandle`] cancels queued work, but cannot
+/// forcibly stop an already-running closure or release its occupied thread.
+/// [`BlockingJoinHandle::cancel`] waits for cancellation or the running result;
+/// [`BlockingJoinHandle::detach`] abandons observation without cancelling work.
+/// Runtime destruction still joins all started blocking work, including detached
+/// work, so closures must not depend on async tasks that shutdown has stopped.
+pub trait BlockingSpawn {
+    /// Submit a closure without blocking the caller on its completion.
+    fn spawn_blocking<F, T>(
+        &self,
+        function: F,
+    ) -> Result<BlockingJoinHandle<T>, BlockingSpawnError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static;
+}
+
+impl LocalSpawn for Current {
+    fn spawn_local<F: Future + 'static>(
+        &self,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, SpawnError>
+    where
+        F::Output: 'static,
+    {
+        spawn_local(future)
+    }
+}
+
 thread_local! {
     #[cfg_attr(
         target_os = "android",
@@ -250,6 +339,27 @@ impl Handle {
         }
         self.group
             .enqueue(selected.map_or(start, |(index, _)| index), factory)
+    }
+}
+
+impl Spawn for Handle {
+    fn spawn<F, Fut, T>(&self, factory: F) -> Result<JoinHandle<T>, SpawnError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        Handle::spawn(self, factory)
+    }
+}
+
+impl BlockingSpawn for Handle {
+    fn spawn_blocking<F, T>(&self, function: F) -> Result<BlockingJoinHandle<T>, BlockingSpawnError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        Handle::spawn_blocking(self, function)
     }
 }
 

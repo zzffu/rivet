@@ -36,6 +36,26 @@ fn config(workers: usize) -> RuntimeConfig {
     config.limits.pool.max_leases = 512;
     config
 }
+fn spawn_factory<F, Fut, T>(
+    spawner: &impl runtime::Spawn,
+    factory: F,
+) -> Result<runtime::JoinHandle<T>, SpawnError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T> + 'static,
+    T: Send + 'static,
+{
+    spawner.spawn(factory)
+}
+fn spawn_local<F: Future + 'static>(
+    spawner: &impl runtime::LocalSpawn,
+    future: F,
+) -> Result<runtime::JoinHandle<F::Output>, SpawnError>
+where
+    F::Output: 'static,
+{
+    spawner.spawn_local(future)
+}
 fn address(v6: bool) -> SocketAddr {
     SocketAddr::new(
         if v6 {
@@ -92,15 +112,13 @@ fn owner_root_and_factory_local_future() {
     let mut runtime = Runtime::new(config(2)).unwrap();
     // The caller worker is inactive: placement must use a running background
     // worker, where this factory constructs an intentionally non-Send future.
-    let task = runtime
-        .handle()
-        .spawn(|| async {
-            let value = Rc::new(Cell::new(40));
-            runtime::yield_now().await;
-            value.set(value.get() + 2);
-            (thread::current().id(), value.get())
-        })
-        .unwrap();
+    let task = spawn_factory(&runtime.handle(), || async {
+        let value = Rc::new(Cell::new(40));
+        runtime::yield_now().await;
+        value.set(value.get() + 2);
+        (thread::current().id(), value.get())
+    })
+    .unwrap();
     let (worker, value) = runtime.block_on(async {
         assert_eq!(thread::current().id(), owner);
         task.await.unwrap()
@@ -113,7 +131,7 @@ fn owner_root_and_factory_local_future() {
 fn single_worker_handle_rejects_unprogressable_work() {
     let mut runtime = Runtime::new(config(1)).unwrap();
     assert_eq!(
-        runtime.handle().spawn(|| async { 7 }).unwrap_err(),
+        spawn_factory(&runtime.handle(), || async { 7 }).unwrap_err(),
         SpawnError::NotRunning
     );
     let result = runtime.block_on(async { runtime::spawn(|| async { 7 }).unwrap().await.unwrap() });
@@ -197,7 +215,7 @@ fn foreign_wake_storm_cannot_move_or_destroy_local_future() {
     runtime.block_on(async {
         let drop_probe = DropThread(dropped.clone());
         let local = Rc::new(11);
-        let task = runtime::spawn_local(async move {
+        let task = spawn_local(&runtime::Current, async move {
             let _drop_probe = drop_probe;
             let mut sent = false;
             std::future::poll_fn(|cx| {
@@ -206,15 +224,16 @@ fn foreign_wake_storm_cannot_move_or_destroy_local_future() {
                     sent = true;
                 }
                 if ready.load(Ordering::Acquire) {
-                    Poll::Ready(*local)
+                    Poll::Ready(())
                 } else {
                     Poll::Pending
                 }
             })
-            .await
+            .await;
+            local
         })
         .unwrap();
-        assert_eq!(task.await.unwrap(), 11);
+        assert_eq!(*task.await.unwrap(), 11);
     });
     assert_eq!(*dropped.lock(), Some(owner));
     let stale_waker = thread.join().unwrap();
