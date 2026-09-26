@@ -102,7 +102,7 @@ async fn request(stream: &rivet::TcpStream) -> std::io::Result<()> {
 - 接收 Future 是队列等待者；丢弃它不清除已经到达的 TCP 字节。TCP EOF 与合法的零长度 UDP 数据报分别表示。
 - 已发布租约可以跨越 socket／Runtime 的销毁继续读取；池和外部映射按实际引用释放。共享 refill 的队列满时保留返还 token，不丢弃它。
 - 普通 TCP 关闭不默认设置 abortive linger。整个 Runtime 销毁会取消未结束业务；Linux 会中止剩余 TCP 传输并等待真实内核释放。需要完整交付时，先完成半关闭和对端协议确认。
-- `TcpStream::abort(self)` 显式选择 RST 式关闭，设置失败可观察；它不改变普通 Drop／半关闭的语义，也不提前释放在途发送的内核内存引用。
+- `TcpStream::abort(self)` 显式选择 RST 式关闭，设置失败可观察；Linux／Android 会断开底层连接，宿主保留的 FD 别名不会延后中止。它不改变普通 Drop／半关闭的语义，也不提前释放在途发送的内核内存引用。
 - 原生 TCP socket 的正值 `SO_LINGER` 会阻塞关闭或导致非阻塞关闭失败，因此在接管及配置钩子后拒绝；不偷偷改成 abortive linger。
 
 ## UDP、接管与宿主接入
@@ -205,6 +205,8 @@ Windows／Linux 的 `cargo clippy --all-features --all-targets -- -D warnings`�
 验证总览在 `artifacts/verification-summary.json`。详细证据包括 `artifacts/windows-native-suite.log`、`artifacts/windows-ipv6-evidence.json`、`artifacts/linux-native-results.json`、`artifacts/android-usb-arm64-*`，以及 API29／API37 模拟器结果与截图；`artifacts/android-final-build-evidence.json` 记录模拟器执行 APK 的散列，USB 真机 APK 散列见其环境记录。Linux runner 在其 `--state` 目录的 `runs/<id>/report.json` 和 `serial.log` 保留内核、二进制散列、参数及实际结果，索引明确关联已修复的历史失败与后续通过记录。这些生成物不代替可重跑的测试／示例。
 
 通用宿主能力的本轮证据在 `artifacts/runtime-services-verification.json`，包含 Linux 各 suite 的独立 guest 报告和 Android 普通 App 原始结果。本轮没有重新执行 API29、ARM64 真机、Server 2022 或硬件 NIC 场景；这些既有结果不能替代新增功能在相应设备上的原生验证。公开 rustdoc（warnings 为错误）、Linux 无 feature 构建和 Android ARM64 编译检查同时通过。
+
+上述记录之后的两项修复验证：Windows 全 feature／全 target 的 122 项测试、严格 Clippy 和 `runtime_services` 通过；Android API37／x86_64／16KiB 模拟器上的 `signal_behavior` 6 项与 `tcp_abort_behavior` 3 项通过。独立消费者程序在 Windows 和 Android 验证了信号 Waker 同步销毁等待任务、最后订阅及重新订阅；Android 另确认 IPv4／IPv6 保留 FD 别名时对端仍收到 RST，别名无法继续发送。Android 原生执行来自 adb shell UID 2000，不冒充普通 App 沙箱验证；ARM64 Android 完成全 feature／全 target 编译检查，未执行 ARM64 真机或重新运行 Linux guest。
 
 真实硬件 RX ZC、large-chunk DMA、NIC NAPI／RSS 行为及线上吞吐仍需要满足要求且已由部署方配置好的 NIC／队列。NODEV 明确是复制验证；本机未配置此类硬件，也未为验证修改外部主机内核、NIC 或主机安全策略。
 

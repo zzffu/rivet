@@ -2,6 +2,8 @@
 
 ## 0.1.0
 
+- 修复 Android 导入 TCP 仍有宿主 FD 别名时 `abort` 不能立即中止连接的问题；使用 `AF_UNSPEC` 断开底层 TCP，补充 IPv4／IPv6 保留别名时的真实 RST 回归。
+- 修复信号 Waker 同步销毁等待任务及最后订阅时的重入死锁；改用单等待者 `AtomicWaker`，取消等待注销 Waker 但保留待处理信号，补充隔离子进程销毁／重新订阅回归。
 - 新增按需启动的有界阻塞池，区分排队取消与运行中工作，Runtime 停止时保留额度、清理责任和原生线程 join。
 - 新增 Runtime 级有界非 socket 注册表：Linux／Android `AsyncFd` readiness 与 Windows `AsyncHandle` 原生等待；保留失败接管所有权、取消安全和迟到事件隔离。
 - 新增三后端 `TcpStream::abort`，显式触发 TCP RST，并保持 direct/fixed socket、在途发送及 ZC 内存释放的真实生命周期。

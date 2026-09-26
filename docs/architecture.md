@@ -152,6 +152,8 @@ Runtime 拥有独立阻塞池；`RuntimeConfig` 指定线程上限和排队上�
 
 `TcpStream::abort` 消费连接，先选择 abortive close，再经现有关闭路径收敛请求。正常 Drop 和 `shutdown(Write)` 的语义不变。设置失败必须可观察；即使中止连接，已提交发送的存储也保留至真实内核释放。三个网络后端均实现这项 TCP 语义，包括 Linux direct descriptor 路径；不向调用方泄露可随意关闭或长期持有的裸句柄。
 
+Android 的中止顺序为零 linger → `connect(AF_UNSPEC)` 断开底层 TCP → 现有 Driver close 路径。接管拥有型 FD 不代表底层 socket 没有其他别名；中止不能等待宿主释放最后一个 `try_clone` 句柄。该断开语义与 Linux 一致，仍由各平台 Adapter 管理操作回收，不引入新的公开 Interface 或影响正常关闭。
+
 ### 8.4 任务组和受监督连接
 
 `runtime::TaskGroup` 有明确容量，接收自动放置工厂或本地 Future，拥有所有子任务句柄。支持等待任意完成、统一 abort，以及可重试的异步 shutdown；取消一次 join/shutdown 等待不丢失其余任务的回收责任。组 Drop 请求取消，只有实际 join 才证明子任务已经终止。可克隆的 abort 控制不转移结果接收权。
@@ -171,6 +173,8 @@ Runtime 拥有独立阻塞池；`RuntimeConfig` 指定线程上限和排队上�
 `signal` Module 显式订阅宿主退出事件：Unix SIGINT/SIGTERM，Windows Ctrl+C/Ctrl+Break。无订阅时不安装处理器；订阅释放后解除本次注册，不吞掉宿主后续默认行为。信号回调只做平台允许的标记/通知，不分配、不运行应用代码。等待可取消，重复事件允许合并，停止订阅必须回收原生等待和辅助线程。该 Module 只发出事件，不主动退出进程或规定应用的关闭顺序。
 
 Unix 仅接管默认／忽略 disposition，遇到现有自定义 handler 返回 `AlreadyExists`；宿主负责把其他 `sigaction` 修改与订阅构造／销毁串行化。Windows 订阅期间不更换 console。原生 handler 使用在途读者协议保护通知句柄的关闭／复用；dispatcher 在注册锁外唤醒。自定义 Waker 若在 dispatcher 自身释放最后订阅，停止标记保证回调返回后退出，不尝试 join 自身。
+
+每个 `recv(&mut self)` 订阅只有一个并发等待者。订阅的 pending 位保留尚未消费的信号事实，`AtomicWaker` 只保存唤醒提示；接收使用检查／注册／再检查协议，完成或取消时注销等待。dispatcher 发布 pending 后在所有注册锁和等待者同步状态之外调用 Waker，允许回调同步销毁等待 Future 及最后订阅。复用现有 futures 依赖，不为信号增加任务队列、线程或多等待者事件结构。
 
 ### 8.8 验收
 

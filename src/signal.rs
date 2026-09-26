@@ -13,13 +13,15 @@
 //! with subscription creation and destruction: POSIX has no compare-and-swap for
 //! `sigaction`. Rivet never chains an application callback from its signal handler.
 
-use event_listener::Event;
+use futures_util::task::AtomicWaker;
 use std::{
+    future::poll_fn,
     io,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU8, Ordering},
     },
+    task::Poll,
     thread::{self, JoinHandle},
 };
 
@@ -67,7 +69,7 @@ impl SignalKind {
 
 struct Subscriber {
     pending: AtomicU8,
-    changed: Event,
+    waker: AtomicWaker,
 }
 
 impl Subscriber {
@@ -78,6 +80,15 @@ impl Subscriber {
             })
             .ok()
             .map(|pending| SignalKind::from_bit(pending.isolate_lowest_one()))
+    }
+}
+
+struct ReceiveWaiter<'a>(&'a AtomicWaker);
+
+impl Drop for ReceiveWaiter<'_> {
+    fn drop(&mut self) {
+        // Cancellation unregisters without consuming pending signal bits.
+        drop(self.0.take());
     }
 }
 
@@ -157,9 +168,9 @@ fn dispatch(state: Arc<platform::State>, hub: Arc<Hub>) {
                 return;
             }
             subscriber.pending.fetch_or(pending, Ordering::Release);
-            // Never invoke Wakers under a registry/subscriber-list lock. They may
-            // synchronously create or destroy another subscription.
-            subscriber.changed.notify(usize::MAX);
+            // AtomicWaker releases its registration state before calling user
+            // code, so a Waker may synchronously drop its pending receive task.
+            subscriber.waker.wake();
         }
         if failure.is_some() {
             return;
@@ -188,7 +199,7 @@ impl ShutdownSignals {
     pub fn new() -> io::Result<Self> {
         let subscriber = Arc::new(Subscriber {
             pending: AtomicU8::new(0),
-            changed: Event::new(),
+            waker: AtomicWaker::new(),
         });
         let mut registry = lock(&REGISTRY);
         if let Some(active) = registry.as_ref() {
@@ -209,22 +220,24 @@ impl ShutdownSignals {
     /// notification. A native waiting failure is returned after pending signals
     /// have been drained. Simultaneously pending kinds have unspecified order.
     pub async fn recv(&mut self) -> io::Result<SignalKind> {
-        loop {
+        let _waiter = ReceiveWaiter(&self.subscriber.waker);
+        poll_fn(|cx| {
             if let Some(kind) = self.subscriber.take() {
-                return Ok(kind);
+                return Poll::Ready(Ok(kind));
             }
             if let Some(error) = self.hub.error() {
-                return Err(error);
+                return Poll::Ready(Err(error));
             }
-            let changed = self.subscriber.changed.listen();
+            self.subscriber.waker.register(cx.waker());
             if let Some(kind) = self.subscriber.take() {
-                return Ok(kind);
+                return Poll::Ready(Ok(kind));
             }
             if let Some(error) = self.hub.error() {
-                return Err(error);
+                return Poll::Ready(Err(error));
             }
-            changed.await;
-        }
+            Poll::Pending
+        })
+        .await
     }
 }
 

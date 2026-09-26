@@ -517,6 +517,19 @@ impl Driver {
             return Err(invalid("abortive close requires a TCP stream"));
         }
         socket2::SockRef::from(&state.socket).set_linger(Some(Duration::ZERO))?;
+        // An imported socket may still have host-owned aliases. Disconnect the
+        // underlying TCP connection now; closing our fd need not be the last close.
+        let address = libc::sockaddr {
+            sa_family: libc::AF_UNSPEC as libc::sa_family_t,
+            sa_data: [0; 14],
+        };
+        socket::cvt(unsafe {
+            libc::connect(
+                state.socket.as_raw_fd(),
+                &address,
+                mem::size_of_val(&address) as libc::socklen_t,
+            )
+        })?;
         self.close(socket)
     }
 

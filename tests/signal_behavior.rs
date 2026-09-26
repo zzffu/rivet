@@ -1,10 +1,13 @@
 use futures_lite::future::{block_on, poll_once};
+use parking_lot::Mutex;
 use rivet::signal::{ShutdownSignals, SignalKind};
 use std::{
+    future::Future,
     io::{BufRead, BufReader, Write},
-    pin::pin,
+    pin::{Pin, pin},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
+    sync::{Arc, mpsc},
+    task::{Context, Wake, Waker},
     thread,
     time::{Duration, Instant},
 };
@@ -180,6 +183,50 @@ fn exercise_broadcast_and_cancellation() {
     assert_eq!(block_on(restarted.recv()).unwrap(), FIRST);
 }
 
+type SignalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+struct CancelOnWake {
+    task: Mutex<Option<SignalTask>>,
+    completed: mpsc::Sender<()>,
+}
+
+impl Wake for CancelOnWake {
+    fn wake(self: Arc<Self>) {
+        let task = self.task.lock().take();
+        drop(task);
+        let _ = self.completed.send(());
+    }
+}
+
+fn drop_pending_task_from_waker() {
+    let mut signals = ShutdownSignals::new().unwrap();
+    let (completed, destroyed) = mpsc::channel();
+    let cancellation = Arc::new(CancelOnWake {
+        task: Mutex::new(None),
+        completed,
+    });
+    let waker = Waker::from(cancellation.clone());
+    let mut task = Box::pin(async move {
+        let _ = signals.recv().await;
+    });
+    assert!(
+        task.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    *cancellation.task.lock() = Some(task);
+    request(FIRST);
+    destroyed
+        .recv_timeout(Duration::from_secs(5))
+        .expect("signal Waker could not destroy its pending task and last subscription");
+
+    // Synchronous destruction must disarm the old registration and permit a new
+    // dispatcher, even before the old dispatcher returns from the user Waker.
+    let mut restarted = ShutdownSignals::new().unwrap();
+    request(SECOND);
+    assert_eq!(block_on(restarted.recv()).unwrap(), SECOND);
+}
+
 fn default_after_drop(kind: SignalKind) {
     let first = ShutdownSignals::new().unwrap();
     let second = ShutdownSignals::new().unwrap();
@@ -343,6 +390,7 @@ fn signal_child() {
     }
     match case.to_str().unwrap() {
         "broadcast" => exercise_broadcast_and_cancellation(),
+        "drop-from-waker" => drop_pending_task_from_waker(),
         "drop-first" => default_after_drop(FIRST),
         "drop-second" => default_after_drop(SECOND),
         #[cfg(unix)]
@@ -360,6 +408,11 @@ fn signal_child() {
 #[test]
 fn broadcasts_both_signals_and_retries_cancelled_receives() {
     assert!(run_child("broadcast").success());
+}
+
+#[test]
+fn signal_waker_can_drop_its_pending_task_and_last_subscription() {
+    assert!(run_child("drop-from-waker").success());
 }
 
 #[test]
