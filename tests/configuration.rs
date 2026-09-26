@@ -1,41 +1,6 @@
-use rivet::capability::{CapabilityError, CapabilityReport, KernelVersion};
+use rivet::capability::KernelVersion;
 use rivet::{Optimization as O, Policy, RuntimeConfig};
 use std::io;
-
-#[test]
-fn strict_unavailable_capability_returns_its_identity() {
-    let mut report = CapabilityReport::new("test-environment", 0);
-    let error = report
-        .decide(
-            O::ZcRx,
-            Policy::RequireCapability,
-            Err("no configured queue".into()),
-        )
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-    let detail = error
-        .get_ref()
-        .unwrap()
-        .downcast_ref::<CapabilityError>()
-        .unwrap();
-    assert_eq!(detail.optimization, O::ZcRx);
-    let state = report.state(O::ZcRx).unwrap();
-    assert!(!state.enabled);
-    assert!(!state.supported);
-    assert!(state.reason.is_some());
-}
-
-#[test]
-fn automatic_unavailable_path_is_reported_inactive() {
-    let mut report = CapabilityReport::new("test-environment", 1);
-    assert!(
-        !report
-            .decide(O::ZcRx, Policy::Auto, Err("queue not available".into()))
-            .unwrap()
-    );
-    assert!(!report.enabled(O::ZcRx));
-    assert!(!report.state(O::ZcRx).unwrap().enabled);
-}
 
 #[test]
 fn explicitly_disabled_dependency_is_not_overridden() {
@@ -214,7 +179,7 @@ fn strict_uncompiled_selection_has_structured_failure_identity() {
     let detail = error
         .get_ref()
         .unwrap()
-        .downcast_ref::<CapabilityError>()
+        .downcast_ref::<rivet::capability::CapabilityError>()
         .unwrap();
     assert_eq!(detail.optimization, O::ZcTx);
 }

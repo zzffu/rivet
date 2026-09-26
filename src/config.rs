@@ -30,7 +30,7 @@ macro_rules! optimizations {
                     || (cfg!(target_os = "android") && matches!(self, Self::UdpGso | Self::UdpGro));
                 platform && match self { $(Self::$name => cfg!(feature = $feature)),+ }
             }
-            pub const fn bit(self) -> u64 { 1u64 << self as u8 }
+            pub(crate) const fn bit(self) -> u64 { 1u64 << self as u8 }
         }
     };
 }

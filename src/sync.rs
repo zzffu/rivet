@@ -2,6 +2,16 @@
 //!
 //! Channels retain their own bounds; moving a sender does not make a `!Send`
 //! payload transferable. Never hold a synchronous watch borrow across `.await`.
+//!
+//! # Public dependencies
+//!
+//! Locks, guards and semaphores are the actual `async-lock` 3.x types; [`mpsc`]
+//! exposes `async-channel` 2.x types and errors; [`oneshot`] is the
+//! `futures-channel` 0.3.x module. These are direct re-exports, not Rivet wrappers.
+//! Their type identity, public methods, bounds, errors and documented
+//! cancellation/close behavior are part of Rivet's compatibility contract.
+//! Dependency upgrades, replacements and feature changes must preserve that
+//! contract and pass downstream compilation and affected behavior checks.
 
 pub use async_lock::{
     Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Semaphore, SemaphoreGuard,

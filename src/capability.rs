@@ -75,6 +75,11 @@ pub struct OptimizationState {
     pub reason: Option<String>,
 }
 
+/// Per-worker native capability evidence obtained from [`crate::Runtime::capabilities`].
+///
+/// Query named optimizations with [`Self::states`], [`Self::state`] and
+/// [`Self::enabled`]. Report construction, backend decisions and the internal
+/// enabled bitset are not part of the public interface.
 #[derive(Clone, Debug)]
 pub struct CapabilityReport {
     pub backend: &'static str,
@@ -86,7 +91,7 @@ pub struct CapabilityReport {
 }
 
 impl CapabilityReport {
-    pub fn new(backend: &'static str, worker: usize) -> Self {
+    pub(crate) fn new(backend: &'static str, worker: usize) -> Self {
         Self {
             backend,
             worker,
@@ -108,13 +113,10 @@ impl CapabilityReport {
     pub fn enabled(&self, optimization: Optimization) -> bool {
         self.active & optimization.bit() != 0
     }
-    pub fn enabled_mask(&self) -> u64 {
-        self.active
-    }
 
     /// Call after the backend has validated and, where applicable, initialized
     /// the real implementation. Opcode existence alone does not prove a NIC path.
-    pub fn decide(
+    pub(crate) fn decide(
         &mut self,
         optimization: Optimization,
         policy: Policy,
@@ -179,7 +181,7 @@ impl CapabilityReport {
     }
 
     /// Ensure that a requested optimization cannot disappear from the report.
-    pub fn finish(&mut self, config: &RuntimeConfig) -> io::Result<()> {
+    pub(crate) fn finish(&mut self, config: &RuntimeConfig) -> io::Result<()> {
         for &optimization in Optimization::ALL {
             if self.state(optimization).is_none() {
                 self.decide(
@@ -249,5 +251,47 @@ impl ZcStats {
         self.rx_allocation_failures = self
             .rx_allocation_failures
             .saturating_add(other.rx_allocation_failures);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CapabilityError, CapabilityReport};
+    use crate::config::{Optimization as O, Policy};
+    use std::io;
+
+    #[test]
+    fn strict_unavailable_capability_returns_its_identity() {
+        let mut report = CapabilityReport::new("test-environment", 0);
+        let error = report
+            .decide(
+                O::ZcRx,
+                Policy::RequireCapability,
+                Err("no configured queue".into()),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let detail = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<CapabilityError>()
+            .unwrap();
+        assert_eq!(detail.optimization, O::ZcRx);
+        let state = report.state(O::ZcRx).unwrap();
+        assert!(!state.enabled);
+        assert!(!state.supported);
+        assert!(state.reason.is_some());
+    }
+
+    #[test]
+    fn automatic_unavailable_path_is_reported_inactive() {
+        let mut report = CapabilityReport::new("test-environment", 1);
+        assert!(
+            !report
+                .decide(O::ZcRx, Policy::Auto, Err("queue not available".into()))
+                .unwrap()
+        );
+        assert!(!report.enabled(O::ZcRx));
+        assert!(!report.state(O::ZcRx).unwrap().enabled);
     }
 }

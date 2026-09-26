@@ -10,6 +10,26 @@ This document specifies the internal ownership and completion contracts. The sys
 
 `runtime::blocking` owns bounded synchronous work independently of the network workers. `io` owns bounded non-socket native registrations; `sync` supplies executor-independent coordination; `signal` owns explicitly scoped process-signal subscriptions. None of these modules implements a Tokio reactor or a protocol stack.
 
+## Capability report ownership
+
+Backends construct reports during runtime initialization. Consumers obtain them through `Runtime::capabilities()` and keep the existing metadata fields and `CapabilityReport::{states, state, enabled}` queries. `Optimization::{ALL, name, compiled}` and structured `CapabilityError` identity remain public.
+
+`CapabilityReport::{new, decide, finish}` and `Optimization::bit` are crate-private. Remove the unused `CapabilityReport::enabled_mask` rather than retaining a compatibility alias or exposing the internal bitset. No configuration/result fields, constructors, enum matching rules, or backend decision behavior change in this cutover.
+
+Tests that directly construct reports or inject capability support belong in the `capability` unit-test module. External callers use actual runtime reports; regression coverage must retain strict unavailable-capability errors and explicit Auto fallback without exposing report-management methods.
+
+## Public compatibility
+
+The public interface after the report-management cutover is the compatibility baseline. Preserve source and documented behavior within `0.1.x`; intentional breaks require the next minor version while below 1.0, or the next major version from 1.0 onward, with migration notes. This is not a claim of native execution coverage on every platform.
+
+Compatibility includes owned-buffer and kernel-lease lifetimes, caller-input send counts, unaccepted suffixes and ordered send groups, receive/send cancellation, datagram metadata, worker ownership, task Drop/detach semantics, lazy flush/write shutdown and the independent receive direction, and timer binding/reset/errors. The existing sections below define those behaviors. Public traits remain open without additional required methods or stronger bounds in a compatible release; independent capabilities use independent traits rather than changing existing implementer obligations.
+
+Keep public configuration/result fields and their construction and enum matching rules unchanged in this work. Do not add `#[non_exhaustive]` or a builder migration. Future additions that invalidate downstream literals or exhaustive matches are breaking changes, not internal implementation changes.
+
+The `sync` re-exports expose the actual `async-channel` 2.x sender/receiver/error types, `async-lock` 3.x lock/guard/semaphore types, and `futures-channel` 0.3.x oneshot module. Preserve that type identity and the documented methods, bounds, errors, cancellation and close behavior within a compatible Rivet release. Dependency upgrades, replacements and feature changes require downstream compilation and affected behavioral regressions; neither a Rivet alias nor Cargo.lock makes a public dependency private. Keep the existing direct re-exports and dependency requirements, without wrappers or new per-operation costs.
+
+Verification uses an external consumer for report queries and direct dependency type interoperability, checks that report-management and bitset helpers are inaccessible externally, and runs the existing lifecycle regressions plus the native capability example. Compile-only boundary checks are not substitutes for runtime evidence or a reason to duplicate behavior tests with forwarding/source-text assertions.
+
 ## Platform handles
 
 `socket::OwnedSocket` and `socket::BorrowedSocket<'a>` are aliases to the standard owning/borrowing socket handles on Windows and `OwnedFd`/`BorrowedFd` on Unix. `RawSocket` is the corresponding platform raw type.

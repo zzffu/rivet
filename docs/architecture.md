@@ -37,6 +37,23 @@ Linux 不维护 6.x 兼容 Implementation，不自动退到 epoll。Android 不�
 
 Driver 是内部 Interface；公开 Interface 不暴露内核队列、buffer ID 或 native completion record。三个平台 Adapter 可有不同的 Implementation，不能把完成式后端强行变成“先模拟 readable，再调用读取”。
 
+### 3.1 公开 Interface 的兼容契约
+
+本次后端管理入口收口后的公开 Interface 是兼容基线。当前 `0.1.x` 内保留源码和已承诺的行为兼容；有意破坏兼容时，`0.y.z` 提升次版本，`1.0` 及以后提升主版本，并在变更记录给出迁移方式。当前仍未发布，不以此宣称所有平台路径已经完成原生验证。
+
+兼容范围不只包括方法名称和参数，还包括：
+
+- 拥有型缓冲区、发送结果的输入字节计数、`send_all` 的未接受后缀、发送分组以及内核租约的实际释放时机；取消等待不丢弃排队接收，取消已提交发送不撤销输出。
+- 网络对象和本地任务的 worker 归属、`!Send` Future／输出及工厂的现有泛型约束、句柄 Drop 取消和显式 detach；计时器保持首次 poll 绑定、reset 和原生错误分类。
+- flush 和写半关闭的惰性、排空责任、上下文校验及半关闭后仍可读取反向响应；数据报保留边界、空报文和来源等元数据。
+- 开放 trait 的下游实现要求。兼容版本不增加必需方法或更强的类型约束；新增独立能力使用独立 trait，不补入 `dyn`、统一 `Send` 或跨运行时承诺。
+
+公开配置／结果结构的字段、构造方式和枚举穷尽匹配规则保持现状，不添加 `#[non_exhaustive]`，也不改用 builder。它们同样属于公开契约；以后新增字段或枚举成员若破坏合法的下游构造／匹配，必须按破坏性变更处理，而不是称为内部优化。
+
+`sync` 直接重导出的 `async-channel` 2.x、`async-lock` 3.x、`futures-channel` 0.3.x 类型属于公开依赖，不是可随意替换的 Implementation。类型身份、公开方法／泛型约束、错误及取消／关闭行为都计入兼容评估；升级、替换或改变这些依赖的 feature 必须检查下游编译和相关行为回归。不为此增加一层包装，也不承诺每个补丁版本都不更新。
+
+验证分为三类：外部消费编译检查公开查询与依赖类型互操作，外部编译拒绝后端管理入口，现有行为回归及真实 `native_traits` 场景检查生命周期契约。编译检查不替代实际运行，Windows／Linux／Android 各自的原生证据不能互相代替。
+
 ## 4. 执行模型
 
 每个 worker 拥有 Driver、就绪任务、定时器、socket/operation 槽位、缓冲区池及有界跨线程入口。任务生成工厂可跨线程传递，Future 在选定 worker 内创建，因此本地 Future 可以是 `!Send`。`spawn_local` 在当前 worker 创建任务；普通任务投递自动选 worker，不暴露负载组。
@@ -121,6 +138,14 @@ Linux 基础能力低于 7.2.7，或 io_uring 整体不可用时，初始化失�
 - 普通 fixed-buffer receive 与同一请求上的 buffer selection/multishot/bundle 互斥。
 - 普通 send bundle 与 SEND_ZC 是不同请求路径，不能直接把两组 flags 混入同一 SQE。
 - 编译期共存不等于每个请求可以同时使用所有能力。
+
+### 6.3 能力报告的公开边界
+
+能力报告由原生后端在 Runtime 初始化期间生成。应用通过 `Runtime::capabilities()` 取得各 worker 的报告，读取现有元数据字段以及 `CapabilityReport::{states, state, enabled}`，并通过 `Optimization::{ALL, name, compiled}` 识别构建内容。`CapabilityError` 继续公开优化项身份和失败原因；报告查询与严格请求的错误身份不因内部表示变化而改变。
+
+`CapabilityReport::{new, decide, finish}` 仅供 crate 内部构造和完成能力探测，收为 `pub(crate)`。没有调用者的 `enabled_mask` 删除，`Optimization::bit` 收为 `pub(crate)`；内部启用位图不作为外部查询或持久化协议。应用按优化项查询，不自行构造后端能力证据。现有报告元数据字段、配置和结果结构的构造方式保持不变。
+
+能力决策回归随实现放在 `capability` 的单元测试中，不为了集成测试重新开放管理入口。外部消费验证通过真实 Runtime 查询报告；Windows、Linux 和 Android 的内部创建流程继续共用原有决策逻辑，不增加包装、探测或数据路径开销。
 
 ## 7. 预配置资源与接管
 

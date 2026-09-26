@@ -19,6 +19,17 @@ Rust 1.98+，edition 2024。当前包名为 `rivet-runtime`、库名为 `rivet`�
 rivet = { package = "rivet-runtime", path = "../rivet" }
 ```
 
+## 公开 API 与兼容性
+
+本次后端管理入口收口后的公开 Interface 是兼容基线，当前 `0.1.x` 内保持源码与已承诺行为兼容。有意破坏兼容时，`0.y.z` 提升次版本，`1.0` 及以后提升主版本，并给出迁移说明；这不代表所有平台路径都已完成原生验证。
+
+- 能力报告由 Runtime 生成：从 `Runtime::capabilities()` 读取 worker 元数据，通过 `states()`、`state(optimization)`、`enabled(optimization)` 查询。`Optimization::{ALL, name, compiled}` 和结构化 `CapabilityError` 保持公开。原 `CapabilityReport::{new, decide, finish}` 与 `Optimization::bit` 不再供外部调用，`enabled_mask` 删除；迁移为按优化项查询，不依赖内部位图。
+- 兼容契约包含拥有型缓冲区与内核租约、发送输入字节计数和未接受后缀、取消与 worker 归属、任务 Drop／detach、惰性 flush／写半关闭及反向读取、数据报元数据、计时器绑定／reset／错误语义，而不只是函数签名。
+- 开放 trait 不在兼容版本中增加必需方法或更强约束；独立能力使用独立 trait。本次不改变配置／结果结构的字段和构造方式，不添加 `#[non_exhaustive]`；以后破坏下游字面量或穷尽匹配的扩展按破坏性变更处理。
+- `sync` 直接重导出的 `async-channel` 2.x、`async-lock` 3.x、`futures-channel` 0.3.x 是公开依赖，类型身份、方法／约束、错误及取消／关闭行为也属于契约。升级、替换或改变 dependency feature 时须验证下游编译和相应行为；不新增包装，也不固定每个补丁版本。
+
+完整约束见[系统与架构设计](docs/architecture.md#31-公开-interface-的兼容契约)及[实施契约](docs/implementation-contract.md#public-compatibility)。外部消费编译、管理入口不可访问检查和真实运行各证明不同方面，不能互相替代。
+
 ## 自动放置与本地执行
 
 `Runtime`、socket 和缓冲区租约均为 `!Send`。`Handle::spawn` 接受 `Send` 工厂，在自动选出的 worker 内创建本地 Future；Future 本身不必 `Send`。`spawn_local` 直接在当前 worker 创建本地任务。已经创建的 Future、正在收发的 socket 和租约不做任意跨核迁移。

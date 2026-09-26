@@ -2,6 +2,10 @@
 
 ## 0.1.0
 
+- 收紧后端管理 Interface：`CapabilityReport::{new, decide, finish}` 与 `Optimization::bit` 改为 crate 内部可见，删除无调用者的 `enabled_mask`。这是一次有意的公开面收口；外部迁移为从 `Runtime::capabilities()` 获取报告，再用 `states`／`state`／`enabled` 按优化项查询。原有能力决策回归迁入内部单元测试，不保留兼容别名。
+- 先更新系统架构与实施契约，再落实公开兼容说明：以本次收口后的 Interface 为 `0.1.x` 兼容基线，保留拥有型缓冲区、取消、worker、任务、flush／半关闭、数据报和计时器行为，以及开放 trait 的实现要求；将 `sync` 重导出的 `async-channel`／`async-lock`／`futures-channel` 类型身份与行为纳入兼容评估。本次不修改配置／结果结构构造方式、枚举匹配规则或依赖版本，不添加 `#[non_exhaustive]` 或包装层。
+- 本次收口验证：Windows IPv4 模式 `--all-features --all-targets` 的 128 项回归、严格 Clippy／rustdoc、修改文件格式检查及双／单 worker `native_traits` 实跑通过；临时外部程序实际查询能力并验证公开 channel／锁／guard／semaphore／oneshot 类型互操作，5 个后端管理／位图入口均按预期被编译器拒绝。未执行 Linux／Android 原生场景或 IPv6 连通性，未修改宿主网络设置。
+- 收口后的 Linux GNU／musl、Android ARM64／x86_64、Windows GNU 均通过 `--all-features --all-targets` 编译检查；Linux GNU 的默认 feature 检查及 GNU／musl 全 feature 检查另以 `-D warnings` 通过。能力回归迁移后的条件导入已处理，编译检查不冒充跨平台原生执行。
 - 新增 `TcpStream::connect_from(local, peer, options)`，在惰性建连时显式绑定源 IP／端口；端口 0 由系统分配，非零端口保持指定值，地址族不匹配在原生 socket／hook 之前拒绝，绑定失败不回退到自动源地址。原有 TCP 自动选源与 UDP 绑定接口不变。
 - Windows 在显式源地址和默认通配地址之间二选一，只执行一次 ConnectEx 前置绑定；Linux／Android 仅在请求显式源地址时增加绑定。Linux direct-descriptors 绑定失败同时回收固定文件槽和导出 FD，保留原有建连完成／取消生命周期；hook 继续负责 protect／接口配置，不负责绑定。
 - 新增源地址／端口、惰性构造、双向地址族误配及连续绑定失败后的资源复用回归；更新系统架构、实现契约和 `native_traits`，由代理源站核验 `127.0.0.2` 及写半关闭后的完整反向响应。
