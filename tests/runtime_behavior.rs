@@ -754,8 +754,10 @@ fn serve_acknowledges_dispatch_cancelled_before_import() {
 }
 
 #[test]
-fn unsupported_splice_is_explicit_without_consuming_tcp_bytes() {
-    let mut runtime = Runtime::new(config(1)).unwrap();
+fn disabled_splice_is_explicit_without_consuming_tcp_bytes() {
+    let mut runtime =
+        Runtime::new(config(1).with_policy(rivet::Optimization::TcpSplice, rivet::Policy::Off))
+            .unwrap();
     runtime.block_on(async {
         let (producer, source) = pair(false).await;
         let (destination, consumer) = pair(false).await;

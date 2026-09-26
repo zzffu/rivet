@@ -2,7 +2,7 @@
 
 ## 1. 范围与不可变约束
 
-Rivet 是 Rust 原生网络异步运行时。Linux 最低支持稳定内核 7.2.7，支持该版本及后续稳定版本；Windows 使用 RIO + IOCP，Android 普通应用使用 epoll 和非阻塞 socket。公开 Interface 使用标准 `Future`，不依赖 Tokio，不提供 TLS、DNS、HTTP、QUIC、RPC 编解码、原生异步文件 I/O、用户态协议栈、DMA-BUF 或 BPF 执行。同步文件及 FFI 工作可交给有界阻塞执行通道。
+Rivet 是 Rust 原生网络异步运行时。Linux 以 6.18 LTS 为主验证基线，明确覆盖 6.6／6.12 兼容路径，不设置全局内核版本门禁；Windows 使用 RIO + IOCP，Android 普通应用使用 epoll 和非阻塞 socket。公开 Interface 使用标准 `Future`，不依赖 Tokio，不提供 TLS、DNS、HTTP、QUIC、RPC 编解码、原生异步文件 I/O、用户态协议栈、DMA-BUF 或 BPF 执行。同步文件及 FFI 工作可交给有界阻塞执行通道。
 
 支持 IPv4/IPv6、TCP 客户端与服务端、UDP connected/unconnected、批量数据报、分段发送、外部 socket 接管以及 Android Network/VPN 接入。广播和组播不在交付范围内。TCP splice 是纯字节流透明转发优化，不是文件 I/O 或协议代理框架。
 
@@ -12,15 +12,15 @@ Rivet 是 Rust 原生网络异步运行时。Linux 最低支持稳定内核 7.2.
 
 ## 2. 平台支持
 
-| 平台 | 最低支持版本（含） | Implementation |
+| 平台 | 平台基线与验证目标 | Implementation |
 | --- | --- | --- |
-| Linux x86_64、aarch64 | 稳定内核 7.2.7 及后续版本；不支持 RC | 以 7.2.7 UAPI 定义为依据的项目内 SQ/CQ、资源注册和网络状态机 |
+| Linux x86_64、aarch64 | 6.18 LTS 主验证线，6.6／6.12 兼容目标；按必要能力初始化，不按版本号拒绝 | 保留 7.2.7 参考 UAPI，按实际能力选择 SQ/CQ、资源注册和网络路径 |
 | Windows x86_64 | Windows 10／Server 2016 及后续版本（当前 Rust 目标基线）；不额外校验 OS 版本号 | 注册缓冲区 RIO，IOCP 通知及 overlapped 连接/接受 |
 | Android arm64-v8a；x86_64 验证目标 | API 23 及后续版本 | epoll、非阻塞 socket、libandroid Network 绑定、宿主保护回调 |
 
-这里声明最低版本及后续版本的支持范围，不将运行环境锁定到某个精确版本。Linux／Android 初始化检查各自版本下限；Windows 按原生能力初始化，不读取 OS 版本号。达到工具链及平台下限不保证可选优化、权限或硬件资源可用。公开 Rust `Future` Interface 的兼容性不替代底层 OS/ABI 契约。项目内 UAPI 定义的参考版本、验证 runner 固定的 guest 版本和实际验证记录各有用途，不能把它们混同为唯一支持版本，也不能用支持范围冒充已完成的原生验证。
+平台基线、参考 UAPI、验证 runner 的具体 guest pin 和实际运行证据是不同事实。Linux 版本用于逐项优化的保守选择和已知缺陷规避，不构成整个 Runtime 的准入条件；未识别版本和 RC 不因版本字符串直接失败，但不因此获得未经验证的支持承诺。Android 保留 API 下限检查，Windows 按原生能力初始化。公开 Rust `Future` Interface 的兼容性不替代底层 OS/ABI、权限和硬件要求。
 
-Linux 不支持低于 7.2.7 的内核或 RC，也不自动退到 epoll。Android 不尝试调用 io_uring。平台通过条件编译选择，不在每次网络操作上进行平台动态分派。
+Linux 必要 io_uring 接口不可用时返回原生错误或明确的缺失能力，不自动退到 epoll。更旧内核可以尝试必要能力路径，不承诺所有带 io_uring 的版本可用。Android 不尝试调用 io_uring。平台通过条件编译选择，不在每次网络操作上进行平台动态分派。
 
 Windows RIO 的接口引入版本为 Windows 8／Server 2012，但这不是本包的工具链或验证基线。Rust 1.77 的常规 MSVC 目标基线包含 Win8；Rust 1.78 起不再覆盖它。本包要求 Rust 1.98／edition 2024，遵循当前 Windows 10／Server 2016 目标基线，不承诺 Win8。后端不设置 OS 版本／build 门禁，直接初始化 Winsock 2.2、registered-I/O socket、RIO／IOCP 及连接扩展；原生能力缺失或资源失败仍显式报错，不降级为其他后端。
 
@@ -45,7 +45,7 @@ Driver 是内部 Interface；公开 Interface 不暴露内核队列、buffer ID 
 
 ### 3.1 公开 Interface 的兼容契约
 
-本次后端管理入口收口后的公开 Interface 是兼容基线。当前 `0.1.x` 内保留源码和已承诺的行为兼容；有意破坏兼容时，`0.y.z` 提升次版本，`1.0` 及以后提升主版本，并在变更记录给出迁移方式。当前仍未发布，不以此宣称所有平台路径已经完成原生验证。
+`0.2.0` 有意改变 Linux 默认功能选择：默认编译生产优化，未指定项由后端自动选择，并删除全局 Linux 版本门禁及其公开管理入口。配置／结果结构、优化枚举和原生 trait 的形状保持不变。新的 `0.2.x` 兼容基线保留源码和已承诺的行为兼容；以后有意破坏兼容时，`0.y.z` 提升次版本，`1.0` 及以后提升主版本，并给出迁移说明。支持策略不冒充所有平台路径都已完成原生验证。
 
 兼容范围不只包括方法名称和参数，还包括：
 
@@ -115,11 +115,11 @@ Drop Future 不保证撤回网络效果。未提交操作可撤销；已提交�
 
 ## 6. 功能选择与能力契约
 
-Cargo features 只决定构建内容。`linux-full` 是编译聚合，不是运行时全开。
+Cargo features 只决定构建内容，默认集合为 `linux-full`，不包含 NODEV。`default-features = false` 保留精简构建及完整基础网络语义；`linux-full` 不表示运行时全开，也不要求运行内核支持每个已编译优化。Windows／Android 的运行时默认策略保持不变。
 
-显式启用优化默认 `RequireCapability`。`Off` 不要求该项能力；`Auto` 必须显式选择，才允许回到正常路径。报告区分 compiled、supported、enabled、inactive reason，以及可选的实际复制统计。未实现的功能不得被报告为支持。
+Linux 的配置表保存调用者覆盖：未指定项继承均衡、空闲可休眠的自动方案；显式 `Off` 禁止该项，`Auto` 允许该优化不可用，`RequireCapability` 必须成功或返回结构化错误。`enable` 仍表示严格要求。`policy`／`requested` 查询配置中的请求，不能预测内核决策；生效结果从 `Runtime::capabilities()` 读取。静态正规化只解决显式请求及其依赖，Linux 后端再补入不与这些请求冲突的默认候选。
 
-Linux 内核低于 7.2.7、版本为 RC，或 io_uring 整体不可用时，初始化失败。ZC `Auto` 可以选择普通 io_uring 数据路径，不能悄悄替换平台后端。`RequireCapability` 要求能力/资源成立，不承诺内核每个请求都不复制。
+自动选择综合已编译实现、版本与已知修复条件、实际 feature bits／opcode／注册结果、资源及硬件配置。版本信息缺失时保守禁用没有可靠独立探测方式的新 modifier，不阻止完整基础路径。报告区分 compiled、supported、enabled 和 inactive reason；不能把注册成功或 opcode 存在作为其他字段和组合可用的证明。`RequireCapability` 不承诺每次 ZC 发送都不复制，优化回退也不能更换平台后端。
 
 ### 6.1 优化目录
 
@@ -144,6 +144,9 @@ Linux 内核低于 7.2.7、版本为 RC，或 io_uring 整体不可用时，初�
 - 普通 fixed-buffer receive 与同一请求上的 buffer selection/multishot/bundle 互斥。
 - 普通 send bundle 与 SEND_ZC 是不同请求路径，不能直接把两组 flags 混入同一 SQE。
 - 编译期共存不等于每个请求可以同时使用所有能力。
+- 默认候选不能重新开启显式 `Off`，也不能为了补齐依赖绕过它。两个显式互斥请求仍报配置错误，包括两者都为 `Auto`；自动方案在填入候选之前消除与显式请求的冲突。
+- 注册内存是内部资源，不等于普通 fixed SEND/RECV 优化。`zc-tx-fixed` 的运行时依赖是 ZC TX 和实际注册资源，不再强制开启 `registered-buffers` 所代表的普通 fixed 收发；Cargo 依赖仍负责纳入共享实现。
+- fixed＋vectored ZC 必须验证具体 modifier 组合，且一次请求的全部非空段位于同一个注册区域。未获证据的组合不提交到业务 socket 试错，不重发已经可能产生网络效果的请求。
 
 ### 6.3 能力报告的公开边界
 
@@ -152,6 +155,24 @@ Linux 内核低于 7.2.7、版本为 RC，或 io_uring 整体不可用时，初�
 `CapabilityReport::{new, decide, finish}` 仅供 crate 内部构造和完成能力探测，收为 `pub(crate)`。没有调用者的 `enabled_mask` 删除，`Optimization::bit` 收为 `pub(crate)`；内部启用位图不作为外部查询或持久化协议。应用按优化项查询，不自行构造后端能力证据。现有报告元数据字段、配置和结果结构的构造方式保持不变。
 
 能力决策回归随实现放在 `capability` 的单元测试中，不为了集成测试重新开放管理入口。外部消费验证通过真实 Runtime 查询报告；Windows、Linux 和 Android 的内部创建流程继续共用原有决策逻辑，不增加包装、探测或数据路径开销。
+
+### 6.4 初始化决策与资源
+
+每个 worker 在初始化期间确定不可变的数据路径能力。`config` 验证调用者意图并补入合法默认候选，`driver::linux` 结合实际内核证据决定 ring 模式和具体收发路径，`capability` 记录结果；不增加面向调用者的内核版本 profiles、动态 Driver 或逐请求能力探测。
+
+默认方案不启用 SQPOLL／NAPI 忙轮询，它们保留显式选择。跨 worker MSG_RING 仅在有多个 worker 时成为默认候选。只有已配置网卡队列时才考虑硬件 ZCRX；共享模式还要匹配队列拓扑，较大接收块遵守显式块大小配置。NODEV 始终显式选择，不能作为硬件 RX 的自动替代。没有扩展完成项需求时，不为版本支持而默认选择 mixed CQE。
+
+先选择路径，再申请它需要的可选资源。资源和队列继续有界；自动初始化失败沿既有所有权清理流程收敛，不能泄漏注册或把仍持有失败注册的 ring 继续用于普通 I/O。正常路径只读取已确定的能力和请求形态，不执行版本解析、探测、逐包分配或 payload 拼接。
+
+启用增量接收时，TCP 使用增量 provided ring，UDP 使用独立的普通 provided ring；两者分摊同一个有界 payload slab，保留全局 buffer ID、租约和回收队列，不额外复制或翻倍 payload 预算。UDP 不能使用小于其接收容量的 TCP／共享增量尾部，否则合法数据报也会被内核截断。两组描述符各自保持二次幂容量，回收按原始组路由；预算不足以建立两组时，Auto 回到原单组普通接收，严格请求明确失败。
+
+### 6.5 跨版本基础路径与验收矩阵
+
+- 普通分段发送在旧内核使用 io_uring SENDMSG，具备对应能力时使用 SEND_VECTORIZED；复用稳定消息结构和 iovec 存储，不改变发送顺序、已接受字节计数或未接受后缀。
+- multishot receive 对旧内核使用其支持的长度规则，具备 per-invocation cap 的内核才写入非零上限。额度、取消、迟到完成和缓冲区回收语义不随版本缩水。
+- 普通 fixed SEND/RECV、fixed ZC 和内存注册分别判定。incremental 当前保守采用已确认的 7.2.7 级语义，UDP 不使用增量尾部；ZCRX control／大小／事件、SQ_REWIND 等保留逐项条件，不反向抬高基础运行门槛。
+- 6.6／6.12／6.18 分别执行默认优化、精简构建、显式关闭、严格请求、不可用路径和互斥配置；新内核 guest 保留高级路径验证。参考 UAPI 不随最低验证目标降级。
+- 原生验收覆盖多段发送、UDP 空包／来源／截断、multishot 背压、关闭和真实内存释放，并运行实际消费者示例。硬件 ZCRX、普通用户权限和不同架构的证据单独列出；loopback、NODEV、交叉编译不能替代它们。
 
 ## 7. 预配置资源与接管
 
@@ -282,7 +303,7 @@ Unix 仅接管默认／忽略 disposition，遇到现有自定义 handler 返回
 
 #### 8.10.4 验收与环境约束
 
-真实回环验证源 IP／端口及数据传输；错误地址族须在 hook 之前拒绝，未轮询取消不能产生绑定，已占用源端口必须失败且不能回退，低容量下重复失败后仍能成功建连。Linux 普通、fixed-files、direct-descriptors 分别执行，以证明绑定及错误回收不是只覆盖一个创建分支。Windows 和 Linux 7.2.7 隔离 guest 执行 IPv4 场景；保留 IPv6 源地址类型及测试能力，但本机验证不进行 IPv6 连通性测试。Android执行编译检查，设备原生证据独立记录。不得修改现有 TUN、IPv6 阻断、宿主路由、DNS 或网络接口。
+真实回环验证源 IP／端口及数据传输；错误地址族须在 hook 之前拒绝，未轮询取消不能产生绑定，已占用源端口必须失败且不能回退，低容量下重复失败后仍能成功建连。Linux 普通、fixed-files、direct-descriptors 分别选择；不可用的严格模式须报告对应能力，不能让默认自动选择把各行变成同一条路径。Linux 多内核隔离 guest 执行 IPv4／IPv6，当前 Windows 验证进程限定 IPv4；Android 编译检查与设备原生证据分开记录。不得修改现有 TUN、IPv6 阻断、宿主路由、DNS 或网络接口。
 
 ## 9. 验证
 
@@ -293,4 +314,4 @@ Unix 仅接管默认／忽略 disposition，遇到现有自定义 handler 返回
 - 特性开关不改变字节流/数据报语义；失败、取消和资源压力不产生提前回收、重复发送、丢失唤醒或句柄重复关闭。
 - 同资源预算下测量小消息、大块 TCP、UDP、混跑和空闲唤醒；不得捏造未测性能。
 
-现有本机 Windows 可运行验证；WSL 6.18 低于 Linux 最低支持版本，须使用满足 7.2.7 下限的稳定内核环境。仓库验证 runner 固定使用 7.2.7 guest 以便复现，这不限制后端只能在该版本运行。不得擅自升级用户 VPS 或更改现有 WSL 全局内核。Android 使用专用验证应用和隔离模拟器，不改变用户现有 VPN 配置。
+Linux 验证采用可复现、隔离的多内核 guest，以 6.18 LTS 为主验证线并覆盖 6.6／6.12；保留 7.2.7 guest 和原始结果用于高级路径及历史复现。逐项记录实际内核补丁版本、架构、权限和运行场景，不将设计目标写成已通过结果。不得擅自升级用户 VPS、更改 WSL 全局内核或宿主网络／安全策略。Android 使用专用验证应用和隔离模拟器，不改变用户现有 VPN 配置。

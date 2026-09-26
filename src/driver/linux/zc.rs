@@ -1,4 +1,4 @@
-//! Linux 7.2.7 SEND_ZC/SENDMSG_ZC preparation and memory-release state.
+//! SEND_ZC/SENDMSG_ZC preparation and memory-release state.
 //!
 //! The send result does not release its immutable kernel guards when F_MORE is
 //! present. A usage notification is a bit field, even though CQE.res is signed.
@@ -95,6 +95,7 @@ impl ZcTx {
     /// Populate an SQE whose fd, user_data and fixed-file flag are already set.
     /// `message`, when supplied, must occupy stable storage until the result
     /// CQE. Its destination and ancillary data are preserved; iovecs are ours.
+    /// The caller selects legal scalar/vector/message modifiers at startup.
     /// All nonempty fixed vectors must be within a *single* registered region:
     /// the UAPI has one buf_index for the operation, not an index per iovec.
     pub fn prepare(
@@ -178,7 +179,7 @@ impl ZcTx {
                 sqe.file_index = 0;
             }
             #[cfg(feature = "zc-tx-vectored")]
-            None if length != 0 && (count != 1 || vectored) => {
+            None if length != 0 && count != 1 => {
                 sqe.opcode = OP_SEND_ZC;
                 sqe.ioprio |= SEND_VECTORIZED;
                 sqe.addr = self.iovecs.as_ptr() as u64;
@@ -578,6 +579,38 @@ mod tests {
         assert_eq!(stats.tx_copy_marked_bytes, 5);
         assert_eq!(stats.tx_notifications, 1);
         assert!(tx.is_idle());
+    }
+
+    #[cfg(all(feature = "zc-tx-fixed", feature = "zc-tx-vectored"))]
+    #[test]
+    fn vector_capability_does_not_change_a_fixed_scalar_request() {
+        let (pool, data) = pool_and_payload();
+        let mut tx = ZcTx::new(2);
+        let mut sqe = Sqe::default();
+        tx.prepare(
+            &mut sqe,
+            &data,
+            &pool.regions(),
+            TxOptions {
+                fixed: true,
+                vectored: true,
+                ..TxOptions::default()
+            },
+            None,
+        )
+        .unwrap();
+        // Older kernels support this fixed scalar request, but not a vector
+        // modifier merely because the runtime can also send vector payloads.
+        assert_eq!(sqe.opcode, OP_SEND_ZC);
+        assert_eq!(
+            sqe.ioprio & (RECVSEND_FIXED_BUF | SEND_VECTORIZED),
+            RECVSEND_FIXED_BUF
+        );
+        assert_eq!(sqe.addr, data.segments()[0].as_ptr() as u64);
+        assert_eq!(sqe.len, 8);
+        unsafe { tx.abandon_unsubmitted() };
+        drop(data);
+        assert_eq!(pool.try_acquire().unwrap().capacity(), 8);
     }
 
     #[cfg(all(feature = "zc-tx-fixed", feature = "zc-tx-vectored"))]

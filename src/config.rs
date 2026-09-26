@@ -64,6 +64,13 @@ optimizations! {
     TcpSplice => "tcp-splice",
 }
 
+const CONFLICTS: &[(Optimization, Optimization)] = &[
+    (Optimization::SqPoll, Optimization::ZcRx),
+    (Optimization::SqPoll, Optimization::ZcRxNodev),
+    (Optimization::SqPoll, Optimization::SqRewind),
+    (Optimization::ZcRx, Optimization::ZcRxNodev),
+];
+
 impl std::fmt::Display for Optimization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
@@ -181,6 +188,13 @@ impl Default for BlockingConfig {
     }
 }
 
+/// Resource bounds and explicit optimization policies.
+///
+/// Linux supplements unspecified policies with compatible automatic candidates
+/// during backend initialization. Windows and Android do not inherit those
+/// defaults. Effective choices are reported by [`crate::Runtime::capabilities`],
+/// not by configuration queries.
+///
 /// A zero-copy threshold is a configurable starting point, not a measured optimum.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -192,6 +206,9 @@ pub struct RuntimeConfig {
     pub max_async_io: usize,
     pub linux: LinuxConfig,
     pub idle_spin: Duration,
+    /// Explicit overrides: Off forbids a path, Auto permits fallback, and
+    /// RequireCapability makes an unavailable path an initialization error.
+    /// An absent entry is not an explicit Off and may inherit a Linux default.
     pub optimizations: BTreeMap<Optimization, Policy>,
 }
 
@@ -220,18 +237,23 @@ impl RuntimeConfig {
         }
     }
 
-    /// Request a capability strictly; compilation alone never enables it.
+    /// Require an optimization; initialization fails if it cannot be activated.
     pub fn enable(mut self, optimization: Optimization) -> Self {
         self.optimizations
             .insert(optimization, Policy::RequireCapability);
         self
     }
 
+    /// Override an optimization's policy, including any automatic Linux default.
     pub fn with_policy(mut self, optimization: Optimization, policy: Policy) -> Self {
         self.optimizations.insert(optimization, policy);
         self
     }
 
+    /// Return the stored request policy, or Off when no entry is present.
+    ///
+    /// This does not resolve automatic Linux defaults or native capabilities.
+    /// Use [`crate::Runtime::capabilities`] for the backend's actual decisions.
     pub fn policy(&self, optimization: Optimization) -> Policy {
         self.optimizations
             .get(&optimization)
@@ -239,11 +261,16 @@ impl RuntimeConfig {
             .unwrap_or(Policy::Off)
     }
 
+    /// Whether the stored request is Auto or RequireCapability.
+    ///
+    /// This is not an enabled-capability query; absent Linux defaults are not
+    /// represented until the backend prepares its local configuration.
     pub fn requested(&self, optimization: Optimization) -> bool {
         self.policy(optimization) != Policy::Off
     }
 
-    /// Resolve implicit dependencies and reject contradictions before OS resources exist.
+    /// Resolve explicit requests' dependencies and reject contradictions before
+    /// OS resources exist. This does not insert automatic Linux defaults.
     pub fn normalized(&self) -> io::Result<Self> {
         let mut config = self.clone();
         config.validate_limits()?;
@@ -281,12 +308,7 @@ impl RuntimeConfig {
             }
         }
         use Optimization::*;
-        for (left, right) in [
-            (SqPoll, ZcRx),
-            (SqPoll, ZcRxNodev),
-            (SqPoll, SqRewind),
-            (ZcRx, ZcRxNodev),
-        ] {
+        for &(left, right) in CONFLICTS {
             if config.requested(left) && config.requested(right) {
                 return Err(invalid(format!(
                     "{} and {} cannot be requested together",
@@ -301,19 +323,29 @@ impl RuntimeConfig {
                 "zc-observe requires an explicitly selected ZC or NODEV path",
             ));
         }
+        let mut unavailable = None;
         for (&feature, &policy) in &config.optimizations {
             if policy == Policy::RequireCapability && !feature.compiled() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    crate::capability::CapabilityError {
-                        optimization: feature,
-                        reason: format!(
-                            "implementation is not compiled for {}; check target support and Cargo features",
-                            std::env::consts::OS
-                        ),
-                    },
-                ));
+                // Prefer the caller's strict request over a dependency that
+                // normalization inserted or strengthened on its behalf.
+                if self.policy(feature) == Policy::RequireCapability {
+                    unavailable = Some(feature);
+                    break;
+                }
+                unavailable.get_or_insert(feature);
             }
+        }
+        if let Some(feature) = unavailable {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                crate::capability::CapabilityError {
+                    optimization: feature,
+                    reason: format!(
+                        "implementation is not compiled for {}; check target support and Cargo features",
+                        std::env::consts::OS
+                    ),
+                },
+            ));
         }
         Ok(config)
     }
@@ -323,12 +355,96 @@ impl RuntimeConfig {
         match feature {
             DirectDescriptors => &[FixedFiles],
             IncrementalBuffers | MultishotRecv | BufferBundles => &[ProvidedBuffers],
-            ZcTxFixed => &[ZcTx, RegisteredBuffers],
-            ZcTxVectored => &[ZcTx],
+            ZcTxFixed | ZcTxVectored => &[ZcTx],
             ZcRxShared if self.requested(ZcRxNodev) => &[ZcRxNodev],
             ZcRxLargeChunks | ZcRxShared => &[ZcRx],
             _ => &[],
         }
+    }
+
+    /// Add only compatible candidates to an already normalized local copy.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn apply_linux_defaults(&mut self) {
+        use Optimization::*;
+        // Dependencies precede their consumers; explicit Off entries remain
+        // authoritative without another normalization pass.
+        for feature in [
+            FixedFiles,
+            DirectDescriptors,
+            RegisteredBuffers,
+            RegisteredRing,
+            RegisteredWait,
+            ProvidedBuffers,
+            IncrementalBuffers,
+            MultishotAccept,
+            MultishotRecv,
+            BufferBundles,
+            SqRewind,
+            ZcTx,
+            ZcTxFixed,
+            ZcTxVectored,
+            UdpGso,
+            UdpGro,
+            TcpSplice,
+        ] {
+            self.insert_linux_default(feature);
+        }
+        if self.workers > 1 {
+            self.insert_linux_default(MsgRing);
+        }
+
+        let queues = self.linux.zcrx.queues.len();
+        if queues != 0
+            && (queues >= self.workers
+                || (ZcRxShared.compiled()
+                    && self.optimizations.get(&ZcRxShared) != Some(&Policy::Off)))
+        {
+            self.insert_linux_default(ZcRx);
+        }
+        if ZcRx.compiled() && self.requested(ZcRx) {
+            if queues != 0 && queues < self.workers {
+                self.insert_linux_default(ZcRxShared);
+            }
+            if ZcRxLargeChunks.compiled()
+                && !self.optimizations.contains_key(&ZcRxLargeChunks)
+                && self.linux.zcrx.chunk_bytes != 0
+            {
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if page > 0
+                    && (page as usize).is_power_of_two()
+                    && self.linux.zcrx.chunk_bytes as usize > page as usize
+                {
+                    self.insert_linux_default(ZcRxLargeChunks);
+                }
+            }
+        }
+        let receive = [ZcRx, ZcRxNodev]
+            .into_iter()
+            .any(|feature| feature.compiled() && self.requested(feature));
+        if receive {
+            self.insert_linux_default(MixedCqe);
+        }
+        if receive || (ZcTx.compiled() && self.requested(ZcTx)) {
+            self.insert_linux_default(ZcObserve);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn insert_linux_default(&mut self, feature: Optimization) {
+        if !feature.compiled()
+            || self.optimizations.contains_key(&feature)
+            || self
+                .dependencies(feature)
+                .iter()
+                .any(|&dependency| !dependency.compiled() || !self.requested(dependency))
+            || CONFLICTS.iter().any(|&(left, right)| {
+                (feature == left && self.requested(right))
+                    || (feature == right && self.requested(left))
+            })
+        {
+            return;
+        }
+        self.optimizations.insert(feature, Policy::Auto);
     }
 
     fn validate_limits(&self) -> io::Result<()> {
@@ -428,4 +544,146 @@ impl RuntimeConfig {
 
 fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{Optimization as O, Policy, RuntimeConfig, RxQueue};
+
+    #[test]
+    fn automatic_dependencies_respect_explicit_off() {
+        for (dependency, children) in [
+            (O::FixedFiles, &[O::DirectDescriptors][..]),
+            (
+                O::ProvidedBuffers,
+                &[O::IncrementalBuffers, O::MultishotRecv, O::BufferBundles][..],
+            ),
+            (O::ZcTx, &[O::ZcTxFixed, O::ZcTxVectored, O::ZcObserve][..]),
+        ] {
+            let mut config = RuntimeConfig::single_thread()
+                .with_policy(dependency, Policy::Off)
+                .normalized()
+                .unwrap();
+            config.apply_linux_defaults();
+            assert_eq!(config.policy(dependency), Policy::Off);
+            for &child in children {
+                assert!(!config.requested(child), "{child}");
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_ring_modes_yield_to_explicit_requests() {
+        for (mode, suppressed) in [
+            (O::SqPoll, &[O::SqRewind, O::ZcRx, O::MixedCqe][..]),
+            (
+                O::ZcRxNodev,
+                &[O::ZcRx, O::ZcRxLargeChunks, O::ZcRxShared][..],
+            ),
+        ] {
+            let mut config = RuntimeConfig::single_thread().with_policy(mode, Policy::Auto);
+            config.linux.zcrx.queues.push(RxQueue {
+                interface_index: 1,
+                queue_index: 0,
+            });
+            let mut config = config.normalized().unwrap();
+            config.apply_linux_defaults();
+            assert_eq!(config.policy(mode), Policy::Auto);
+            for &feature in suppressed {
+                assert!(!config.requested(feature), "{feature}");
+            }
+        }
+    }
+
+    #[cfg(feature = "zc-tx-fixed")]
+    #[test]
+    fn automatic_fixed_zero_copy_keeps_ordinary_fixed_io_disabled() {
+        let mut config = RuntimeConfig::single_thread()
+            .with_policy(O::RegisteredBuffers, Policy::Off)
+            .enable(O::ZcTx)
+            .normalized()
+            .unwrap();
+        config.apply_linux_defaults();
+        assert_eq!(config.policy(O::ZcTxFixed), Policy::Auto);
+        assert_eq!(config.policy(O::RegisteredBuffers), Policy::Off);
+        assert_eq!(config.policy(O::ZcTx), Policy::RequireCapability);
+        let once = config.optimizations.clone();
+        config.apply_linux_defaults();
+        assert_eq!(config.optimizations, once);
+    }
+
+    #[cfg(feature = "zc-rx-shared")]
+    #[test]
+    fn automatic_hardware_receive_requires_usable_queue_topology() {
+        let mut config = RuntimeConfig::single_thread();
+        config.workers = 2;
+        config.linux.zcrx.queues.push(RxQueue {
+            interface_index: 1,
+            queue_index: 0,
+        });
+        let mut disabled = config
+            .clone()
+            .with_policy(O::ZcRxShared, Policy::Off)
+            .normalized()
+            .unwrap();
+        disabled.apply_linux_defaults();
+        assert!(!disabled.requested(O::ZcRx));
+        assert_eq!(disabled.policy(O::ZcRxShared), Policy::Off);
+
+        let mut shared = config.normalized().unwrap();
+        shared.apply_linux_defaults();
+        assert_eq!(shared.policy(O::ZcRx), Policy::Auto);
+        assert_eq!(shared.policy(O::ZcRxShared), Policy::Auto);
+
+        config.linux.zcrx.queues.push(RxQueue {
+            interface_index: 1,
+            queue_index: 1,
+        });
+        let mut independent = config.normalized().unwrap();
+        independent.apply_linux_defaults();
+        assert_eq!(independent.policy(O::ZcRx), Policy::Auto);
+        assert!(!independent.requested(O::ZcRxShared));
+    }
+
+    #[cfg(feature = "zc-rx-large-chunks")]
+    #[test]
+    fn automatic_large_chunks_follow_explicit_size_and_off_policy() {
+        let page = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let mut config = RuntimeConfig::single_thread();
+        config.linux.zcrx.queues.push(RxQueue {
+            interface_index: 1,
+            queue_index: 0,
+        });
+        config.linux.zcrx.chunk_bytes = page;
+        let mut ordinary = config.normalized().unwrap();
+        ordinary.apply_linux_defaults();
+        assert!(!ordinary.requested(O::ZcRxLargeChunks));
+
+        config.linux.zcrx.chunk_bytes = page.checked_mul(2).unwrap();
+        let mut large = config.normalized().unwrap();
+        large.apply_linux_defaults();
+        assert_eq!(large.policy(O::ZcRxLargeChunks), Policy::Auto);
+
+        let mut disabled = config
+            .with_policy(O::ZcRxLargeChunks, Policy::Off)
+            .normalized()
+            .unwrap();
+        disabled.apply_linux_defaults();
+        assert_eq!(disabled.policy(O::ZcRxLargeChunks), Policy::Off);
+    }
+
+    #[cfg(feature = "uring-msg-ring")]
+    #[test]
+    fn automatic_worker_notifications_respect_worker_count_and_off() {
+        let mut config = RuntimeConfig::single_thread();
+        config.apply_linux_defaults();
+        assert!(!config.requested(O::MsgRing));
+        config.workers = 2;
+        config.apply_linux_defaults();
+        assert_eq!(config.policy(O::MsgRing), Policy::Auto);
+
+        let mut disabled = config.with_policy(O::MsgRing, Policy::Off);
+        disabled.apply_linux_defaults();
+        assert_eq!(disabled.policy(O::MsgRing), Policy::Off);
+    }
 }

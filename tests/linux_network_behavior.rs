@@ -2,8 +2,8 @@
 
 use futures_lite::future::{poll_once, zip};
 use rivet::{
-    BufferPool, Runtime, RuntimeConfig, SendBuf, SendPayload, SocketOptions, TcpListener,
-    TcpStream, UdpSocket,
+    BufferPool, Optimization, Policy, Runtime, RuntimeConfig, SendBuf, SendPayload, SocketOptions,
+    TcpListener, TcpStream, UdpSocket,
 };
 use std::{
     future::Future,
@@ -13,6 +13,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+#[path = "support/linux.rs"]
+mod linux;
 
 fn config() -> RuntimeConfig {
     let mut config = RuntimeConfig::single_thread();
@@ -26,6 +29,29 @@ fn config() -> RuntimeConfig {
     config.limits.pool.block_size = 4096;
     config.limits.pool.max_leases = 128;
     config
+}
+
+fn ordinary_receive_config() -> RuntimeConfig {
+    config()
+        .with_policy(Optimization::ProvidedBuffers, Policy::Off)
+        .with_policy(Optimization::RegisteredBuffers, Policy::Off)
+}
+
+#[cfg(feature = "provided-buffers")]
+fn provided_config() -> RuntimeConfig {
+    config()
+        .enable(Optimization::ProvidedBuffers)
+        .with_policy(Optimization::MultishotRecv, Policy::Off)
+        .with_policy(Optimization::IncrementalBuffers, Policy::Off)
+        .with_policy(Optimization::BufferBundles, Policy::Off)
+}
+
+#[cfg(feature = "multishot-recv")]
+fn multishot_config() -> RuntimeConfig {
+    config()
+        .enable(Optimization::MultishotRecv)
+        .with_policy(Optimization::IncrementalBuffers, Policy::Off)
+        .with_policy(Optimization::BufferBundles, Policy::Off)
 }
 
 fn filled(pool: &BufferPool, bytes: &[u8]) -> SendBuf {
@@ -99,35 +125,202 @@ fn tiny_submission_queues_progress_past_background_udp_receives() {
     }
 }
 
+#[test]
+fn ordinary_tcp_vectors_preserve_short_write_suffix_and_bytes() {
+    let config = config()
+        .with_policy(Optimization::ZcTx, Policy::Off)
+        .with_policy(Optimization::BufferBundles, Policy::Off)
+        .with_policy(Optimization::RegisteredBuffers, Policy::Off);
+    let mut runtime = linux::runtime(config).unwrap();
+    let pool = runtime.buffer_pool();
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        runtime.block_on(deadline(async {
+            let options = SocketOptions {
+                send_buffer_bytes: Some(4096),
+                receive_buffer_bytes: Some(32 * 1024),
+                ..SocketOptions::default()
+            };
+            let listener =
+                TcpListener::bind_with_options(address.parse().unwrap(), options.clone()).unwrap();
+            let (sender, receiver) = zip(
+                TcpStream::connect_with_options(listener.local_addr(), options),
+                listener.accept(),
+            )
+            .await;
+            let (sender, receiver) = (sender.unwrap(), receiver.unwrap());
+            let expected: Vec<_> = (0..256 * 1024)
+                .map(|index| (index * 17 + index / 239) as u8)
+                .collect();
+            let data = filled(&pool, &expected);
+            let payload = SendPayload::Vectored(vec![
+                data.slice(0..0),
+                data.slice(0..13),
+                data.slice(13..128 * 1024),
+                data.slice(128 * 1024..128 * 1024),
+                data.slice(128 * 1024..data.len()),
+                data.slice(data.len()..data.len()),
+            ]);
+            // Neither peer nor backend has started receiving: the bounded
+            // native send/receive queues cannot accept this complete payload.
+            let outcome = sender.send(payload).await;
+            let accepted = outcome.result.unwrap();
+            assert!(accepted > 0 && accepted < expected.len(), "{accepted}");
+            let returned: Vec<_> = outcome
+                .data
+                .segments()
+                .iter()
+                .flat_map(|segment| segment.as_slice().iter().copied())
+                .collect();
+            assert_eq!(returned, expected);
+            let remaining = outcome.data.remaining(accepted);
+            let suffix: Vec<_> = remaining
+                .segments()
+                .iter()
+                .flat_map(|segment| segment.as_slice().iter().copied())
+                .collect();
+            assert_eq!(suffix, expected[accepted..]);
+            let send = async {
+                let outcome = sender.send_all(remaining).await;
+                assert_eq!(outcome.result.unwrap(), expected.len() - accepted);
+                assert!(outcome.data.is_empty());
+                sender.shutdown(Shutdown::Write).unwrap();
+            };
+            let receive = async {
+                let mut bytes = Vec::new();
+                while let Some(block) = receiver.recv().await.unwrap() {
+                    bytes.extend_from_slice(block.as_slice());
+                }
+                bytes
+            };
+            let (_, received) = zip(send, receive).await;
+            assert_eq!(received, expected);
+            assert_eq!(data.as_slice(), expected);
+        }));
+    }
+}
+
+#[cfg(all(feature = "incremental-buffers", feature = "multishot-recv"))]
+#[test]
+fn incremental_tcp_storage_cannot_truncate_udp_at_buffer_tails() {
+    let mut config = config()
+        .enable(Optimization::IncrementalBuffers)
+        .enable(Optimization::MultishotRecv);
+    config.limits.max_pending_receives = 128;
+    config.limits.completion_budget = 64;
+    let Some(mut runtime) = linux::runtime(config) else {
+        return;
+    };
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        for receive_chunk in [256, 1400] {
+            runtime.block_on(deadline(async {
+                let address: SocketAddr = address.parse().unwrap();
+                let mut options = SocketOptions::udp();
+                options.receive_chunk = receive_chunk;
+                let receiver = UdpSocket::bind_with_options(address, options).unwrap();
+                let sender = std::net::UdpSocket::bind(address).unwrap();
+                let peer = sender.local_addr().unwrap();
+                let mut expected = vec![0xd3; receive_chunk];
+                expected[..4].copy_from_slice(&0u32.to_le_bytes());
+                let first_bytes = expected.clone();
+                let mut retained = None;
+                // Exercise several buffer boundaries, not only the first
+                // datagram fitting in a fresh incremental buffer.
+                for sequence in 0..256u32 {
+                    expected[..4].copy_from_slice(&sequence.to_le_bytes());
+                    assert_eq!(
+                        sender.send_to(&expected, receiver.local_addr()).unwrap(),
+                        expected.len()
+                    );
+                    let packet = receiver.recv().await.unwrap();
+                    assert!(
+                        !packet.truncated,
+                        "datagram {sequence} below receive_chunk={receive_chunk} was truncated"
+                    );
+                    assert_eq!(packet.original_len, Some(expected.len()));
+                    assert_eq!(packet.peer, Some(peer));
+                    assert_eq!(packet.data.as_slice(), expected);
+                    if sequence == 0 {
+                        retained = Some(packet.data.clone());
+                    }
+                }
+                assert_eq!(retained.unwrap().as_slice(), first_bytes);
+            }));
+        }
+    }
+}
+
+#[cfg(feature = "incremental-buffers")]
+#[test]
+fn incremental_resource_pressure_keeps_ordinary_provided_receive_available() {
+    let mut config = config();
+    for &optimization in Optimization::ALL {
+        config.optimizations.insert(optimization, Policy::Off);
+    }
+    config.limits.pool.bytes = 70 * 1024;
+    let config = config
+        .enable(Optimization::ProvidedBuffers)
+        .with_policy(Optimization::IncrementalBuffers, Policy::Auto);
+    let mut runtime = Runtime::new(config).unwrap();
+    assert!(
+        runtime
+            .capabilities()
+            .iter()
+            .all(|report| report.enabled(Optimization::ProvidedBuffers)
+                && !report.enabled(Optimization::IncrementalBuffers))
+    );
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        runtime.block_on(deadline(async {
+            let address: SocketAddr = address.parse().unwrap();
+            let mut options = SocketOptions::udp();
+            options.receive_chunk = 1400;
+            let receiver = UdpSocket::bind_with_options(address, options).unwrap();
+            let sender = std::net::UdpSocket::bind(address).unwrap();
+            let expected = [0x6b; 1400];
+            assert_eq!(
+                sender.send_to(&expected, receiver.local_addr()).unwrap(),
+                expected.len()
+            );
+            let packet = receiver.recv().await.unwrap();
+            assert_eq!(packet.data.as_slice(), expected);
+            assert_eq!(packet.peer, Some(sender.local_addr().unwrap()));
+            assert_eq!(packet.original_len, Some(expected.len()));
+            assert!(!packet.truncated);
+        }));
+    }
+}
+
 #[cfg(feature = "registered-wait")]
 #[test]
 fn registered_wait_preserves_timeouts_and_network_progress() {
     use rivet::Optimization::*;
+    let baseline = config()
+        .enable(RegisteredWait)
+        .with_policy(RegisteredRing, Policy::Off)
+        .with_policy(RegisteredBuffers, Policy::Off)
+        .with_policy(DirectDescriptors, Policy::Off)
+        .with_policy(SqRewind, Policy::Off)
+        .with_policy(MixedCqe, Policy::Off);
     let configurations = [
-        config().enable(RegisteredWait),
+        baseline.clone(),
         #[cfg(all(
             feature = "registered-ring",
             feature = "registered-buffers",
             feature = "direct-descriptors"
         ))]
-        config()
-            .enable(RegisteredWait)
+        baseline
+            .clone()
             .enable(RegisteredRing)
             .enable(RegisteredBuffers)
             .enable(DirectDescriptors),
         #[cfg(all(feature = "sq-rewind", feature = "mixed-cqe"))]
-        config()
-            .enable(RegisteredWait)
-            .enable(SqRewind)
-            .enable(MixedCqe),
+        baseline.clone().enable(SqRewind).enable(MixedCqe),
         #[cfg(all(feature = "uring-sqpoll", feature = "registered-ring"))]
-        config()
-            .enable(RegisteredWait)
-            .enable(SqPoll)
-            .enable(RegisteredRing),
+        baseline.clone().enable(SqPoll).enable(RegisteredRing),
     ];
     for config in configurations {
-        let mut runtime = Runtime::new(config).unwrap();
+        let Some(mut runtime) = linux::runtime(config) else {
+            continue;
+        };
         for address in ["127.0.0.1:0", "[::1]:0"] {
             runtime.block_on(deadline(async {
                 let address = address.parse().unwrap();
@@ -155,38 +348,49 @@ fn registered_wait_preserves_timeouts_and_network_progress() {
 #[cfg(feature = "multishot-recv")]
 #[test]
 fn provided_multishot_tcp_eof_preserves_payload_and_reverse_direction() {
-    use rivet::Optimization::*;
     let configurations = [
-        config().enable(MultishotRecv),
+        multishot_config(),
         #[cfg(feature = "incremental-buffers")]
-        config().enable(MultishotRecv).enable(IncrementalBuffers),
+        multishot_config().enable(Optimization::IncrementalBuffers),
         #[cfg(all(feature = "incremental-buffers", feature = "buffer-bundles"))]
-        config()
-            .enable(MultishotRecv)
-            .enable(IncrementalBuffers)
-            .enable(BufferBundles),
+        multishot_config()
+            .enable(Optimization::IncrementalBuffers)
+            .enable(Optimization::BufferBundles),
     ];
     for config in configurations {
-        let mut runtime = Runtime::new(config).unwrap();
+        let Some(mut runtime) = linux::runtime(config) else {
+            continue;
+        };
         let pool = runtime.buffer_pool();
         for address in ["127.0.0.1:0", "[::1]:0"] {
             runtime.block_on(deadline(async {
                 let (sender, receiver) = pair(address.parse().unwrap()).await;
-                let request = b"request before half-close";
+                let request: Vec<_> = (0..64 * 1024)
+                    .map(|index| (index * 31 + index / 251) as u8)
+                    .collect();
+                let mut cancelled = receiver.recv();
+                assert!(poll_once(&mut cancelled).await.is_none());
                 assert_eq!(
                     sender
-                        .send_all(SendPayload::Single(filled(&pool, request)))
+                        .send_all(SendPayload::Single(filled(&pool, &request)))
                         .await
                         .result
                         .unwrap(),
                     request.len()
                 );
                 sender.shutdown(Shutdown::Write).unwrap();
-                let mut received = Vec::new();
+                // One publication credit forces pause/cancel/rearm while a
+                // multishot can still produce late completions.
+                rivet::time::sleep(Duration::from_millis(2)).await.unwrap();
+                drop(cancelled);
+                let retained = receiver.recv().await.unwrap().unwrap();
+                assert_eq!(retained.as_slice(), &request[..retained.len()]);
+                let mut received = retained.as_slice().to_vec();
                 while let Some(data) = receiver.recv().await.unwrap() {
                     received.extend_from_slice(data.as_slice());
                 }
                 assert_eq!(received, request);
+                assert_eq!(retained.as_slice(), &request[..retained.len()]);
                 let reply = b"reply after multishot EOF";
                 assert_eq!(
                     receiver
@@ -207,11 +411,48 @@ fn provided_multishot_tcp_eof_preserves_payload_and_reverse_direction() {
     }
 }
 
+#[cfg(feature = "zc-tx-fixed")]
+#[test]
+fn private_zc_registration_does_not_enable_ordinary_fixed_send_or_receive() {
+    let mut config = ordinary_receive_config()
+        .enable(Optimization::ZcTxFixed)
+        .with_policy(Optimization::BufferBundles, Policy::Off);
+    config.linux.zc_send_threshold = 128 * 1024;
+    let mut runtime = linux::runtime(config).unwrap();
+    let pool = runtime.buffer_pool();
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        runtime.block_on(deadline(async {
+            let (sender, receiver) = pair(address.parse().unwrap()).await;
+            for (writer, reader, expected) in [
+                (
+                    &sender,
+                    &receiver,
+                    &b"ordinary request with private registration"[..],
+                ),
+                (&receiver, &sender, &b"ordinary reply after write EOF"[..]),
+            ] {
+                let outcome = writer
+                    .send(SendPayload::Single(filled(&pool, expected)))
+                    .await;
+                assert_eq!(outcome.result.unwrap(), expected.len());
+                assert_eq!(outcome.data.segments()[0].as_slice(), expected);
+                writer.shutdown(Shutdown::Write).unwrap();
+                let mut received = Vec::new();
+                while let Some(block) = reader.recv().await.unwrap() {
+                    received.extend_from_slice(block.as_slice());
+                }
+                assert_eq!(received, expected);
+            }
+        }));
+    }
+}
+
 #[cfg(all(feature = "zc-tx-fixed", feature = "zc-tx-vectored"))]
 fn fixed_zc_config() -> RuntimeConfig {
     let mut config = config()
         .enable(rivet::Optimization::ZcTxFixed)
-        .enable(rivet::Optimization::ZcTxVectored);
+        .enable(rivet::Optimization::ZcTxVectored)
+        .with_policy(Optimization::RegisteredBuffers, Policy::Off);
     config.linux.zc_send_threshold = 0;
     config
 }
@@ -219,7 +460,9 @@ fn fixed_zc_config() -> RuntimeConfig {
 #[cfg(all(feature = "zc-tx-fixed", feature = "zc-tx-vectored"))]
 #[test]
 fn fixed_zero_copy_tcp_vectors_ignore_empty_segments_without_losing_bytes() {
-    let mut runtime = Runtime::new(fixed_zc_config()).unwrap();
+    let Some(mut runtime) = linux::runtime(fixed_zc_config()) else {
+        return;
+    };
     let pool = runtime.buffer_pool();
     for address in ["127.0.0.1:0", "[::1]:0"] {
         runtime.block_on(deadline(async {
@@ -282,7 +525,9 @@ fn fixed_zero_copy_tcp_vectors_ignore_empty_segments_without_losing_bytes() {
 #[cfg(all(feature = "zc-tx-fixed", feature = "zc-tx-vectored"))]
 #[test]
 fn fixed_zero_copy_udp_vectors_keep_empty_datagrams_and_peer_addresses() {
-    let mut runtime = Runtime::new(fixed_zc_config()).unwrap();
+    let Some(mut runtime) = linux::runtime(fixed_zc_config()) else {
+        return;
+    };
     let pool = runtime.buffer_pool();
     for address in ["127.0.0.1:0", "[::1]:0"] {
         runtime.block_on(deadline(async {
@@ -332,7 +577,9 @@ fn fixed_zero_copy_udp_vectors_keep_empty_datagrams_and_peer_addresses() {
 }
 
 fn exercise_udp_metadata(config: RuntimeConfig, receive_chunk: usize) {
-    let mut runtime = Runtime::new(config).unwrap();
+    let Some(mut runtime) = linux::runtime(config) else {
+        return;
+    };
     for address in ["127.0.0.1:0", "[::1]:0"] {
         runtime.block_on(deadline(async {
             let address: SocketAddr = address.parse().unwrap();
@@ -390,51 +637,51 @@ fn exercise_udp_metadata(config: RuntimeConfig, receive_chunk: usize) {
 
 #[test]
 fn recvmsg_metadata_survives_other_operations_and_credit_pauses() {
-    exercise_udp_metadata(config(), 4);
+    exercise_udp_metadata(ordinary_receive_config(), 4);
 }
 
 #[cfg(feature = "provided-buffers")]
 #[test]
 fn single_shot_provided_recvmsg_retains_its_output_until_publication() {
-    exercise_udp_metadata(config().enable(rivet::Optimization::ProvidedBuffers), 4);
+    exercise_udp_metadata(provided_config(), 4);
 }
 
 #[cfg(feature = "uring-sqpoll")]
 #[test]
 fn sqpoll_recvmsg_metadata_is_not_aliased_by_owner_bookkeeping() {
-    exercise_udp_metadata(config().enable(rivet::Optimization::SqPoll), 4);
+    exercise_udp_metadata(ordinary_receive_config().enable(Optimization::SqPoll), 4);
 }
 
-#[cfg(all(
-    feature = "provided-buffers",
-    feature = "multishot-recv",
-    feature = "incremental-buffers",
-    feature = "direct-descriptors"
-))]
+#[cfg(feature = "multishot-recv")]
 #[test]
 fn provided_multishot_datagram_metadata_survives_deferred_completions() {
-    exercise_udp_metadata(
-        config()
-            .enable(rivet::Optimization::MultishotRecv)
-            .enable(rivet::Optimization::IncrementalBuffers)
-            .enable(rivet::Optimization::DirectDescriptors),
-        4,
-    );
+    let configurations = [
+        multishot_config(),
+        #[cfg(all(feature = "incremental-buffers", feature = "direct-descriptors"))]
+        multishot_config()
+            .enable(Optimization::IncrementalBuffers)
+            .enable(Optimization::DirectDescriptors),
+    ];
+    for config in configurations {
+        exercise_udp_metadata(config, 4);
+    }
 }
 
 #[test]
 fn imported_udp_gro_keeps_datagram_boundaries_with_off_policy() {
     let configurations = [
-        config(),
+        ordinary_receive_config(),
         #[cfg(feature = "provided-buffers")]
-        config().enable(rivet::Optimization::ProvidedBuffers),
+        provided_config(),
         #[cfg(feature = "multishot-recv")]
-        config().enable(rivet::Optimization::MultishotRecv),
+        multishot_config(),
     ];
     for config in configurations {
-        let mut runtime =
-            Runtime::new(config.with_policy(rivet::Optimization::UdpGro, rivet::Policy::Off))
-                .unwrap();
+        let Some(mut runtime) =
+            linux::runtime(config.with_policy(Optimization::UdpGro, Policy::Off))
+        else {
+            continue;
+        };
         for address in ["127.0.0.1:0", "[::1]:0"] {
             let receiver = std::net::UdpSocket::bind(address).unwrap();
             let sender = std::net::UdpSocket::bind(address).unwrap();
@@ -592,12 +839,16 @@ fn positive_linger_import_rejection_preserves_socket_and_blocking_mode() {
 #[test]
 fn tcp_creation_rejects_hook_configured_positive_linger() {
     let configurations = [
-        config(),
+        config()
+            .with_policy(Optimization::FixedFiles, Policy::Off)
+            .with_policy(Optimization::DirectDescriptors, Policy::Off),
         #[cfg(feature = "direct-descriptors")]
         config().enable(rivet::Optimization::DirectDescriptors),
     ];
     for config in configurations {
-        let mut runtime = Runtime::new(config).unwrap();
+        let Some(mut runtime) = linux::runtime(config) else {
+            continue;
+        };
         runtime.block_on(deadline(async {
             let options = SocketOptions {
                 hook: Some(Arc::new(|socket: rivet::socket::BorrowedSocket<'_>| {

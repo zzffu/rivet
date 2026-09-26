@@ -32,12 +32,14 @@ fn required_child_strengthens_an_automatic_dependency() {
     let config = RuntimeConfig::single_thread()
         .enable(O::ZcTxFixed)
         .with_policy(O::ZcTx, Policy::Auto)
+        .with_policy(O::RegisteredBuffers, Policy::Off)
         .normalized()
         .unwrap();
     assert_eq!(config.policy(O::ZcTx), Policy::RequireCapability);
+    assert_eq!(config.policy(O::RegisteredBuffers), Policy::Off);
     assert_eq!(
-        config.policy(O::RegisteredBuffers),
-        Policy::RequireCapability
+        config.normalized().unwrap().optimizations,
+        config.optimizations
     );
 }
 
@@ -60,27 +62,49 @@ fn incompatible_ring_requests_are_rejected_before_backend_creation() {
 }
 
 #[test]
-fn kernel_release_guard_handles_vendor_versions_and_rejects_rc() {
-    let minimum = KernelVersion::parse("7.2.7-vendor.3").unwrap();
-    assert_eq!(minimum, KernelVersion::MINIMUM_LINUX);
-    minimum.require_supported().unwrap();
-    assert_eq!(KernelVersion::parse("7.2.7+").unwrap(), minimum);
-    assert_eq!(
-        KernelVersion::parse("7.2.6")
-            .unwrap()
-            .require_supported()
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::Unsupported
-    );
-    assert_eq!(
-        KernelVersion::parse("7.3-rc4").unwrap_err().kind(),
-        io::ErrorKind::Unsupported
-    );
-    assert_eq!(
-        KernelVersion::parse("not-a-release").unwrap_err().kind(),
-        io::ErrorKind::InvalidData
-    );
+fn kernel_release_parser_preserves_numeric_vendor_and_rc_versions() {
+    for (release, expected) in [
+        ("6.6.87-vendor.3", (6, 6, 87)),
+        ("6.12.34+", (6, 12, 34)),
+        ("6.18-rc1", (6, 18, 0)),
+        ("6.18.0-rc4-custom", (6, 18, 0)),
+        ("6.12", (6, 12, 0)),
+        ("6.6-vendor", (6, 6, 0)),
+    ] {
+        assert_eq!(
+            KernelVersion::parse(release).unwrap(),
+            KernelVersion {
+                major: expected.0,
+                minor: expected.1,
+                patch: expected.2,
+            },
+            "{release}"
+        );
+    }
+}
+
+#[test]
+fn malformed_kernel_components_are_not_replaced_with_zero() {
+    for release in [
+        "",
+        "not-a-release",
+        "6",
+        "6-rc1",
+        "6..1",
+        "6.18.",
+        "6.18.invalid",
+        "6.invalid.1",
+        "-6.18.0",
+        "65536.18.0",
+        "6.65536.0",
+        "6.18.65536",
+    ] {
+        assert_eq!(
+            KernelVersion::parse(release).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "{release}"
+        );
+    }
 }
 
 #[test]
@@ -182,4 +206,27 @@ fn strict_uncompiled_selection_has_structured_failure_identity() {
         .downcast_ref::<rivet::capability::CapabilityError>()
         .unwrap();
     assert_eq!(detail.optimization, O::ZcTx);
+}
+
+#[cfg(not(all(target_os = "linux", feature = "zc-tx-fixed")))]
+#[test]
+fn strict_uncompiled_child_reports_the_explicit_request_not_its_dependency() {
+    let error = RuntimeConfig::single_thread()
+        .enable(O::ZcTxFixed)
+        .normalized()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    let detail = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<rivet::capability::CapabilityError>()
+        .unwrap();
+    assert_eq!(detail.optimization, O::ZcTxFixed);
+
+    let conflict = RuntimeConfig::single_thread()
+        .enable(O::ZcTxFixed)
+        .with_policy(O::ZcTx, Policy::Off)
+        .normalized()
+        .unwrap_err();
+    assert_eq!(conflict.kind(), io::ErrorKind::InvalidInput);
 }

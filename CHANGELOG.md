@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0
+
+- 先更新系统架构与实现契约，再将 Linux 改为 6.18 LTS 主验证线及 6.6／6.12 兼容目标。删除全局版本／RC 准入门禁，以及 `KernelVersion::MINIMUM_LINUX`、`require_supported`；保留可解析的版本元数据，无法识别版本时保守选择能力，不伪造兼容证据、不回退到 epoll。
+- 默认 Cargo 集合改为 `linux-full`，不包含 NODEV。Linux 未指定项继承合法、均衡、空闲可休眠的自动优化方案；显式 Off、Auto、RequireCapability 和结构化失败身份保留。默认不启用 SQPOLL／NAPI 忙轮询，硬件 RX 仍需要预配置队列；Windows／Android 运行时默认策略不变。
+- `default-features = false` 保留完整基础网络功能。旧内核普通多段发送使用稳定消息／iovec 存储上的 SENDMSG，旧版 multishot 接收使用合法长度；不增加 payload 拼接、逐操作分配或业务请求试错重发。
+- 将 fixed ZC 的内部注册资源与普通 fixed SEND/RECV 优化分离，后者不可用或显式关闭不再阻止前者。分别选择旧内核 scalar fixed、非 fixed SENDMSG_ZC 向量、已确认的 fixed message vectors 和较新 fixed SEND_VECTORIZED 组合，保留同注册区域及真实内存释放约束。
+- 可选路径按实际 modifier／注册／修复条件判定，能力报告保留原始 Auto／严格请求和失败原因。ZCRX 初始化失败后的 ring 重建不重新推导默认项，不重新激活已失败依赖或更改显式选择。
+- 修复自动组合暴露的 UDP 增量尾部截断：合法数据报也可能因共享缓冲区只剩短尾部而被截断，继而使混合负载等待丢失数据。TCP 增量 ring 与 UDP 普通 ring 现在分摊原有 payload slab，保留全局租约／回收所有权；小预算 Auto 回到单组普通接收，不关闭整个优化集合、不吞截断错误或重发数据报。增加跨缓冲区边界、保留租约及小预算回退回归。
+- 迁移配置和网络回归，明确隔离 ordinary／fixed／direct 路径；覆盖向量短写后缀、多段 multishot 背压与取消、普通收发和私有 ZC 注册共存。示例新增 `--disable NAME`，并显示未启用能力的原因。
+- 验证工具增加签名固定的 6.6／6.12／6.18 guest，原样保留 7.2.7 制品身份；`--kernel` 选择隔离状态，`run-suite` 在一次启动内逐项校验并执行多个静态 ELF。工具不构建内核、不更改宿主内核／网络／安全设置，不以 loopback 或 NODEV 冒充物理 NIC 证据。
+- 迁移：从 Runtime 能力报告读取生效结果，不把配置请求查询当作内核决策；要保留全关闭行为，逐项显式设置 Off，或关闭默认编译集合。普通 fixed 收发和 fixed ZC 需分别关闭。公开配置／结果结构、枚举和原生 trait 形状不变，默认行为和旧门禁入口的有意变更以次版本升级交付。
+- 本轮原生验证：隔离 x86_64 TCG guest 的 6.6.72／6.12.75／6.18.54 默认与精简构建测试及四个实际示例通过，覆盖 IPv4／IPv6；7.2.7 全 feature／精简构建及 NODEV shared／fixed-vectored 独立组合通过。UDP 尾部回归在修复前失败于第 125 个合法数据报，修复后与原混合负载通过；低版本不可用的高级路径明确记录严格失败／Auto 停用及跳过，不冒充执行成功。
+- Windows IPv4 全 feature／all-targets 测试及三个实际示例、36 组 Linux feature 编译组合、Linux 全 feature／精简及 Windows 严格 Clippy、严格 rustdoc、格式检查通过。Linux ARM64、Windows GNU、Android 双架构和独立 Android 包编译检查通过；未新增这些目标的原生证据或物理 NIC 验证。完整索引见 `artifacts/linux-auto/verification-summary.json`，保留实际限制及修复前／后原始报告。
+
 ## 0.1.0
 
 - 移除 Windows 11／Server 2022 的显式版本门禁，删除 `require_supported_windows`、`VersionInfo`、`RtlGetVersion` 声明及废弃导入，不替换为另一个版本号检查。启动仍要求真实 Winsock 2.2、registered-I/O socket、完整 RIO 扩展表及相关原生能力，缺失时保持可观察错误，不静默回退。

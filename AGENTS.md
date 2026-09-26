@@ -10,13 +10,13 @@ Rivet is a native Rust `Future` runtime for OS TCP/UDP, bounded blocking work, n
 - Network futures in `src/net/mod.rs` register bounded operations in `src/runtime/io.rs`. The compile-time-selected driver executes native I/O and emits semantic `Event`s; the worker updates queues, wakes futures, returns credits, and recycles leases. Native completion records stay behind the driver interface.
 - `Runtime`, sockets, and ordinary buffer leases are worker-local and `!Send`. `Handle::spawn` transfers a `Send` **factory**, which constructs a potentially `!Send` future on its selected worker. `spawn_local` stays local. `TcpListener::serve_until` can transfer a newly accepted socket before data I/O, then supervise its handler; active sockets/futures do not migrate.
 
-| Platform | Minimum supported OS (inclusive) | Native implementation |
+| Platform | Platform baseline and validation targets | Native implementation |
 | --- | --- | --- |
-| Linux x86_64/aarch64 | Stable Linux 7.2.7 and later; RC kernels excluded | io_uring; no silent epoll fallback |
+| Linux x86_64/aarch64 | 6.18 LTS primary validation line; 6.6/6.12 compatibility targets; no global version/RC gate | io_uring; no silent epoll fallback |
 | Windows x86_64 | Windows 10 / Server 2016 and later (Rust target baseline; no extra OS-version gate) | RIO data path with IOCP, AcceptEx, and ConnectEx |
 | Android ARM64; x86_64 verification target | API 23 and later | Ordinary-app epoll/nonblocking sockets; no io_uring probing |
 
-These are minimum supported versions, not exact-version pins or claims that every release has been natively tested. Required native facilities must be available; optional optimizations still depend on compiled features, policy, and capability checks. Public Rust `Future` compatibility alone does not establish OS support.
+Platform baselines, reference UAPI, pinned verification guests and actual native evidence are different facts. Linux starts from required native capabilities and uses version/fix evidence only for individual optimizations; unknown/RC releases do not trigger a global rejection or imply support for arbitrary old kernels. Windows/Android retain their platform baselines. Public Rust `Future` compatibility alone does not establish OS support.
 
 ## Key Directories
 
@@ -47,11 +47,11 @@ Run from the repository root on a supported host:
 | Public documentation | `cargo doc --no-deps --all-features` |
 | IPv4-only native smoke | `cargo run --example native_traits` |
 
-Other real scenarios: `cargo run --example loopback`, `cargo run --example runtime_services`, and `cargo run --release --example mixed_load`. Examples share `-- --workers N`, `--enable NAME` (strict), and `--auto NAME`; default to two workers. For example, on suitable Linux: `cargo run --release --all-features --example loopback -- --enable zc-tx-fixed`.
+Other real scenarios: `cargo run --example loopback`, `cargo run --example runtime_services`, and `cargo run --release --example mixed_load`. Examples share `-- --workers N`, `--enable NAME` (strict), `--auto NAME`, and `--disable NAME`; default to two workers. For example, on suitable Linux: `cargo run --release --all-features --example loopback -- --enable zc-tx-fixed`.
 
 Platform harnesses require separate setup:
 
-- Linux/WSL Debian 13 x86_64: `python3 tools/verification/linux_vm.py prepare`, then `python3 tools/verification/linux_vm.py run --accel tcg /path/to/static-elf`. Requires Python 3, curl, dpkg-deb, and sqv. Supply an already-built static x86_64 Linux ELF; the runner does not build it. KVM is the default; TCG must be explicit. Global `--state` precedes the subcommand.
+- Linux/WSL Debian 13 x86_64: `python3 tools/verification/linux_vm.py --kernel 6.18 prepare`, then `python3 tools/verification/linux_vm.py --kernel 6.18 run --accel tcg /path/to/static-elf`. Kernel selectors also include 6.6, 6.12 and retained 7.2.7. Requires Python 3, curl, dpkg-deb and sqv. Supply already-built static x86_64 Linux ELFs; `run-suite` accepts JSON `{name, executable, args}` cases, not host mounts or scripts. The runner does not build code. KVM is the default; TCG must be explicit. Global `--state` and `--kernel` precede the subcommand.
 - Windows Android packaging: `./android-smoke/build.ps1 -Abi x86_64` or `-Abi arm64-v8a`. Requires the matching Rust target, JDK, SDK, and NDK described in the script; it builds but does not install/run the APK.
 
 ## Code Conventions & Common Patterns
@@ -71,14 +71,14 @@ Platform harnesses require separate setup:
 - `src/buffer.rs`: lease/storage lifetime rules. `src/socket.rs`: native-handle ownership and configuration hooks. `src/time.rs` / `src/sync.rs`: public timing and coordination interfaces.
 - For socket changes, inspect `src/net/mod.rs`, `src/runtime/io.rs`, and the affected driver together. For optimization changes, also inspect `Cargo.toml`, configuration normalization, and backend initialization.
 - Read `docs/architecture.md` and `docs/implementation-contract.md` before changing behavior. Keep `README.md` and `CHANGELOG.md` aligned with public changes, migration instructions, and actually exercised platform evidence.
-- Preserve the documented `0.1.x` public contract: trait implementer obligations, configuration/result construction, enum matching, and the concrete dependency types re-exported by `sync`. Intentional breaks require a minor bump before 1.0, a major bump afterward, and migration notes.
-- `docs/linux-io-uring-compatibility.md` records API-history analysis, not a change to the existing Linux baseline or validation coverage.
+- Preserve the documented `0.2.x` public contract after the Linux automatic-policy cutover: trait implementer obligations, configuration/result construction, enum matching, and concrete dependency types re-exported by `sync`. Intentional breaks require a minor bump before 1.0, a major bump afterward, and migration notes.
+- `docs/linux-io-uring-compatibility.md` archives the earlier 0.1 API-history analysis; current support and selection rules are in the architecture and implementation contract. Do not restore its historical global gate or treat interface introduction dates as native validation.
 
 ## Runtime/Tooling Preferences
 
 - Rust **1.98+**, edition **2024**, Cargo and Cargo-managed lockfiles. No checked-in toolchain pin or custom rustfmt configuration was found; do not invent a JavaScript package-manager workflow.
 - Rust 1.77's ordinary Windows targets covered Windows 7+, including Windows 8; Rust 1.78 raised the client baseline to Windows 10. This Rust 1.98/edition 2024 crate follows the current Windows 10 / Server 2016 target baseline, not the old toolchain's coverage. Windows initialization checks Winsock/RIO facilities directly, with no OS-version/build-number gate; keep native errors observable and do not infer old-OS validation from RIO's introduction date.
-- Default Cargo features are empty. Features compile implementations; runtime policies separately choose `Off`, `Auto`, or `RequireCapability`. `--all-features` does not activate every optimization. `linux-full` excludes `zc-rx-nodev`; explicit `Auto` alone permits capability fallback.
+- Default Cargo features include `linux-full`, excluding `zc-rx-nodev`; `default-features = false` keeps complete base networking. Linux unspecified policies inherit a legal balanced/sleepable automatic plan; explicit Off/Auto/Require overrides remain. Default SQPOLL/NAPI and NODEV are not inferred. Windows/Android runtime defaults stay unchanged. `--all-features` compiles implementations, not a runtime all-on mode. Registered memory resources for fixed ZC are independent of ordinary fixed SEND/RECV capability.
 - `android-smoke/native/` is a separate Cargo package, not a root workspace member. Its Windows PowerShell packaging avoids Gradle and enforces API23 native/APK deployment, v1 signing, and 16KiB alignment. Keep Android startup free of post-23 strong symbol references; use the existing property-based API-level check rather than the external API29 getter. Debug signing is verification-only, not production packaging.
 - Keep linker overrides process-scoped. Do not change host kernels, networking, NIC configuration, or security settings to make verification pass. Keep generated `target/`, `artifacts/`, Android build outputs, and APKs out of source changes.
 

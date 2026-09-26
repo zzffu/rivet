@@ -1,12 +1,14 @@
 //! A native, ownership-based asynchronous TCP/UDP runtime.
 //!
-//! Optional optimizations are compiled with Cargo features and requested through
-//! [`config::RuntimeConfig`]. Explicit requests are strict unless Auto is chosen.
+//! Cargo features compile optional implementations; Linux automatically selects
+//! compatible paths unless [`config::RuntimeConfig`] overrides their policies.
+//! Explicit enable requests are strict unless Auto is chosen. Effective choices
+//! are available through [`Runtime::capabilities`], not configuration queries.
 //!
 //! # Compatibility
 //!
-//! The public interface after the backend report-management cutover is the
-//! compatibility baseline for `0.1.x`. Compatibility includes documented buffer
+//! The automatic Linux policy and kernel-gate removal establish the `0.2.x`
+//! compatibility baseline. Compatibility includes documented buffer
 //! ownership, send progress and cancellation, worker affinity, task Drop/detach,
 //! lazy flush/write shutdown, and timer binding/reset/error behavior, not just
 //! method signatures.
@@ -21,7 +23,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
-compile_error!("rivet supports Linux 7.2.7+, Windows, and Android");
+compile_error!("rivet supports Linux, Windows, and Android");
 
 pub mod buffer;
 pub mod capability;

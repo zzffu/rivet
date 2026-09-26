@@ -1,8 +1,7 @@
 //! Real TCP/UDP smoke scenario, not a throughput benchmark.
 use futures_lite::future::zip;
 use rivet::{
-    BufferPool, Optimization, Policy, ReadBuf, Runtime, SendPayload, TcpListener, TcpStream,
-    UdpSocket,
+    BufferPool, Optimization, ReadBuf, Runtime, SendPayload, TcpListener, TcpStream, UdpSocket,
 };
 use std::{
     collections::HashSet,
@@ -170,11 +169,7 @@ fn main() -> io::Result<()> {
             "worker={} backend={} kernel={:?} receive_mode={:?}",
             report.worker, report.backend, report.kernel, report.receive_mode
         );
-        for state in report
-            .states()
-            .iter()
-            .filter(|state| state.policy != Policy::Off)
-        {
+        for state in report.states() {
             println!(
                 "  {} policy={:?} compiled={} supported={} enabled={} reason={:?}",
                 state.optimization,

@@ -1,4 +1,4 @@
-//! Owner-thread io_uring networking for stable Linux 7.2.7 and later (excluding RC).
+//! Owner-thread io_uring networking with startup-selected Linux capabilities.
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("the Linux backend supports x86_64 and aarch64 only");
@@ -29,17 +29,10 @@ use self::{
     ring::{Mapping, Ring},
     uapi::*,
 };
-#[cfg(any(
-    feature = "direct-descriptors",
-    feature = "incremental-buffers",
-    feature = "zc-rx",
-    feature = "zc-tx-fixed"
-))]
-use crate::config::Policy;
 use crate::{
     buffer::{BufferPool, SendPayload, WriteBuf},
     capability::{CapabilityReport, KernelVersion, ZcStats},
-    config::{Optimization, RuntimeConfig},
+    config::{Optimization, Policy, RuntimeConfig},
     driver::{Arena, Event, Received, SendOutcome, SocketId, SocketInfo, SocketKind, Token},
     socket::{ImportError, OwnedSocket, SocketOptions},
 };
@@ -358,6 +351,38 @@ struct Pending {
     provided: Option<ProvidedRange>,
 }
 
+#[derive(Clone, Copy)]
+struct KernelFeatures {
+    send_vectored: bool,
+    multishot_recv_cap: bool,
+    #[cfg(feature = "zc-tx-fixed")]
+    fixed_message: bool,
+    #[cfg(all(feature = "zc-tx-fixed", feature = "zc-tx-vectored"))]
+    fixed_vectored: bool,
+    #[cfg(all(feature = "zc-tx", feature = "zc-observe"))]
+    tx_observe: bool,
+}
+
+impl KernelFeatures {
+    fn new(kernel: Option<KernelVersion>) -> Self {
+        Self {
+            // v6.17 net.c adds SEND_VECTORIZED and per-invocation mshot_len.
+            send_vectored: kernel_at_least(kernel, 6, 17, 0),
+            multishot_recv_cap: kernel_at_least(kernel, 6, 17, 0),
+            // v6.6/v6.12 reject fixed SENDMSG_ZC. v6.17/v6.18 import its
+            // registered iovecs, but still import fixed SEND_ZC as a scalar.
+            #[cfg(feature = "zc-tx-fixed")]
+            fixed_message: kernel_at_least(kernel, 6, 17, 0),
+            // Conservatively use the reference implementation's vector importer;
+            // opcode support and the 6.17 vector flag do not prove this pairing.
+            #[cfg(all(feature = "zc-tx-fixed", feature = "zc-tx-vectored"))]
+            fixed_vectored: kernel_at_least(kernel, 7, 2, 7),
+            #[cfg(all(feature = "zc-tx", feature = "zc-observe"))]
+            tx_observe: kernel_at_least(kernel, 6, 2, 0),
+        }
+    }
+}
+
 pub struct Driver {
     // Ring closes before registrations' memory and before the normal pool clone.
     ring: Ring,
@@ -379,6 +404,7 @@ pub struct Driver {
     _shared: Arc<Shared>,
     config: RuntimeConfig,
     report: CapabilityReport,
+    kernel_features: KernelFeatures,
     sockets: Arena<SocketEntry>,
     operations: Box<[Operation]>,
     native_messages: Mapping,
@@ -410,7 +436,38 @@ impl Driver {
         notifier: Arc<Notifier>,
         _shared: Arc<Shared>,
     ) -> io::Result<Self> {
-        let config = config.normalized()?;
+        let mut config = config.normalized()?;
+        let inferred_mixed = !config.optimizations.contains_key(&Optimization::MixedCqe);
+        config.apply_linux_defaults();
+        let mut report = CapabilityReport::new("linux-io_uring", worker);
+        report.kernel = kernel_version();
+        filter_candidates(&mut config, &mut report)?;
+        if inferred_mixed
+            && config.requested(Optimization::MixedCqe)
+            && !config.requested(Optimization::ZcRx)
+            && !config.requested(Optimization::ZcRxNodev)
+        {
+            reject_candidate(
+                &mut config,
+                &mut report,
+                Optimization::MixedCqe,
+                "automatic mixed CQEs require a selected ZCRX path".to_owned(),
+            )?;
+        }
+        Self::initialize(config, report, worker, pool, notifier, _shared)
+    }
+
+    fn initialize(
+        config: RuntimeConfig,
+        mut report: CapabilityReport,
+        _worker: usize,
+        pool: BufferPool,
+        notifier: Arc<Notifier>,
+        _shared: Arc<Shared>,
+    ) -> io::Result<Self> {
+        #[cfg(any(feature = "direct-descriptors", feature = "zc-rx"))]
+        let mut config = config;
+        let kernel_features = KernelFeatures::new(report.kernel);
         let native_bytes = config
             .limits
             .max_operations
@@ -422,17 +479,6 @@ impl Driver {
                 )
             })?;
         let native_messages = Mapping::anonymous(native_bytes)?;
-        let mut uname: libc::utsname = unsafe { mem::zeroed() };
-        if unsafe { libc::uname(&mut uname) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let release = unsafe { CStr::from_ptr(uname.release.as_ptr()) }
-            .to_str()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 Linux release"))?;
-        let kernel = KernelVersion::parse(release)?;
-        kernel.require_supported()?;
-        let mut report = CapabilityReport::new("linux-io_uring", worker);
-        report.kernel = Some(kernel);
         let params = Params {
             flags: IORING_SETUP_CQSIZE
                 | IORING_SETUP_SUBMIT_ALL
@@ -526,6 +572,18 @@ impl Driver {
                     format!("required io_uring opcode {opcode} unavailable"),
                 ));
             }
+        }
+        #[cfg(feature = "direct-descriptors")]
+        if requested(&config, Optimization::DirectDescriptors)
+            && !(supported(&probe, IORING_OP_FIXED_FD_INSTALL)
+                && supported(&probe, IORING_OP_SOCKET))
+        {
+            reject_candidate(
+                &mut config,
+                &mut report,
+                Optimization::DirectDescriptors,
+                "direct descriptors require SOCKET and FIXED_FD_INSTALL".to_owned(),
+            )?;
         }
         #[cfg(feature = "fixed-files")]
         let mut fixed = None;
@@ -654,6 +712,8 @@ impl Driver {
                         )?;
                     }
                 }
+                #[cfg(feature = "incremental-buffers")]
+                Err(error) if ProvidedBuffers::rollback_failed(&error) => return Err(error),
                 #[cfg(feature = "incremental-buffers")]
                 Err(error)
                     if incremental
@@ -815,15 +875,34 @@ impl Driver {
             } else {
                 Optimization::ZcRx
             };
-            match zcrx::Zcrx::new(
-                &ring,
-                &config,
-                worker,
-                #[cfg(feature = "zc-rx-shared")]
-                &_shared.zcrx,
-                #[cfg(feature = "zc-observe")]
-                ZCRX_EVENT,
-            ) {
+            // RX events/stats are newer than TX usage reporting. Do not pass
+            // an unsupported event_desc merely because TX observation is active.
+            let rx_config = if cfg!(feature = "zc-observe")
+                && config.requested(Optimization::ZcObserve)
+                && !kernel_at_least(report.kernel, 7, 2, 0)
+            {
+                let mut selected = config.clone();
+                selected
+                    .optimizations
+                    .insert(Optimization::ZcObserve, Policy::Off);
+                Some(selected)
+            } else {
+                None
+            };
+            let result = if supported(&probe, IORING_OP_RECV_ZC) {
+                zcrx::Zcrx::new(
+                    &ring,
+                    rx_config.as_ref().unwrap_or(&config),
+                    _worker,
+                    #[cfg(feature = "zc-rx-shared")]
+                    &_shared.zcrx,
+                    #[cfg(feature = "zc-observe")]
+                    ZCRX_EVENT,
+                )
+            } else {
+                Err(unsupported("RECV_ZC unavailable"))
+            };
+            match result {
                 Ok(resource) => {
                     resource.set_notifier(&notifier)?;
                     report.receive_mode = resource.mode();
@@ -832,25 +911,32 @@ impl Driver {
                 }
                 Err(error) => {
                     let reason = error.to_string();
-                    report.decide(primary, config.policy(primary), Err(reason.clone()))?;
+                    reject_candidate(&mut config, &mut report, primary, reason.clone())?;
                     if zcrx::requires_ring_close(&error) {
                         // IFQ has no unregister operation. Auto may use ordinary
                         // I/O only on a freshly created ring, never one still
                         // owning the failed NIC registration.
-                        let mut fallback = config.clone();
-                        let disable_observe = !report.enabled(Optimization::ZcTx);
-                        for feature in [
-                            primary,
-                            Optimization::ZcRxLargeChunks,
-                            Optimization::ZcRxShared,
-                        ] {
-                            fallback.optimizations.insert(feature, Policy::Off);
+                        for feature in [Optimization::ZcRxLargeChunks, Optimization::ZcRxShared] {
+                            if config.requested(feature) {
+                                reject_candidate(
+                                    &mut config,
+                                    &mut report,
+                                    feature,
+                                    reason.clone(),
+                                )?;
+                            }
                         }
-                        if disable_observe {
-                            fallback
-                                .optimizations
-                                .insert(Optimization::ZcObserve, Policy::Off);
+                        if config.requested(Optimization::ZcObserve)
+                            && !report.enabled(Optimization::ZcTx)
+                        {
+                            reject_candidate(
+                                &mut config,
+                                &mut report,
+                                Optimization::ZcObserve,
+                                reason,
+                            )?;
                         }
+                        let report = reconstruction_report(&mut config, &report)?;
                         #[cfg(feature = "uring-msg-ring")]
                         notifier.detach();
                         drop(ring);
@@ -860,26 +946,9 @@ impl Driver {
                         drop(provided);
                         #[cfg(feature = "fixed-files")]
                         drop(fixed);
-                        let mut driver = Self::new(&fallback, worker, pool, notifier, _shared)?;
-                        for feature in [
-                            primary,
-                            Optimization::ZcRxLargeChunks,
-                            Optimization::ZcRxShared,
-                        ] {
-                            driver.report.decide(
-                                feature,
-                                config.policy(feature),
-                                Err(reason.clone()),
-                            )?;
-                        }
-                        if disable_observe {
-                            driver.report.decide(
-                                Optimization::ZcObserve,
-                                config.policy(Optimization::ZcObserve),
-                                Err(reason),
-                            )?;
-                        }
-                        return Ok(driver);
+                        // Keep filtered candidates and their original policies;
+                        // neither normalization nor defaults run a second time.
+                        return Self::initialize(config, report, _worker, pool, notifier, _shared);
                     }
                 }
             }
@@ -887,14 +956,17 @@ impl Driver {
         #[cfg(feature = "registered-buffers")]
         let mut registered = None;
         #[cfg(feature = "registered-buffers")]
-        if requested(&config, Optimization::RegisteredBuffers) {
+        if requested(&config, Optimization::RegisteredBuffers)
+            || (requested(&config, Optimization::ZcTxFixed) && report.enabled(Optimization::ZcTx))
+        {
             let regions = pool.regions();
             #[cfg(all(
                 feature = "zc-tx-fixed",
                 any(feature = "provided-buffers", feature = "zc-rx")
             ))]
             let mut regions = regions;
-            let extra = requested(&config, Optimization::ZcTxFixed);
+            let extra =
+                requested(&config, Optimization::ZcTxFixed) && report.enabled(Optimization::ZcTx);
             if extra {
                 #[cfg(all(feature = "zc-tx-fixed", feature = "provided-buffers"))]
                 if let Some(buffers) = &provided {
@@ -908,11 +980,13 @@ impl Driver {
             match RegisteredBuffers::new(&ring, regions) {
                 Ok(resource) => {
                     registered = Some(resource);
-                    report.decide(
-                        Optimization::RegisteredBuffers,
-                        config.policy(Optimization::RegisteredBuffers),
-                        Ok(()),
-                    )?;
+                    if requested(&config, Optimization::RegisteredBuffers) {
+                        report.decide(
+                            Optimization::RegisteredBuffers,
+                            config.policy(Optimization::RegisteredBuffers),
+                            Ok(()),
+                        )?;
+                    }
                 }
                 #[cfg(feature = "zc-tx-fixed")]
                 Err(error) if extra && config.policy(Optimization::ZcTxFixed) == Policy::Auto => {
@@ -921,30 +995,36 @@ impl Driver {
                         Policy::Auto,
                         Err(error.to_string()),
                     )?;
-                    match RegisteredBuffers::new(&ring, pool.regions()) {
-                        Ok(resource) => {
-                            registered = Some(resource);
-                            report.decide(
-                                Optimization::RegisteredBuffers,
-                                config.policy(Optimization::RegisteredBuffers),
-                                Ok(()),
-                            )?;
-                        }
-                        Err(error) => {
-                            report.decide(
-                                Optimization::RegisteredBuffers,
-                                config.policy(Optimization::RegisteredBuffers),
-                                Err(error.to_string()),
-                            )?;
+                    if requested(&config, Optimization::RegisteredBuffers) {
+                        match RegisteredBuffers::new(&ring, pool.regions()) {
+                            Ok(resource) => {
+                                registered = Some(resource);
+                                report.decide(
+                                    Optimization::RegisteredBuffers,
+                                    config.policy(Optimization::RegisteredBuffers),
+                                    Ok(()),
+                                )?;
+                            }
+                            Err(error) => {
+                                report.decide(
+                                    Optimization::RegisteredBuffers,
+                                    config.policy(Optimization::RegisteredBuffers),
+                                    Err(error.to_string()),
+                                )?;
+                            }
                         }
                     }
                 }
                 Err(error) => {
-                    report.decide(
-                        Optimization::RegisteredBuffers,
-                        config.policy(Optimization::RegisteredBuffers),
-                        Err(error.to_string()),
-                    )?;
+                    for feature in [Optimization::ZcTxFixed, Optimization::RegisteredBuffers] {
+                        if requested(&config, feature) {
+                            report.decide(
+                                feature,
+                                config.policy(feature),
+                                Err(error.to_string()),
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -985,7 +1065,11 @@ impl Driver {
         #[cfg(feature = "zc-observe")]
         if requested(&config, Optimization::ZcObserve) {
             let support = match () {
-                _ if report.enabled(Optimization::ZcTx) => Ok(()),
+                _ if report.enabled(Optimization::ZcTx)
+                    && kernel_at_least(report.kernel, 6, 2, 0) =>
+                {
+                    Ok(())
+                }
                 #[cfg(feature = "zc-rx")]
                 _ if zcrx.is_some() => zcrx.as_ref().unwrap().supports(Optimization::ZcObserve),
                 _ => Err("no operational ZC observation source".to_owned()),
@@ -1059,6 +1143,7 @@ impl Driver {
             scratch: Vec::with_capacity(max_operations),
             config,
             report,
+            kernel_features,
             send_bytes: 0,
             stopping: false,
             aborting_sockets: 0,
@@ -1092,6 +1177,139 @@ impl Driver {
         }
         ZcStats::default()
     }
+}
+
+fn kernel_version() -> Option<KernelVersion> {
+    let mut uname: libc::utsname = unsafe { mem::zeroed() };
+    if unsafe { libc::uname(&mut uname) } < 0 {
+        return None;
+    }
+    unsafe { CStr::from_ptr(uname.release.as_ptr()) }
+        .to_str()
+        .ok()
+        .and_then(|release| KernelVersion::parse(release).ok())
+}
+
+fn kernel_at_least(kernel: Option<KernelVersion>, major: u16, minor: u16, patch: u16) -> bool {
+    kernel.is_some_and(|kernel| {
+        kernel
+            >= KernelVersion {
+                major,
+                minor,
+                patch,
+            }
+    })
+}
+
+/// These are path requirements, not Runtime admission checks. Registration and
+/// opcode probes still have to succeed. Unknown versions do not prove modifiers
+/// that have no independent, traffic-free probe.
+fn minimum_kernel(feature: Optimization, config: &RuntimeConfig) -> Option<(u16, u16, u16)> {
+    use Optimization::*;
+    Some(match feature {
+        DirectDescriptors => (6, 8, 0),         // FIXED_FD_INSTALL
+        RegisteredBuffers => (7, 2, 0),         // ordinary SEND/RECV, not registration
+        RegisteredWait | MsgRing => (6, 13, 0), // MEM_REGION / synchronous MSG_RING
+        IncrementalBuffers => (7, 2, 7),        // min_left + MSG_TRUNC consumption fix
+        MultishotAccept => (5, 19, 0),
+        MultishotRecv | ZcTxFixed => (6, 0, 0),
+        BufferBundles => (6, 10, 0), // also requires RECVSEND_BUNDLE
+        MixedCqe => (6, 18, 0),
+        SqRewind => (7, 0, 0),
+        // Current ZCRX uses both CTRL flush (6.19) and rx_buf_len (7.0).
+        ZcRx | ZcRxLargeChunks | ZcRxShared => (7, 0, 0),
+        ZcRxNodev => (7, 1, 0),
+        NapiBusyPoll if config.linux.napi_ids.is_empty() => (6, 9, 0),
+        NapiBusyPoll => (6, 13, 0),
+        _ => return None,
+    })
+}
+
+fn reject_candidate(
+    config: &mut RuntimeConfig,
+    report: &mut CapabilityReport,
+    feature: Optimization,
+    reason: String,
+) -> io::Result<()> {
+    // Record caller/inferred intent before removing an unavailable candidate.
+    report.decide(feature, config.policy(feature), Err(reason))?;
+    config.optimizations.insert(feature, Policy::Off);
+    Ok(())
+}
+
+fn filter_candidates(config: &mut RuntimeConfig, report: &mut CapabilityReport) -> io::Result<()> {
+    for &feature in Optimization::ALL {
+        if !config.requested(feature) {
+            continue;
+        }
+        if !feature.compiled() {
+            reject_candidate(
+                config,
+                report,
+                feature,
+                "implementation is not compiled".to_owned(),
+            )?;
+            continue;
+        }
+        if let Some((major, minor, patch)) = minimum_kernel(feature, config)
+            && !kernel_at_least(report.kernel, major, minor, patch)
+        {
+            reject_candidate(
+                config,
+                report,
+                feature,
+                format!("this path requires verified Linux {major}.{minor}.{patch} semantics"),
+            )?;
+        }
+    }
+    // A filtered child must never expand its dependencies again, including
+    // during whole-ring reconstruction after a partial ZCRX registration.
+    loop {
+        let mut changed = false;
+        for &feature in Optimization::ALL {
+            if config.requested(feature)
+                && let Some(&dependency) = config
+                    .dependencies(feature)
+                    .iter()
+                    .find(|&&dependency| !config.requested(dependency))
+            {
+                reject_candidate(
+                    config,
+                    report,
+                    feature,
+                    format!("selected dependency {dependency} is unavailable"),
+                )?;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(feature = "zc-rx")]
+fn reconstruction_report(
+    config: &mut RuntimeConfig,
+    previous: &CapabilityReport,
+) -> io::Result<CapabilityReport> {
+    let mut report = CapabilityReport::new(previous.backend, previous.worker);
+    report.kernel = previous.kernel;
+    // Resource/setup success belonged to the closed ring and must be reproven.
+    // Failed choices stay filtered, including native Auto dependency failures.
+    for state in previous.states().iter().filter(|state| !state.enabled) {
+        report.decide(
+            state.optimization,
+            state.policy,
+            Err(state
+                .reason
+                .clone()
+                .unwrap_or_else(|| "path unavailable".to_owned())),
+        )?;
+        config.optimizations.insert(state.optimization, Policy::Off);
+    }
+    filter_candidates(config, &mut report)?;
+    Ok(report)
 }
 
 #[cfg(any(
@@ -1490,7 +1708,7 @@ impl Driver {
                         .get(_op.socket.0)
                         .is_some_and(|socket| socket.kind == SocketKind::TcpStream)
                 {
-                    self.provided.as_ref().unwrap().entries()
+                    self.provided.as_ref().unwrap().tcp_entries()
                 } else {
                     expansion
                 };
@@ -1507,7 +1725,7 @@ impl Driver {
                         remaining -= bytes;
                         bid = buffers.next_bid(bid);
                         expansion += 1;
-                        if expansion > buffers.entries() {
+                        if expansion > buffers.tcp_entries() {
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "receive bundle exceeds its registered group",
@@ -1711,13 +1929,13 @@ impl Driver {
             socket.bind(&addr.into())?;
             socket.listen(options.backlog)
         })();
-        if let Err(error) = result {
-            #[cfg(feature = "direct-descriptors")]
-            if let Some(index) = direct {
-                self.fixed.as_mut().unwrap().remove(&self.ring, index)?;
-            }
-            return Err(error);
+        #[cfg(feature = "direct-descriptors")]
+        if result.is_err()
+            && let Some(index) = direct
+        {
+            self.fixed.as_mut().unwrap().remove(&self.ring, index)?;
         }
+        result?;
         self.add_socket(fd, SocketKind::TcpListener, options, direct)
             .map_err(|error| error.error)
     }
@@ -1731,7 +1949,7 @@ impl Driver {
             net::validate_address(peer, true)?;
         }
         let (fd, direct) = self.create(addr, SocketKind::Udp, options)?;
-        let result = (|| {
+        let result: io::Result<()> = (|| {
             let socket = socket2::SockRef::from(&fd);
             socket.bind(&addr.into())?;
             if let Some(peer) = peer {
@@ -1739,13 +1957,13 @@ impl Driver {
             }
             Ok(())
         })();
-        if let Err(error) = result {
-            #[cfg(feature = "direct-descriptors")]
-            if let Some(index) = direct {
-                self.fixed.as_mut().unwrap().remove(&self.ring, index)?;
-            }
-            return Err(error);
+        #[cfg(feature = "direct-descriptors")]
+        if result.is_err()
+            && let Some(index) = direct
+        {
+            self.fixed.as_mut().unwrap().remove(&self.ring, index)?;
         }
+        result?;
         self.add_socket(fd, SocketKind::Udp, options, direct)
             .map_err(|error| error.error)
     }
@@ -2322,7 +2540,7 @@ impl Driver {
                     #[cfg(feature = "provided-buffers")]
                     _ if op.provided => {
                         sqe.flags |= IOSQE_BUFFER_SELECT;
-                        sqe.buf_index = self.provided.as_ref().unwrap().group;
+                        sqe.buf_index = self.provided.as_ref().unwrap().group(udp);
                         #[cfg(feature = "multishot-recv")]
                         if op.multishot {
                             sqe.ioprio |= IORING_RECV_MULTISHOT;
@@ -2342,6 +2560,7 @@ impl Driver {
                             buffer.capacity().min(receive_chunk).min(i32::MAX as usize) as u32;
                         #[cfg(feature = "registered-buffers")]
                         if !udp
+                            && self.report.enabled(Optimization::RegisteredBuffers)
                             && let Some(index) = self
                                 .registered
                                 .as_ref()
@@ -2380,10 +2599,11 @@ impl Driver {
                     sqe.len = 1;
                     sqe.op_flags = libc::MSG_TRUNC as u32;
                 } else if cfg!(feature = "provided-buffers") && op.provided {
-                    // 7.2 multishot cap limits one shot without mistaking a
-                    // logical restart for EOF. Bundles may span provided blocks.
-                    sqe.len = if cfg!(feature = "buffer-bundles")
-                        && self.report.enabled(Optimization::BufferBundles)
+                    // Before 6.17 multishot RECV rejects a nonzero length.
+                    // Bundles span provided blocks and also use the uncapped form.
+                    sqe.len = if (op.multishot && !self.kernel_features.multishot_recv_cap)
+                        || (cfg!(feature = "buffer-bundles")
+                            && self.report.enabled(Optimization::BufferBundles))
                     {
                         0
                     } else {
@@ -2408,6 +2628,10 @@ impl Driver {
                 native.message.msg_iovlen = op.iovecs.len();
                 #[cfg(feature = "zc-tx")]
                 if op.use_zc {
+                    let vectors = data.segments().len() > 1;
+                    let addressed = udp
+                        || native.message.msg_controllen != 0
+                        || native.message.msg_namelen != 0;
                     #[cfg(feature = "zc-tx-fixed")]
                     let regions = self
                         .registered
@@ -2415,6 +2639,7 @@ impl Driver {
                         .map_or(&[][..], |r| r.regions.as_slice());
                     #[cfg(feature = "zc-tx-fixed")]
                     let fixed = self.report.enabled(Optimization::ZcTxFixed)
+                        && (!(addressed || vectors) || self.kernel_features.fixed_message)
                         && self.registered.as_ref().is_some_and(|registered| {
                             let mut segments =
                                 data.segments().iter().filter(|segment| !segment.is_empty());
@@ -2427,17 +2652,22 @@ impl Driver {
                                 registered.index(segment.as_ptr(), segment.len()) == Some(first)
                             })
                         });
+                    let fixed_message = false;
+                    #[cfg(all(feature = "zc-tx-fixed", feature = "zc-tx-vectored"))]
+                    let fixed_message =
+                        fixed_message || (fixed && vectors && !self.kernel_features.fixed_vectored);
                     let options = zc::TxOptions {
                         #[cfg(feature = "zc-tx-fixed")]
                         fixed,
                         #[cfg(feature = "zc-tx-vectored")]
                         vectored: self.report.enabled(Optimization::ZcTxVectored),
                         #[cfg(feature = "zc-observe")]
-                        observe: self.report.enabled(Optimization::ZcObserve),
+                        observe: self.report.enabled(Optimization::ZcObserve)
+                            && self.kernel_features.tx_observe,
                     };
-                    let message = if udp
-                        || native.message.msg_controllen != 0
-                        || native.message.msg_namelen != 0
+                    let message = if addressed
+                        || fixed_message
+                        || (vectors && !self.kernel_features.send_vectored)
                     {
                         Some(&mut native.message)
                     } else {
@@ -2462,7 +2692,11 @@ impl Driver {
                     sqe.buf_index = self.bundles[bundle].group;
                     return Ok(sqe);
                 }
-                if cfg!(feature = "udp-gso") && native.message.msg_controllen != 0 {
+                if native.message.msg_controllen != 0
+                    || (!data.is_empty()
+                        && data.segments().len() > 1
+                        && !self.kernel_features.send_vectored)
+                {
                     sqe.opcode = IORING_OP_SENDMSG;
                     sqe.addr = std::ptr::from_mut(&mut native.message) as u64;
                     sqe.len = 1;
@@ -2482,10 +2716,11 @@ impl Driver {
                         sqe.addr = segment.as_ptr() as u64;
                         sqe.len = segment.len() as u32;
                         #[cfg(feature = "registered-buffers")]
-                        if let Some(index) = self
-                            .registered
-                            .as_ref()
-                            .and_then(|r| r.index(segment.as_ptr(), segment.len()))
+                        if self.report.enabled(Optimization::RegisteredBuffers)
+                            && let Some(index) = self
+                                .registered
+                                .as_ref()
+                                .and_then(|r| r.index(segment.as_ptr(), segment.len()))
                         {
                             sqe.ioprio |= IORING_RECVSEND_FIXED_BUF;
                             sqe.buf_index = index;
@@ -2662,15 +2897,14 @@ impl Driver {
                 Ok(sqe) => {
                     // We reserved capacity before prepare. Nothing between here
                     // and push can consume that owner-thread SQ reservation.
-                    if let Err(error) = self.ring.push(sqe) {
-                        #[cfg(feature = "zc-tx")]
-                        if self.op(key).unwrap().use_zc && kind == Kind::Send {
-                            unsafe {
-                                self.op_mut(key).unwrap().zc.abandon_unsubmitted();
-                            }
+                    let result = self.ring.push(sqe);
+                    #[cfg(feature = "zc-tx")]
+                    if result.is_err() && self.op(key).unwrap().use_zc && kind == Kind::Send {
+                        unsafe {
+                            self.op_mut(key).unwrap().zc.abandon_unsubmitted();
                         }
-                        return Err(error);
                     }
+                    result?;
                     self.mark_submitted(key);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -3377,5 +3611,139 @@ impl Driver {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "registered-buffers"))]
+mod selection_tests {
+    use super::*;
+    use crate::capability::CapabilityError;
+
+    #[test]
+    fn version_rejection_preserves_auto_policy_and_strict_error_identity() {
+        for kernel in [
+            None,
+            Some(KernelVersion {
+                major: 6,
+                minor: 18,
+                patch: 54,
+            }),
+        ] {
+            let mut config = RuntimeConfig::default();
+            config
+                .optimizations
+                .insert(Optimization::RegisteredBuffers, Policy::Auto);
+            let mut report = CapabilityReport::new("linux-io_uring", 0);
+            report.kernel = kernel;
+            filter_candidates(&mut config, &mut report).unwrap();
+            report.finish(&config).unwrap();
+            let state = report.state(Optimization::RegisteredBuffers).unwrap();
+            assert_eq!(state.policy, Policy::Auto);
+            assert!(state.compiled && !state.supported && !state.enabled);
+            assert!(!config.requested(Optimization::RegisteredBuffers));
+            assert_ne!(state.reason.as_deref(), Some("not requested"));
+
+            config
+                .optimizations
+                .insert(Optimization::RegisteredBuffers, Policy::RequireCapability);
+            let error = filter_candidates(&mut config, &mut report).unwrap_err();
+            let capability = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<CapabilityError>()
+                .unwrap();
+            assert_eq!(capability.optimization, Optimization::RegisteredBuffers);
+        }
+    }
+
+    #[cfg(feature = "zc-tx-fixed")]
+    #[test]
+    fn old_kernel_keeps_fixed_zc_when_ordinary_fixed_io_is_unavailable() {
+        let mut config = RuntimeConfig::default();
+        config
+            .optimizations
+            .insert(Optimization::RegisteredBuffers, Policy::Auto);
+        config
+            .optimizations
+            .insert(Optimization::ZcTxFixed, Policy::RequireCapability);
+        let mut config = config.normalized().unwrap();
+        let mut report = CapabilityReport::new("linux-io_uring", 0);
+        report.kernel = Some(KernelVersion {
+            major: 6,
+            minor: 6,
+            patch: 72,
+        });
+        filter_candidates(&mut config, &mut report).unwrap();
+        assert!(!config.requested(Optimization::RegisteredBuffers));
+        assert!(config.requested(Optimization::ZcTxFixed));
+        assert!(config.requested(Optimization::ZcTx));
+        assert_eq!(
+            config.policy(Optimization::ZcTxFixed),
+            Policy::RequireCapability
+        );
+        assert!(!report.enabled(Optimization::ZcTxFixed));
+    }
+
+    #[cfg(all(feature = "zc-rx", feature = "zc-tx-fixed"))]
+    #[test]
+    fn ring_reconstruction_retains_rejections_and_prunes_failed_dependencies() {
+        let mut config = RuntimeConfig::default();
+        for feature in [
+            Optimization::RegisteredBuffers,
+            Optimization::ZcTxFixed,
+            Optimization::ZcRx,
+        ] {
+            config.optimizations.insert(feature, Policy::Auto);
+        }
+        let mut config = config.normalized().unwrap();
+        let mut report = CapabilityReport::new("linux-io_uring", 0);
+        report.kernel = Some(KernelVersion {
+            major: 7,
+            minor: 1,
+            patch: 0,
+        });
+        filter_candidates(&mut config, &mut report).unwrap();
+        let fixed_reason = report
+            .state(Optimization::RegisteredBuffers)
+            .unwrap()
+            .reason
+            .clone();
+        reject_candidate(
+            &mut config,
+            &mut report,
+            Optimization::ZcTx,
+            "no TX opcodes".to_owned(),
+        )
+        .unwrap();
+        reject_candidate(
+            &mut config,
+            &mut report,
+            Optimization::ZcRx,
+            "registered IFQ failed".to_owned(),
+        )
+        .unwrap();
+        let rebuilt = reconstruction_report(&mut config, &report).unwrap();
+        for feature in [
+            Optimization::RegisteredBuffers,
+            Optimization::ZcTx,
+            Optimization::ZcTxFixed,
+            Optimization::ZcRx,
+        ] {
+            assert!(!config.requested(feature));
+            let state = rebuilt.state(feature).unwrap();
+            assert_eq!(state.policy, Policy::Auto);
+            assert!(!state.enabled);
+        }
+        assert_eq!(
+            rebuilt
+                .state(Optimization::RegisteredBuffers)
+                .unwrap()
+                .reason,
+            fixed_reason
+        );
+        assert_eq!(
+            rebuilt.state(Optimization::ZcRx).unwrap().reason.as_deref(),
+            Some("registered IFQ failed"),
+        );
     }
 }

@@ -3,6 +3,7 @@
 use crate::config::{Optimization, Policy, RuntimeConfig};
 use std::{fmt, io};
 
+/// Numeric kernel release evidence, not a runtime admission requirement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct KernelVersion {
     pub major: u16,
@@ -11,42 +12,30 @@ pub struct KernelVersion {
 }
 
 impl KernelVersion {
-    pub const MINIMUM_LINUX: Self = Self {
-        major: 7,
-        minor: 2,
-        patch: 7,
-    };
-
+    /// Parse the numeric release prefix, including vendor and RC releases.
+    ///
+    /// An omitted patch component is zero. Malformed or out-of-range numeric
+    /// components return InvalidData rather than an invented version.
     pub fn parse(release: &str) -> io::Result<Self> {
-        if release.contains("-rc") {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "release-candidate kernels are outside the supported baseline",
-            ));
-        }
-        let mut parts = release.split(['.', '-', '+']);
-        let mut next = || -> io::Result<u16> {
-            parts
-                .next()
-                .and_then(|part| part.parse().ok())
+        let numeric = release
+            .split_once(['-', '+'])
+            .map_or(release, |(numeric, _)| numeric);
+        let mut parts = numeric.split('.');
+        let component = |part: Option<&str>| -> io::Result<u16> {
+            part.and_then(|part| part.parse().ok())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid kernel release"))
         };
+        let major = component(parts.next())?;
+        let minor = component(parts.next())?;
+        let patch = match parts.next() {
+            Some(part) => component(Some(part))?,
+            None => 0,
+        };
         Ok(Self {
-            major: next()?,
-            minor: next()?,
-            patch: next()?,
+            major,
+            minor,
+            patch,
         })
-    }
-
-    pub fn require_supported(self) -> io::Result<()> {
-        if self < Self::MINIMUM_LINUX {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Linux {} is below required {}", self, Self::MINIMUM_LINUX),
-            ))
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -80,6 +69,9 @@ pub struct OptimizationState {
 /// Query named optimizations with [`Self::states`], [`Self::state`] and
 /// [`Self::enabled`]. Report construction, backend decisions and the internal
 /// enabled bitset are not part of the public interface.
+///
+/// Unlike [`RuntimeConfig::policy`] and [`RuntimeConfig::requested`], these
+/// queries describe native decisions, including automatic Linux candidates.
 #[derive(Clone, Debug)]
 pub struct CapabilityReport {
     pub backend: &'static str,

@@ -20,7 +20,7 @@ pub fn configuration() -> io::Result<RuntimeConfig> {
                     .parse()
                     .map_err(|_| error("invalid worker count"))?;
             }
-            "--enable" | "--auto" => {
+            "--enable" | "--auto" | "--disable" => {
                 let name = args
                     .next()
                     .ok_or_else(|| error("optimization name required"))?;
@@ -29,16 +29,17 @@ pub fn configuration() -> io::Result<RuntimeConfig> {
                     .copied()
                     .find(|feature| feature.name() == name)
                     .ok_or_else(|| error(format!("unknown optimization {name}")))?;
-                let policy = if arg == "--enable" {
-                    Policy::RequireCapability
-                } else {
-                    Policy::Auto
+                let policy = match arg.as_str() {
+                    "--enable" => Policy::RequireCapability,
+                    "--auto" => Policy::Auto,
+                    "--disable" => Policy::Off,
+                    _ => unreachable!(),
                 };
                 config = config.with_policy(feature, policy);
             }
             _ => {
                 return Err(error(
-                    "usage: <example> [--workers N] [--enable FEATURE | --auto FEATURE]...",
+                    "usage: <example> [--workers N] [--enable FEATURE | --auto FEATURE | --disable FEATURE]...",
                 ));
             }
         }

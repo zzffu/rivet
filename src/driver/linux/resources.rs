@@ -207,23 +207,112 @@ impl Recycle for Returns {
 }
 
 #[cfg(feature = "provided-buffers")]
-/// One owner publishes descriptors; application releases only enqueue IDs.
-/// Incremental ranges are never republished while either kernel suffix or any
-/// application prefix remains outstanding.
+struct ProvidedRing {
+    descriptors: Mapping,
+    #[cfg(any(feature = "incremental-buffers", feature = "buffer-bundles"))]
+    first_bid: u16,
+    entries: u16,
+    tail: u16,
+    group: u16,
+}
+
+#[cfg(feature = "provided-buffers")]
+impl ProvidedRing {
+    fn new(entries: u16, _first_bid: u16, group: u16) -> io::Result<Self> {
+        Ok(Self {
+            descriptors: Mapping::anonymous(entries as usize * size_of::<Buf>())?,
+            #[cfg(any(feature = "incremental-buffers", feature = "buffer-bundles"))]
+            first_bid: _first_bid,
+            entries,
+            tail: 0,
+            group,
+        })
+    }
+
+    fn register(&self, ring: &Ring, incremental: bool) -> io::Result<()> {
+        let reg = BufReg {
+            ring_addr: self.descriptors.as_ptr() as u64,
+            ring_entries: self.entries as u32,
+            bgid: self.group,
+            flags: if incremental { IOU_PBUF_RING_INC } else { 0 },
+            // Incremental groups are TCP-only; even a one-byte tail is useful.
+            min_left: u32::from(incremental),
+            ..BufReg::default()
+        };
+        unsafe {
+            ring.register(IORING_REGISTER_PBUF_RING, (&reg as *const BufReg).cast(), 1)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "incremental-buffers")]
+    fn unregister(&self, ring: &Ring) -> io::Result<()> {
+        let reg = BufReg {
+            bgid: self.group,
+            ..BufReg::default()
+        };
+        unsafe {
+            ring.register(
+                IORING_UNREGISTER_PBUF_RING,
+                (&reg as *const BufReg).cast(),
+                1,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn publish_tail(&self) {
+        let tail = unsafe {
+            &*self
+                .descriptors
+                .as_ptr()
+                .add(14)
+                .cast::<std::sync::atomic::AtomicU16>()
+        };
+        tail.store(self.tail, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "incremental-buffers")]
+#[derive(Debug)]
+struct ProvidedRollbackError(io::Error);
+
+#[cfg(feature = "incremental-buffers")]
+impl std::fmt::Display for ProvidedRollbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot roll back provided buffer registration: {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(feature = "incremental-buffers")]
+impl std::error::Error for ProvidedRollbackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[cfg(feature = "provided-buffers")]
+/// One slab and global buffer IDs serve one ordinary group, or disjoint TCP
+/// incremental / UDP ordinary groups. Application releases only enqueue IDs;
+/// neither a live kernel suffix nor a published application prefix is reused.
 pub struct ProvidedBuffers {
     memory: Arc<Memory>,
     returns: Arc<Returns>,
-    descriptors: Mapping,
+    tcp: ProvidedRing,
+    #[cfg(feature = "incremental-buffers")]
+    udp: Option<ProvidedRing>,
     #[cfg(feature = "buffer-bundles")]
     positions: Box<[u16]>,
     #[cfg(feature = "buffer-bundles")]
     order: Box<[u16]>,
     #[cfg(feature = "incremental-buffers")]
     consumed: Box<[usize]>,
-    tail: u16,
     entries: u16,
     pub block_bytes: usize,
-    pub group: u16,
 }
 
 #[cfg(feature = "provided-buffers")]
@@ -251,52 +340,59 @@ impl ProvidedBuffers {
                 "provided buffer size exceeds the network CQE byte range",
             ));
         }
+        let incremental = cfg!(feature = "incremental-buffers") && incremental;
         let available = (bytes / block_bytes).min(32768);
-        if available == 0 {
+        if available < if incremental { 2 } else { 1 } {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
-                "provided-buffer budget cannot hold one UDP receive block",
+                "provided-buffer budget cannot hold the required receive groups",
             ));
         }
         let entries = 1usize << available.ilog2();
+        // Splitting a power-of-two count leaves two power-of-two rings without
+        // adding payload memory. UDP must never select an incremental TCP tail.
+        let tcp_entries = if incremental { entries / 2 } else { entries } as u16;
         let memory = Arc::new(Memory(Mapping::anonymous(entries * block_bytes)?));
-        let descriptors = Mapping::anonymous(entries * size_of::<Buf>())?;
+        let tcp = ProvidedRing::new(tcp_entries, 0, 1)?;
+        #[cfg(feature = "incremental-buffers")]
+        let udp = if incremental {
+            Some(ProvidedRing::new(tcp_entries, tcp_entries, 0)?)
+        } else {
+            None
+        };
         let returns = Arc::new(Returns {
             state: (0..entries).map(|_| AtomicUsize::new(0)).collect(),
             ready: ArrayQueue::new(entries),
             notifier,
         });
-        let incremental = cfg!(feature = "incremental-buffers") && incremental;
-        let reg = BufReg {
-            ring_addr: descriptors.as_ptr() as u64,
-            ring_entries: entries as u32,
-            bgid: 1,
-            flags: if incremental { IOU_PBUF_RING_INC } else { 0 },
-            min_left: if incremental {
-                (16 + size_of::<libc::sockaddr_storage>() + super::net::CONTROL_BYTES + 1) as u32
-            } else {
-                0
-            },
-            ..BufReg::default()
-        };
-        unsafe {
-            ring.register(IORING_REGISTER_PBUF_RING, (&reg as *const BufReg).cast(), 1)?;
-        }
         let mut buffers = Self {
             memory,
             returns,
-            descriptors,
+            tcp,
+            #[cfg(feature = "incremental-buffers")]
+            udp,
             #[cfg(feature = "buffer-bundles")]
             positions: vec![0; entries].into_boxed_slice(),
             #[cfg(feature = "buffer-bundles")]
             order: vec![0; entries].into_boxed_slice(),
             #[cfg(feature = "incremental-buffers")]
             consumed: vec![0; entries].into_boxed_slice(),
-            tail: 0,
             entries: entries as u16,
             block_bytes,
-            group: 1,
         };
+        // All fallible allocations precede registration. A second registration
+        // failure removes the first before Auto can retry an ordinary group.
+        buffers.tcp.register(ring, incremental)?;
+        #[cfg(feature = "incremental-buffers")]
+        if let Some(udp) = &buffers.udp
+            && let Err(error) = udp.register(ring, false)
+        {
+            buffers
+                .tcp
+                .unregister(ring)
+                .map_err(|error| io::Error::new(error.kind(), ProvidedRollbackError(error)))?;
+            return Err(error);
+        }
         for bid in 0..entries {
             buffers.publish(bid as u16);
         }
@@ -304,18 +400,25 @@ impl ProvidedBuffers {
         Ok(buffers)
     }
     fn publish(&mut self, bid: u16) {
-        let index = self.tail & (self.entries - 1);
+        let queue = match () {
+            #[cfg(feature = "incremental-buffers")]
+            _ if self.udp.as_ref().is_some_and(|udp| bid >= udp.first_bid) => {
+                self.udp.as_mut().unwrap()
+            }
+            _ => &mut self.tcp,
+        };
+        let index = queue.tail & (queue.entries - 1);
         #[cfg(feature = "buffer-bundles")]
         {
-            self.positions[bid as usize] = self.tail;
-            self.order[index as usize] = bid;
+            self.positions[bid as usize] = queue.tail;
+            self.order[queue.first_bid as usize + index as usize] = bid;
         }
         #[cfg(feature = "incremental-buffers")]
         {
             self.consumed[bid as usize] = 0;
         }
         self.returns.state[bid as usize].store(KERNEL, Ordering::Release);
-        let desc = unsafe { self.descriptors.as_ptr().cast::<Buf>().add(index as usize) };
+        let desc = unsafe { queue.descriptors.as_ptr().cast::<Buf>().add(index as usize) };
         // Entry zero's resv aliases tail; never overwrite it while publishing.
         unsafe {
             std::ptr::addr_of_mut!((*desc).addr)
@@ -323,17 +426,14 @@ impl ProvidedBuffers {
             std::ptr::addr_of_mut!((*desc).len).write(self.block_bytes as u32);
             std::ptr::addr_of_mut!((*desc).bid).write(bid);
         }
-        self.tail = self.tail.wrapping_add(1);
+        queue.tail = queue.tail.wrapping_add(1);
     }
     fn publish_tail(&self) {
-        let tail = unsafe {
-            &*self
-                .descriptors
-                .as_ptr()
-                .add(14)
-                .cast::<std::sync::atomic::AtomicU16>()
-        };
-        tail.store(self.tail, Ordering::Release);
+        self.tcp.publish_tail();
+        #[cfg(feature = "incremental-buffers")]
+        if let Some(udp) = &self.udp {
+            udp.publish_tail();
+        }
     }
     pub fn flush(&mut self) -> usize {
         let mut count = 0;
@@ -348,6 +448,24 @@ impl ProvidedBuffers {
     }
     pub fn entries(&self) -> usize {
         self.entries as usize
+    }
+    #[cfg(feature = "buffer-bundles")]
+    pub fn tcp_entries(&self) -> usize {
+        self.tcp.entries as usize
+    }
+    pub fn group(&self, udp: bool) -> u16 {
+        #[cfg(feature = "incremental-buffers")]
+        if udp && let Some(udp) = &self.udp {
+            return udp.group;
+        }
+        let _ = udp;
+        self.tcp.group
+    }
+    #[cfg(feature = "incremental-buffers")]
+    pub fn rollback_failed(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|source| source.is::<ProvidedRollbackError>())
     }
     #[cfg(feature = "zc-tx-fixed")]
     pub fn memory_region(&self, id: u32) -> MemoryRegion {
@@ -371,8 +489,15 @@ impl ProvidedBuffers {
     }
     #[cfg(feature = "buffer-bundles")]
     pub fn next_bid(&self, bid: u16) -> u16 {
-        let next = self.positions[bid as usize].wrapping_add(1) & (self.entries - 1);
-        self.order[next as usize]
+        let queue = match () {
+            #[cfg(feature = "incremental-buffers")]
+            _ if self.udp.as_ref().is_some_and(|udp| bid >= udp.first_bid) => {
+                self.udp.as_ref().unwrap()
+            }
+            _ => &self.tcp,
+        };
+        let next = self.positions[bid as usize].wrapping_add(1) & (queue.entries - 1);
+        self.order[queue.first_bid as usize + next as usize]
     }
     pub fn reserve(&mut self, bid: u16, bytes: usize, more: bool) -> io::Result<ProvidedRange> {
         if bytes > self.remaining(bid)? {

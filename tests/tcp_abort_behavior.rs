@@ -9,6 +9,10 @@ use std::{
     time::Duration,
 };
 
+#[cfg(all(target_os = "linux", feature = "direct-descriptors"))]
+#[path = "support/linux.rs"]
+mod linux;
+
 fn config() -> RuntimeConfig {
     let mut config = RuntimeConfig::single_thread();
     config.limits.max_tasks = 16;
@@ -28,8 +32,7 @@ async fn deadline<F: Future>(future: F) -> F::Output {
         .expect("native abortive close timed out")
 }
 
-fn native_close_result(config: RuntimeConfig, abort: bool) -> io::Result<usize> {
-    let mut runtime = Runtime::new(config).unwrap();
+fn native_close_result(mut runtime: Runtime, abort: bool) -> io::Result<usize> {
     let (result, peer) = runtime.block_on(deadline(async {
         let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let address = listener.local_addr();
@@ -55,9 +58,14 @@ fn native_close_result(config: RuntimeConfig, abort: bool) -> io::Result<usize> 
 
 #[test]
 fn abort_reports_native_reset_while_ordinary_drop_still_reports_eof() {
-    assert_eq!(native_close_result(config(), false).unwrap(), 0);
     assert_eq!(
-        native_close_result(config(), true).unwrap_err().kind(),
+        native_close_result(Runtime::new(config()).unwrap(), false).unwrap(),
+        0
+    );
+    assert_eq!(
+        native_close_result(Runtime::new(config()).unwrap(), true)
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::ConnectionReset,
     );
 }
@@ -93,15 +101,17 @@ fn abort_disconnects_imported_stream_while_native_alias_remains_open() {
 #[test]
 fn direct_and_fixed_socket_references_do_not_turn_abort_into_fin() {
     let config = config().enable(rivet::Optimization::DirectDescriptors);
+    let Some(runtime) = linux::runtime(config) else {
+        return;
+    };
     assert_eq!(
-        native_close_result(config, true).unwrap_err().kind(),
+        native_close_result(runtime, true).unwrap_err().kind(),
         io::ErrorKind::ConnectionReset,
     );
 }
 
-fn abort_with_inflight_send(configuration: RuntimeConfig) {
+fn abort_with_inflight_send(mut runtime: Runtime) {
     const BYTES: usize = 2 * 1024 * 1024;
-    let mut runtime = Runtime::new(configuration).unwrap();
     let (guard, peer) = runtime.block_on(deadline(async {
         let options = SocketOptions {
             send_buffer_bytes: Some(4096),
@@ -179,7 +189,7 @@ fn abort_with_inflight_send(configuration: RuntimeConfig) {
 
 #[test]
 fn abort_reclaims_inflight_send_storage_only_through_native_convergence() {
-    abort_with_inflight_send(config());
+    abort_with_inflight_send(Runtime::new(config()).unwrap());
 }
 
 #[cfg(all(target_os = "linux", feature = "zc-tx", feature = "direct-descriptors"))]
@@ -189,5 +199,8 @@ fn direct_zero_copy_abort_retains_send_storage_until_real_notifications() {
         .enable(rivet::Optimization::DirectDescriptors)
         .enable(rivet::Optimization::ZcTx);
     config.linux.zc_send_threshold = 0;
-    abort_with_inflight_send(config);
+    let Some(runtime) = linux::runtime(config) else {
+        return;
+    };
+    abort_with_inflight_send(runtime);
 }

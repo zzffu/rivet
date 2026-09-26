@@ -13,6 +13,10 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+#[path = "support/linux.rs"]
+mod linux;
+
 fn config() -> RuntimeConfig {
     let mut config = RuntimeConfig::single_thread();
     config.limits.max_tasks = 8;
@@ -27,14 +31,32 @@ fn config() -> RuntimeConfig {
 }
 
 fn configurations() -> impl Iterator<Item = RuntimeConfig> {
+    let ordinary = config();
+    #[cfg(target_os = "linux")]
+    let ordinary = ordinary
+        .with_policy(rivet::Optimization::FixedFiles, rivet::Policy::Off)
+        .with_policy(rivet::Optimization::DirectDescriptors, rivet::Policy::Off);
     [
-        config(),
+        ordinary,
         #[cfg(all(target_os = "linux", feature = "fixed-files"))]
-        config().enable(rivet::Optimization::FixedFiles),
+        config()
+            .enable(rivet::Optimization::FixedFiles)
+            .with_policy(rivet::Optimization::DirectDescriptors, rivet::Policy::Off),
         #[cfg(all(target_os = "linux", feature = "direct-descriptors"))]
         config().enable(rivet::Optimization::DirectDescriptors),
     ]
     .into_iter()
+}
+
+fn native_runtime(config: RuntimeConfig) -> Option<Runtime> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::runtime(config)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(Runtime::new(config).unwrap())
+    }
 }
 
 async fn deadline<F: Future>(future: F) -> F::Output {
@@ -109,7 +131,9 @@ fn explicit_source_ip_and_ephemeral_port_reach_the_accepted_peer() {
             .into_iter()
             .take(families)
         {
-            let mut runtime = Runtime::new(configuration.clone()).unwrap();
+            let Some(mut runtime) = native_runtime(configuration.clone()) else {
+                continue;
+            };
             runtime.block_on(deadline(async {
                 let source = source.parse().unwrap();
                 let listener = TcpListener::bind(listen.parse().unwrap()).unwrap();
@@ -146,7 +170,9 @@ fn unpolled_connections_are_lazy_and_the_specified_source_port_is_preserved() {
             )),
             ..SocketOptions::default()
         };
-        let mut runtime = Runtime::new(configuration).unwrap();
+        let Some(mut runtime) = native_runtime(configuration) else {
+            continue;
+        };
         let listener =
             runtime.block_on(async { TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap() });
         let peer = listener.local_addr();
@@ -175,7 +201,9 @@ fn occupied_source_port_never_falls_back_or_exhausts_admission() {
             reuse_address: false,
             ..SocketOptions::default()
         };
-        let mut runtime = Runtime::new(configuration).unwrap();
+        let Some(mut runtime) = native_runtime(configuration) else {
+            continue;
+        };
         runtime.block_on(deadline(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             // More failures than either the socket/fixed-slot or operation limit

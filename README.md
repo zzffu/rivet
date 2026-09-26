@@ -6,13 +6,13 @@
 
 ## 平台与构建
 
-| 平台 | 最低支持版本（含） | 后端 |
+| 平台 | 平台基线与验证目标 | 后端 |
 | --- | --- | --- |
-| Linux x86_64／aarch64 | 稳定内核 7.2.7 及后续版本；不支持 RC | io_uring；无静默 epoll 回退 |
+| Linux x86_64／aarch64 | 6.18 LTS 主验证线，6.6／6.12 兼容目标；无全局版本门禁 | io_uring；无静默 epoll 回退 |
 | Windows x86_64 | Windows 10／Server 2016 及后续版本（当前 Rust 目标基线）；不额外按 OS 版本号拦截 | RIO 数据路径＋IOCP／AcceptEx／ConnectEx |
 | Android ARM64；x86_64 验证 | API 23 及后续版本，普通 App 进程 | 非阻塞 socket＋epoll；不探测或依赖 io_uring |
 
-表中版本是包含下限的支持范围，不是只支持某个精确版本，也不代表每个后续版本都已完成原生验证。运行仍要求后端所需的原生接口、权限与资源可用；可选优化还受编译 feature、运行策略和能力探测约束。公开 Rust `Future` 接口兼容与底层 OS 支持是不同契约，不能仅凭前者推断任意旧系统可运行。实际验证环境与限制见下文“已执行的原生验证”。
+Linux 按必要原生能力初始化，不因版本号、RC 或无法解析版本字符串直接拒绝整个 Runtime；更旧环境可以尝试运行，但这不承诺任意旧内核可用。版本与已知修复条件只参与逐项优化选择。Windows／Android 保留表中的平台基线。所有后端仍要求权限与资源可用；参考 UAPI、固定验证 guest、支持目标与实际执行证据各自独立。实际验证环境与限制见下文“已执行的原生验证”。
 
 Rust 1.98+，edition 2024。当前包名为 `rivet-runtime`、库名为 `rivet`；本仓库不配置 crates.io 发布。
 
@@ -27,7 +27,7 @@ rivet = { package = "rivet-runtime", path = "../rivet" }
 
 ## 公开 API 与兼容性
 
-本次后端管理入口收口后的公开 Interface 是兼容基线，当前 `0.1.x` 内保持源码与已承诺行为兼容。有意破坏兼容时，`0.y.z` 提升次版本，`1.0` 及以后提升主版本，并给出迁移说明；这不代表所有平台路径都已完成原生验证。
+`0.2.0` 有意改变 Linux 默认编译和运行时优化选择，并删除全局 Linux 版本门禁。新的 `0.2.x` 内保持源码与已承诺行为兼容；以后有意破坏兼容时，`0.y.z` 提升次版本，`1.0` 及以后提升主版本，并给出迁移说明。这不代表所有平台路径都已完成原生验证。
 
 - 能力报告由 Runtime 生成：从 `Runtime::capabilities()` 读取 worker 元数据，通过 `states()`、`state(optimization)`、`enabled(optimization)` 查询。`Optimization::{ALL, name, compiled}` 和结构化 `CapabilityError` 保持公开。原 `CapabilityReport::{new, decide, finish}` 与 `Optimization::bit` 不再供外部调用，`enabled_mask` 删除；迁移为按优化项查询，不依赖内部位图。
 - 兼容契约包含拥有型缓冲区与内核租约、发送输入字节计数和未接受后缀、取消与 worker 归属、任务 Drop／detach、惰性 flush／写半关闭及反向读取、数据报元数据、计时器绑定／reset／错误语义，而不只是函数签名。
@@ -35,6 +35,14 @@ rivet = { package = "rivet-runtime", path = "../rivet" }
 - `sync` 直接重导出的 `async-channel` 2.x、`async-lock` 3.x、`futures-channel` 0.3.x 是公开依赖，类型身份、方法／约束、错误及取消／关闭行为也属于契约。升级、替换或改变 dependency feature 时须验证下游编译和相应行为；不新增包装，也不固定每个补丁版本。
 
 完整约束见[系统与架构设计](docs/architecture.md#31-公开-interface-的兼容契约)及[实施契约](docs/implementation-contract.md#public-compatibility)。外部消费编译、管理入口不可访问检查和真实运行各证明不同方面，不能互相替代。
+
+### 从 0.1 迁移
+
+- 默认 Cargo 集合改为 `linux-full`，不包含 NODEV。需要精简构建时设置 `default-features = false`，基础 TCP／UDP 和分段发送语义仍完整。
+- Linux 未指定的优化继承均衡、空闲可休眠的自动方案；用 `with_policy(optimization, Policy::Off)` 明确关闭，用 `enable` 严格要求。需要全部关闭时，为 `Optimization::ALL` 中每项显式设置 `Off`，而不是依赖空配置表。
+- `policy`／`requested` 查询配置请求，不预测内核选择；从 `Runtime::capabilities()` 查询实际结果。Windows／Android 的运行时默认策略不变。
+- 删除 `KernelVersion::MINIMUM_LINUX` 和 `require_supported`。不要在应用中复制固定版本门禁；创建 Runtime 并处理真实能力错误。`KernelVersion::parse` 可解析 RC／vendor 数字版本，无法解析的数据仍返回解析错误，但后端将版本缺失作为可选信息处理。
+- `registered-buffers` 表示普通 fixed SEND/RECV 优化；关闭它不禁止 `zc-tx-fixed` 使用独立的内部注册资源。需要禁止这两种用途时，分别关闭两项。
 
 ## 自动放置与本地执行
 
@@ -200,18 +208,20 @@ Android 的 `android_network` 使用真实 `android_setsocknetwork`。已连接�
 
 ## Linux 优化策略
 
-Cargo feature 只纳入实现，**不自动启用运行策略**。默认所有可选策略为 `Off`：
+默认编译 `linux-full`，Linux 在初始化期间根据已编译实现、内核版本／修复条件、实际原生能力和资源选择合法组合。**不是把每项策略都设为 Auto，也不是版本足够就全开**：
 
-- `config.enable(Optimization::...)` = `RequireCapability`；能力、权限或资源不满足时明确失败。
-- `with_policy(..., Policy::Auto)` 才允许该优化降级；不是全局静默回退。
-- `capabilities()` 分别报告 compiled／supported／enabled／reason。
-- `linux-full` 是编译聚合，不是把所有开关同时打开；`zc-rx-nodev` 必须另行显式选择。
+- 未指定项继承自动方案，显式 `Off` 优先；默认不启用 SQPOLL／NAPI 忙轮询。
+- `config.enable(Optimization::...)` = `RequireCapability`；能力、权限或资源不满足时明确失败。显式 `Auto` 允许该项不可用。
+- `capabilities()` 分别报告 compiled／supported／enabled／reason。探测和版本判断只在初始化进行，不用业务请求试错后重发。
+- MSG_RING 默认只用于多个 worker；硬件 RX 需要已配置的网卡队列，NODEV 始终显式选择。mixed CQE 默认只在需要扩展完成项时考虑。
+- 普通多段发送在旧内核使用 io_uring SENDMSG；multishot receive 使用相应内核支持的长度规则。普通 fixed 收发、incremental、ZCRX 等新路径不可用时，不反向抬高基础运行门槛。
+- `linux-full` 是编译聚合，不是运行时预设；`default-features = false` 可关闭默认编译集合，`--all-features` 也不会自动选择互斥模式。
 
 | Cargo feature | 路径 |
 | --- | --- |
 | `fixed-files`, `direct-descriptors` | 固定文件槽、direct socket／accept 与受控句柄移交 |
 | `registered-ring`, `registered-wait`, `registered-buffers` | 注册 ring、等待参数、普通 CPU 缓冲区 |
-| `provided-buffers`, `incremental-buffers` | provided buffer ring、增量区间消费与回收 |
+| `provided-buffers`, `incremental-buffers` | provided buffer rings；TCP 增量与 UDP 普通接收分组，共享有界存储 |
 | `multishot-accept`, `multishot-recv`, `multishot` | 持续 accept／recv／recvmsg |
 | `buffer-bundles` | 合法的 send／recv bundle 路径 |
 | `sq-rewind`, `mixed-cqe` | SQ_REWIND／NO_SQARRAY、混合完成项布局 |
@@ -223,7 +233,7 @@ Cargo feature 只纳入实现，**不自动启用运行策略**。默认所有�
 | `udp-gso`, `udp-gro`, `udp-offload` | 数据报分段与聚合处理 |
 | `tcp-splice` | 显式内核透明转发 |
 
-`zc` 聚合 ZC 实现。具体依赖会正规化；显式关闭必要依赖、SQPOLL 与 RECV_ZC／NODEV／SQ_REWIND 同 ring、硬件 RX 与 NODEV 同选，均拒绝。NODEV 可共享，但大接收块要求真实 RX 模式。可同时注册普通与 provided 存储，但单条 SQE 不混用不合法的 fixed／buffer-select／bundle／vector 组合。
+`zc` 聚合 ZC 实现，不包含 NODEV 或 observe。显式请求的必要依赖会正规化；显式关闭依赖、显式同选 SQPOLL 与 RECV_ZC／NODEV／SQ_REWIND、硬件 RX 与 NODEV 同选，均拒绝，包括双方都是 `Auto` 的情况。默认候选先避开这些冲突。NODEV 可共享，但大接收块要求真实 RX 模式。可同时注册普通与 provided 存储，但单条 SQE 不混用不合法的 fixed／buffer-select／bundle／vector 组合；fixed ZC 的注册资源不再要求启用普通 fixed 收发。
 
 硬件 RX 必须提供管理员已经配置好的网卡队列。运行时不修改 RSS、flow steering、网卡设置或全局网络／安全策略。`RequireCapability` 保证路径可用，不保证每次 ZC 发送都不复制；内核复制成功仍是成功，不能重发。
 
@@ -261,20 +271,32 @@ cargo run --example loopback
 cargo test --all-targets
 ```
 
-Linux 特性按合法组合分别选择，例如：
+示例默认使用自动方案，也可用 `--disable NAME`、`--auto NAME`、`--enable NAME` 覆盖；`--workers N` 默认是两个 worker。严格请求高级能力须在对应能力可用的环境执行，例如：
 
 ```text
 cargo run --release --all-features --example loopback -- --enable zc-tx-fixed --enable zc-tx-vectored --enable zc-observe
 cargo run --release --all-features --example loopback -- --enable zc-rx-nodev --enable zc-rx-shared --enable zc-observe
 ```
 
-`tools/verification/linux_vm.py` 提供签名／校验和固定的、无磁盘和无外部 NIC 的 Linux 7.2.7 guest；记录实际 guest 内核、配置、可执行文件 SHA256、串口输出与退出状态。它不修改 WSL 全局内核。KVM 不可用时须显式选择 TCG，不静默回退。loopback／NODEV 不能证明真实 NIC RX ZC、RSS、NAPI 或硬件吞吐。
+`tools/verification/linux_vm.py` 提供签名／校验和固定、无磁盘和无外部 NIC 的隔离 guest。`--kernel 6.18` 是默认主验证线，另有 `6.6`、`6.12` 和保留的 `7.2.7`；全局 `--kernel`／`--state` 放在子命令前。先运行 `--kernel 6.18 prepare`，再运行 `--kernel 6.18 run --accel tcg /path/to/static-elf`。`run-suite` 接收 JSON 数组，每项包含唯一 `name`、静态 ELF 的 `executable` 和字符串数组 `args`，相对 ELF 路径按清单所在目录解析；一次 guest 启动逐项校验散列、执行并记录结果。runner 不构建代码、不挂载宿主目录、不修改 WSL 全局内核；KVM 不可用时须显式选择 TCG。loopback／NODEV 不能证明真实 NIC RX ZC、RSS、NAPI 或硬件吞吐。
 
 Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用普通 App，支持 `-Abi x86_64` 和 `-Abi arm64-v8a`，不依赖 Gradle。NDK 目标和 APK 最低版本为 API23，JNI 库采用 16KiB ELF／APK 对齐和真正未压缩的 ZIP 条目，并保留 API23 所需的 v1 签名。界面、`RivetSmoke` logcat 标签和私有 `files/smoke-result.json` 给出结构化结果；每次进程运行先清除旧成功状态，JNI 初始化失败也持久化。验证 APK 的 debuggable 配置和测试签名不能用于生产应用。
 
 ### 已执行的原生验证
 
-本次 API23 下限迁移的验证：
+0.2.0 自动优化与兼容改造的本轮验证（2026-09-27）：
+
+| 实际环境 | 已执行结果 | 限制 |
+| --- | --- | --- |
+| Linux 6.6.72-1-lts、6.12.75-1-lts、6.18.54-1-lts；x86_64 静态 musl | 默认及无默认 feature 的测试、`loopback`／`native_traits`／`runtime_services`／`mixed_load` 均通过；另覆盖单 worker、显式 Off、严格 fixed files、Auto registered wait 和显式 SQPOLL | 隔离 TCG guest、root、IPv4／IPv6 loopback；不支持的高级路径明确跳过，并校验对应严格失败／Auto 停用，不计作该优化原生通过 |
+| Linux 7.2.7-arch1-1；x86_64 静态 musl | 全 feature 与精简构建的测试／四个示例通过；显式 NODEV＋shared＋observe、fixed＋vectored ZC 且普通 registered buffers Off 的 loopback 通过 | NODEV 为复制接收；没有物理 NIC／NAPI／RSS 或吞吐证据 |
+| Windows x64，build 26200 | 全 feature／all-targets 测试及 `native_traits`、`runtime_services`、`loopback` 实跑通过 | 验证进程限定 IPv4，Windows IPv6 未执行；未改宿主 TUN、路由或网络设置 |
+
+7.2.7 的初次混合负载暴露 UDP 增量尾部截断。永久回归在修复前准确失败于第 125 个 256 字节数据报；TCP／UDP 描述符分组后，该回归、小预算普通接收回退和原混合负载均通过，未延长业务超时、隐藏截断或重传丢失数据。
+
+静态验证另包含 26 个独立 Linux feature、4 个聚合 feature 和 6 个交叉组合的全 target 编译检查；Linux 全 feature／精简构建与 Windows 全 feature 的严格 Clippy、严格 rustdoc、格式检查通过。Linux ARM64、Windows GNU、Android ARM64／x86_64 全 feature／全 target 及独立 Android native 包编译检查通过；这些不是新增的对应平台原生运行。证据索引在 `artifacts/linux-auto/verification-summary.json`，逐 guest 的精确内核、程序散列、参数、跳过原因、结果及修复前失败保留在索引指向的 `report.json`／`serial.log` 中。
+
+此前 API23 下限迁移的验证：
 
 - Android 6.0／API23、x86_64、4KiB 页、kernel 3.10.0+、SELinux Enforcing：普通 App UID 10055 的 17 项场景通过，1 项不可用的 UDP GSO/GRO 明确跳过；实际覆盖 IPv4／IPv6、Network 绑定和通用运行时能力。旋转及后台恢复继续显示缓存结果，不重跑原生场景。
 - 同一 API23 环境的 Android 目标全 feature 原生回归共 127 项通过。既有保留 FD 别名的 IPv6 `abort` 回归先暴露 `EINVAL`；修正 Android 的 `AF_UNSPEC` 地址长度后通过，不跳过断言或吞掉错误。adb shell 回归与普通 App 结果分别记录。

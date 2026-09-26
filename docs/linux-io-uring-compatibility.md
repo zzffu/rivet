@@ -1,14 +1,16 @@
 # Linux io_uring API 历史与兼容性分析
 
-记录日期：2026-09-26。本文归档源码与上游资料分析，**不是支持策略调整，也不是旧内核部署验证报告**。源码行号对应记录时的仓库状态。
+原始记录日期：2026-09-26，针对 **0.1.0**。本文归档源码与上游资料分析，**不是旧内核部署验证报告**；下面的旧版本门禁、默认路径和源码行号均属于记录当时的状态。
 
-## 1. 结论与不变的支持契约
+**0.2.0 策略已独立调整**：6.18 LTS 为主验证线，6.6／6.12 为兼容目标，删除全局版本／RC 门禁，默认自动选择合法优化组合。现行契约见 [README](../README.md)、[架构文档](architecture.md#6-功能选择与能力契约) 和 [实现契约](implementation-contract.md)。保留 v7.2.7 参考 UAPI 和原 guest 制品，不把这份历史记录当作现行准入条件。
 
-- Rivet 的 Linux 支持范围仍是 **x86_64／aarch64、稳定内核 7.2.7 及后续稳定版本，不支持 RC，不静默回退到 epoll**。既有能力、权限、硬件限制与验证承诺全部不变，见 [README](../README.md)、[架构文档](architecture.md) 和 [实现契约](implementation-contract.md)。
-- 版本门禁仍由 [`src/capability.rs:14-49`](../src/capability.rs#L14) 的 `MINIMUM_LINUX = 7.2.7`、RC 拒绝及下限检查执行；[`src/driver/linux/mod.rs:426-433`](../src/driver/linux/mod.rs#L426) 在创建 ring 前调用它。本文不移除、放宽或绕过门禁。
-- [`src/driver/linux/uapi.rs:1-5`](../src/driver/linux/uapi.rs#L1) 与 [`src/driver/linux/zcrx.rs:1-6`](../src/driver/linux/zcrx.rs#L1) 继续以 **v7.2.7 UAPI** 为参考；[`tools/verification/linux-kernel.lock.json:2-9`](../tools/verification/linux-kernel.lock.json#L2) 与 [`tools/verification/linux_vm.py`](../tools/verification/linux_vm.py) 继续固定 **7.2.7-arch1-1** guest 及原有制品校验。参考 ABI、可复现 runner、支持范围和实际运行证据是四件不同的事。
-- **[INFERENCE] 忽略上述显式门禁、只按上游主线 API 引入时间推导，强制 setup flags 给出 6.6；完整默认数据路径中无可选 feature 门控的多段 `SEND_VECTORIZED` 将已识别的必要下限提高到 6.17。** 这不是“6.17 已兼容／已支持”的充分条件，更不把支持下限从 7.2.7 降到 6.17。
-- 本次只记录分析；没有修改 Linux 实现、配置、门禁或 pins，没有为这些历史版本执行编译、测试或原生运行。既有运行结果仍以仓库原始证据为准。
+## 1. 记录时的结论与支持契约（0.1.0）
+
+- 当时 Rivet 的 Linux 支持范围是 **x86_64／aarch64、稳定内核 7.2.7 及后续稳定版本，不支持 RC，不静默回退到 epoll**。0.2.0 改变版本准入和默认选择，不改变无 epoll 回退及所有权契约。
+- 当时 `src/capability.rs:14-49` 的 `MINIMUM_LINUX = 7.2.7`、RC 拒绝及下限检查在 ring 创建前执行；这些门禁入口已在 0.2.0 删除，不保留无操作兼容方法。
+- `src/driver/linux/uapi.rs` 与 `src/driver/linux/zcrx.rs` 以 **v7.2.7 UAPI** 为参考；当时 runner 固定 **7.2.7-arch1-1** guest。现在的多内核锁保留该制品身份和校验信息。参考 ABI、可复现 runner、支持目标和实际运行证据是四件不同的事。
+- **[INFERENCE] 对记录时的实现，忽略显式门禁、只按上游主线 API 引入时间推导，强制 setup flags 给出 6.6；无可选 feature 门控的普通多段 SEND_VECTORIZED 将已识别的必要下限提高到 6.17。** 这不是“6.17 已兼容”的充分条件，也不适用于后来增加 SENDMSG 兼容路径的实现。
+- 原始分析轮次没有修改 Linux 实现、配置、门禁或 pins，也没有为这些历史版本执行原生验证。后续实际结果单独记录，不能倒填为该轮证据。
 
 ## 2. 从 5.1 到本次核实的上游版本
 
@@ -83,9 +85,25 @@ Rivet 在 [`src/driver/linux/mod.rs:2381`](../src/driver/linux/mod.rs#L2381) 为
 
 ## 6. 维护时如何使用这份记录
 
-1. 把 **6.17** 当作“当前已识别的默认路径 API 必要条件”线索，而非充分条件或部署建议。结论按上游主线版本计算，不覆盖发行版特有回移，也不包含工具链／依赖最低版本。
-2. 排查可选能力失败时，核对实际 tag／发行版源码、modifier／结构字段和组合语义，不只看 `uname`、opcode probe 或单次注册成功。fixed／vectored ZC 等组合及所有 backport 的精确最低版本仍未确定。
-3. 当前无需因这份历史分析改动任何 Linux 源码、feature gate、版本门禁、UAPI／runner pin 或既有支持承诺。支持范围不冒充逐版本实测；源码推断也不证明内核配置、安全策略、权限、硬件可用性或生产可靠性。
+1. **6.17** 是原始实现已识别的默认路径接口条件，不是跨版本兼容实现的全局最低版本，也不覆盖发行版回移、工具链或依赖版本。
+2. 排查可选能力失败时，核对实际 tag／发行版源码、modifier／结构字段和组合语义，不只看 uname、opcode probe 或单次注册成功。fixed／vectored ZC 等组合及 backport 的版本必须按实际证据判断。
+3. 0.2.0 的兼容与自动选择工作按独立批准的系统设计实施；保留本记录作为历史依据，不恢复旧全局门禁，也不将版本表冒充逐版本实测、权限或硬件可用性证明。
+
+## 7. 0.2 实现选择补充（2026-09-27）
+
+本节描述后来增加的兼容路径，不改写上述 0.1 历史结论。具体原生证据按实际内核和场景记录在 README／变更记录，不能从这张接口表推导实测结果。
+
+| 路径 | 0.2 的选择依据 |
+| --- | --- |
+| 普通向量发送 | 旧版或未知版本用 SENDMSG；具备 6.17 modifier 条件时可用 SEND_VECTORIZED。 |
+| TCP multishot 长度 | 旧版使用零长度；6.17 的 per-invocation cap 可用时才写非零长度。 |
+| scalar fixed ZC | [v6.6][v6.6-net]／[v6.12][v6.12-net] 已有 SEND_ZC fixed 导入；注册资源与普通 fixed 收发分开。 |
+| message/vector ZC | 旧版使用非 fixed SENDMSG_ZC；[v6.17][v6.17-net]／[v6.18][v6.18-net] 的 SENDMSG_ZC 支持 registered iovec 导入，但 fixed SEND_ZC 仍走 scalar 导入，不能因为接受 VECTOR flag 就认为组合正确。 |
+| fixed SEND_VECTORIZED | 当前采用 [v7.2.7 实现][v7.2.7-net] 已确认的 fixed-vector 导入路径作为保守条件，不声称它是精确首次引入版本。 |
+| TX／RX 观测 | TX usage flag 在 [v6.2][v6.2] 已有，RX events／stats 另需较新的 ZCRX 扩展，分别判断。 |
+| incremental | 保守选择已确认的 7.2.7 级语义。TCP 增量与 UDP 非增量描述符分组，共享原 slab；UDP 不得选中不足以容纳其接收容量的增量尾部。 |
+
+最后一项与 7.2.7 的 MSG_TRUNC 内核修复不同：正确记录实际消费量，并不能保证一个较短的增量尾部装得下调用者允许的数据报。0.2 原生混合负载暴露了该运行时组合问题，新增边界回归在原实现上复现了第 125 个 256 字节数据报被截断；解决方式是隔离描述符选择，不是隐藏截断或重试已丢失的数据。
 
 ## 上游来源
 
@@ -121,3 +139,8 @@ Rivet 在 [`src/driver/linux/mod.rs:2381`](../src/driver/linux/mod.rs#L2381) 为
 [zcrx-doc]: https://raw.githubusercontent.com/torvalds/linux/v6.15/Documentation/networking/iou-zcrx.rst
 [v7.3-merge]: https://github.com/torvalds/linux/commit/f5437ff7299e47e76e52d37a2937a4b0f04e399f
 [v7.3-zcrx]: https://raw.githubusercontent.com/torvalds/linux/v7.3-rc4/include/uapi/linux/io_uring/zcrx.h
+[v6.2]: https://raw.githubusercontent.com/torvalds/linux/v6.2/include/uapi/linux/io_uring.h
+[v6.6-net]: https://raw.githubusercontent.com/torvalds/linux/v6.6/io_uring/net.c
+[v6.12-net]: https://raw.githubusercontent.com/torvalds/linux/v6.12/io_uring/net.c
+[v6.18-net]: https://raw.githubusercontent.com/torvalds/linux/v6.18/io_uring/net.c
+[v7.2.7-net]: https://raw.githubusercontent.com/gregkh/linux/v7.2.7/io_uring/net.c

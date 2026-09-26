@@ -1,6 +1,6 @@
 [package]
 name = "rivet-runtime"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 publish = false
@@ -11,7 +11,7 @@ name = "rivet"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["linux-full"]
 fixed-files = []
 direct-descriptors = ["fixed-files"]
 registered-buffers = []

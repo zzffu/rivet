@@ -1,31 +1,159 @@
 {
-  "baseline": "7.2.7",
-  "release": "7.2.7-arch1-1",
-  "architecture": "x86_64",
-  "origin": "Arch Linux Archive, official linux package; upstream 7.2.7 plus Arch's arch1 packaging patches, not a relabelled WSL kernel",
-  "package": {
-    "file": "linux-7.2.7.arch1-1-x86_64.pkg.tar.zst",
-    "url": "https://archive.archlinux.org/packages/l/linux/linux-7.2.7.arch1-1-x86_64.pkg.tar.zst",
-    "sha256": "4c922b4be698a85e13647928992d4d099dc5a530915bf82a631c2624784802a4"
-  },
-  "signature": {
-    "file": "linux-7.2.7.arch1-1-x86_64.pkg.tar.zst.sig",
-    "url": "https://archive.archlinux.org/packages/l/linux/linux-7.2.7.arch1-1-x86_64.pkg.tar.zst.sig",
-    "sha256": "d617aff66bee034a1edf8b96c61153ac82d6ef366d993852555917ce5f60beba"
-  },
-  "certificate": {
-    "file": "heftig.asc",
-    "url": "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x83BC8889351B5DEBBB68416EB8AC08600F108CDF",
-    "sha256": "950f1064ad9dcc732f188b3dcfbf730a2ce7038ae69f9dc0664129a187fed5aa",
-    "fingerprint": "83BC8889351B5DEBBB68416EB8AC08600F108CDF",
-    "identity": "Jan Alexander Steffens (heftig), Arch Linux kernel maintainer",
-    "fingerprint_origin": "https://archlinux.org/people/developers/#heftig"
-  },
-  "recipe": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/raw/7.2.7.arch1-1/PKGBUILD",
-  "configuration_source": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/raw/7.2.7.arch1-1/config.x86_64",
-  "upstream_source": "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.7.tar.xz",
-  "upstream_source_sha256": "4ac34c47db2540ffb2713943f8d891ff1702e0ba6934525a493b7d1cad43145a",
-  "upstream_checksum_origin": "https://cdn.kernel.org/pub/linux/kernel/v7.x/sha256sums.asc",
-  "verification": "Detached package signature verified with Debian sqv on 2026-09-25; returned the exact pinned primary fingerprint. This is artifact verification, not a guest boot or runtime test.",
-  "scope": "The diskless guest has loopback networking only. It can exercise io_uring CPU-memory networking and explicit NODEV paths, but cannot establish real NIC RX zero-copy or hardware NAPI/RSS performance. Source config enables IO_URING and IO_URING_ZCRX; the runner checks the actual guest's embedded config after boot."
+  "default": "6.18",
+  "kernels": {
+    "6.6": {
+      "required_config": [
+        "IO_URING",
+        "INET",
+        "IPV6"
+      ],
+      "artifact": {
+        "baseline": "6.6",
+        "release": "6.6.72-1-lts",
+        "architecture": "x86_64",
+        "origin": "Arch Linux Archive, official signed linux-lts package; not a relabelled WSL kernel",
+        "package": {
+          "file": "linux-lts-6.6.72-1-x86_64.pkg.tar.zst",
+          "url": "https://archive.archlinux.org/packages/l/linux-lts/linux-lts-6.6.72-1-x86_64.pkg.tar.zst",
+          "sha256": "a527cb8907781c2110d6b1bebb3340689c46a73ff4ad7de1a387946c44907a14"
+        },
+        "signature": {
+          "file": "linux-lts-6.6.72-1-x86_64.pkg.tar.zst.sig",
+          "url": "https://archive.archlinux.org/packages/l/linux-lts/linux-lts-6.6.72-1-x86_64.pkg.tar.zst.sig",
+          "sha256": "281d63cc37f4be7e79a07b3a391cb24d246f7221337b327ef95b95c74a56eaee"
+        },
+        "certificate": {
+          "file": "andyrtr.asc",
+          "url": "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xADC8A1FCC15E01D45310419E94657AB20F2A092B",
+          "sha256": "d1ad94125b58c96122b401f6a351d6f7ac547bf51608e3e49d82a9d27e809788",
+          "fingerprint": "ADC8A1FCC15E01D45310419E94657AB20F2A092B",
+          "identity": "Andreas Radke (andyrtr), Arch Linux kernel maintainer",
+          "fingerprint_origin": "https://archlinux.org/people/developers/#andyrtr"
+        },
+        "recipe": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux-lts/-/raw/6.6.72-1/PKGBUILD",
+        "configuration_source": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux-lts/-/raw/6.6.72-1/config",
+        "upstream_source": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.72.tar.xz",
+        "upstream_source_sha256": "feb9e514930d5968daa0b8b5486d3295d1fb2b34accf876207641884d4baef39",
+        "upstream_checksum_origin": "https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc",
+        "verification": "Detached binary package signature verified with Debian sqv on 2026-09-27 against the independently published exact primary fingerprint; unique image path and package metadata checked. This is artifact verification, not a guest boot or runtime test.",
+        "scope": "Diskless loopback-only guest; no host mounts, disk or NIC. Does not establish hardware zero-copy, NAPI/RSS performance or ordinary-user permissions."
+      }
+    },
+    "6.12": {
+      "required_config": [
+        "IO_URING",
+        "INET",
+        "IPV6"
+      ],
+      "artifact": {
+        "baseline": "6.12",
+        "release": "6.12.75-1-lts",
+        "architecture": "x86_64",
+        "origin": "Arch Linux Archive, official signed linux-lts package; not a relabelled WSL kernel",
+        "package": {
+          "file": "linux-lts-6.12.75-1-x86_64.pkg.tar.zst",
+          "url": "https://archive.archlinux.org/packages/l/linux-lts/linux-lts-6.12.75-1-x86_64.pkg.tar.zst",
+          "sha256": "4cd9a94a075b6e46b2aca962ff58ae5598c471ab637b2c3da87dee72ab2ce1ab"
+        },
+        "signature": {
+          "file": "linux-lts-6.12.75-1-x86_64.pkg.tar.zst.sig",
+          "url": "https://archive.archlinux.org/packages/l/linux-lts/linux-lts-6.12.75-1-x86_64.pkg.tar.zst.sig",
+          "sha256": "08baf5ca68a4c090e406315a8419e038d52242dc0576f93b55d7616e965a4d3e"
+        },
+        "certificate": {
+          "file": "andyrtr.asc",
+          "url": "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xADC8A1FCC15E01D45310419E94657AB20F2A092B",
+          "sha256": "d1ad94125b58c96122b401f6a351d6f7ac547bf51608e3e49d82a9d27e809788",
+          "fingerprint": "ADC8A1FCC15E01D45310419E94657AB20F2A092B",
+          "identity": "Andreas Radke (andyrtr), Arch Linux kernel maintainer",
+          "fingerprint_origin": "https://archlinux.org/people/developers/#andyrtr"
+        },
+        "recipe": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux-lts/-/raw/6.12.75-1/PKGBUILD",
+        "configuration_source": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux-lts/-/raw/6.12.75-1/config",
+        "upstream_source": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.75.tar.xz",
+        "upstream_source_sha256": "06ee7927556ff1aa8810c4826501b0fdb169ebdc180644b882cf7c143ac1c177",
+        "upstream_checksum_origin": "https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc",
+        "verification": "Detached binary package signature verified with Debian sqv on 2026-09-27 against the independently published exact primary fingerprint; unique image path and package metadata checked. This is artifact verification, not a guest boot or runtime test.",
+        "scope": "Diskless loopback-only guest; no host mounts, disk or NIC. Does not establish hardware zero-copy, NAPI/RSS performance or ordinary-user permissions."
+      }
+    },
+    "6.18": {
+      "required_config": [
+        "IO_URING",
+        "INET",
+        "IPV6",
+        "IO_URING_ZCRX"
+      ],
+      "artifact": {
+        "baseline": "6.18",
+        "release": "6.18.54-1-lts",
+        "architecture": "x86_64",
+        "origin": "Arch Linux Archive, official signed linux-lts package; not a relabelled WSL kernel",
+        "package": {
+          "file": "linux-lts-6.18.54-1-x86_64.pkg.tar.zst",
+          "url": "https://archive.archlinux.org/packages/l/linux-lts/linux-lts-6.18.54-1-x86_64.pkg.tar.zst",
+          "sha256": "357b5695c0a97253ba3472ba99cd56b113f20d87c84d77c13dfba86980dac8a6"
+        },
+        "signature": {
+          "file": "linux-lts-6.18.54-1-x86_64.pkg.tar.zst.sig",
+          "url": "https://archive.archlinux.org/packages/l/linux-lts/linux-lts-6.18.54-1-x86_64.pkg.tar.zst.sig",
+          "sha256": "9af896f1f46a110273bdcfda5fdf0a2dc12e964e63fa4520c0819abea1e2f1e3"
+        },
+        "certificate": {
+          "file": "andyrtr.asc",
+          "url": "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xADC8A1FCC15E01D45310419E94657AB20F2A092B",
+          "sha256": "d1ad94125b58c96122b401f6a351d6f7ac547bf51608e3e49d82a9d27e809788",
+          "fingerprint": "ADC8A1FCC15E01D45310419E94657AB20F2A092B",
+          "identity": "Andreas Radke (andyrtr), Arch Linux kernel maintainer",
+          "fingerprint_origin": "https://archlinux.org/people/developers/#andyrtr"
+        },
+        "recipe": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux-lts/-/raw/6.18.54-1/PKGBUILD",
+        "configuration_source": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux-lts/-/raw/6.18.54-1/config.x86_64",
+        "upstream_source": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.54.tar.xz",
+        "upstream_source_sha256": "9df30b02dd8102bbd0be52556288ef6889ddbe7f1ddb96fbf847d0becf3eacac",
+        "upstream_checksum_origin": "https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc",
+        "verification": "Detached binary package signature verified with Debian sqv on 2026-09-27 against the independently published exact primary fingerprint; unique image path and package metadata checked. This is artifact verification, not a guest boot or runtime test.",
+        "scope": "Diskless loopback-only guest; no host mounts, disk or NIC. Does not establish hardware zero-copy, NAPI/RSS performance or ordinary-user permissions."
+      }
+    },
+    "7.2.7": {
+      "required_config": [
+        "IO_URING",
+        "INET",
+        "IPV6",
+        "IO_URING_ZCRX"
+      ],
+      "artifact": {
+        "baseline": "7.2.7",
+        "release": "7.2.7-arch1-1",
+        "architecture": "x86_64",
+        "origin": "Arch Linux Archive, official linux package; upstream 7.2.7 plus Arch's arch1 packaging patches, not a relabelled WSL kernel",
+        "package": {
+          "file": "linux-7.2.7.arch1-1-x86_64.pkg.tar.zst",
+          "url": "https://archive.archlinux.org/packages/l/linux/linux-7.2.7.arch1-1-x86_64.pkg.tar.zst",
+          "sha256": "4c922b4be698a85e13647928992d4d099dc5a530915bf82a631c2624784802a4"
+        },
+        "signature": {
+          "file": "linux-7.2.7.arch1-1-x86_64.pkg.tar.zst.sig",
+          "url": "https://archive.archlinux.org/packages/l/linux/linux-7.2.7.arch1-1-x86_64.pkg.tar.zst.sig",
+          "sha256": "d617aff66bee034a1edf8b96c61153ac82d6ef366d993852555917ce5f60beba"
+        },
+        "certificate": {
+          "file": "heftig.asc",
+          "url": "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x83BC8889351B5DEBBB68416EB8AC08600F108CDF",
+          "sha256": "950f1064ad9dcc732f188b3dcfbf730a2ce7038ae69f9dc0664129a187fed5aa",
+          "fingerprint": "83BC8889351B5DEBBB68416EB8AC08600F108CDF",
+          "identity": "Jan Alexander Steffens (heftig), Arch Linux kernel maintainer",
+          "fingerprint_origin": "https://archlinux.org/people/developers/#heftig"
+        },
+        "recipe": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/raw/7.2.7.arch1-1/PKGBUILD",
+        "configuration_source": "https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/raw/7.2.7.arch1-1/config.x86_64",
+        "upstream_source": "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.7.tar.xz",
+        "upstream_source_sha256": "4ac34c47db2540ffb2713943f8d891ff1702e0ba6934525a493b7d1cad43145a",
+        "upstream_checksum_origin": "https://cdn.kernel.org/pub/linux/kernel/v7.x/sha256sums.asc",
+        "verification": "Detached package signature verified with Debian sqv on 2026-09-25; returned the exact pinned primary fingerprint. This is artifact verification, not a guest boot or runtime test.",
+        "scope": "The diskless guest has loopback networking only. It can exercise io_uring CPU-memory networking and explicit NODEV paths, but cannot establish real NIC RX zero-copy or hardware NAPI/RSS performance. Source config enables IO_URING and IO_URING_ZCRX; the runner checks the actual guest's embedded config after boot."
+      }
+    }
+  }
 }

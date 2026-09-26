@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
-"""Prepare and run a diskless, isolated Linux 7.2.7 x86_64 verification VM.
+"""Prepare and run signed, diskless Linux x86_64 verification guests.
 
 Run under Debian 13 / WSL Debian, with python3, curl, dpkg-deb and sqv already
 available. `prepare` downloads pinned packages and extracts them to --state;
 it never installs packages, runs package scripts, builds code, or boots a VM.
-`run` accepts an existing static x86_64 Linux ELF, makes an initramfs, boots
-QEMU, captures guest uname/config/output, and returns failure unless the guest
-reports the exact kernel release and a successful smoke exit. No host directory
-or disk is attached to the guest, and no host network interface, TAP, forwarding
-rule, sysctl or boot setting is changed.
+`run` accepts one existing static x86_64 Linux ELF; `run-suite` accepts a JSON
+array of {name, executable, args} cases and executes them in one guest boot.
+Every payload is hashed and checked independently. The selected kernel release,
+guest configuration, all case results and the final shutdown must match.
+No host directory or disk is attached to the guest, and no host network
+interface, TAP, forwarding rule, sysctl or boot setting is changed.
 
 Windows commands (from the repository root; build only after integration):
-  wsl -d Debian -- python3 /mnt/c/project/rivet/tools/verification/linux_vm.py prepare
+  wsl -d Debian -- python3 /mnt/c/project/rivet/tools/verification/linux_vm.py --kernel 6.18 prepare
   rustup target add x86_64-unknown-linux-musl
   # Use rust-lld and -C target-feature=+crt-static for the parent-owned smoke build.
   # In PowerShell, set this only for the build process, not a global Cargo config:
   # $env:CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = 'rust-lld'
-  # cargo build --target x86_64-unknown-linux-musl --features linux-full --example NAME
+  # cargo build --target x86_64-unknown-linux-musl --tests --examples
   # Remove-Item Env:CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
-  wsl -d Debian -- python3 /mnt/c/project/rivet/tools/verification/linux_vm.py run --accel tcg /mnt/c/PATH/TO/STATIC-SMOKE
+  wsl -d Debian -- python3 /mnt/c/project/rivet/tools/verification/linux_vm.py --kernel 6.18 run --accel tcg /mnt/c/PATH/TO/STATIC-SMOKE
 
-KVM is the default accelerator and never silently falls back to TCG. On the
-observed host, /dev/kvm belongs to group kvm but the WSL user's normal groups do
-not include it. To grant access to this process only, with no group-file edits:
-  wsl -d Debian -u root -- setpriv --reuid=zzffu --regid=zzffu --groups=zzffu,kvm python3 /mnt/c/project/rivet/tools/verification/linux_vm.py --state /home/zzffu/.cache/rivet-verification/linux-7.2.7 run /mnt/c/PATH/TO/STATIC-SMOKE
+KVM is the default accelerator and never silently falls back to TCG. Check
+the current /dev/kvm availability and permissions; historical host access is
+not evidence of current access. Explicit TCG needs no host virtualization change.
+Kernel selectors cover 6.6, 6.12, 6.18 (default) and the retained 7.2.7 guest.
 
-The KVM command drops root before Python/QEMU run. Substitute local account names
-on another machine. All downloads and run reports live in --state (default:
-~/.cache/rivet-verification/linux-7.2.7). No Cargo or kernel build is performed by
-this script. A passing loopback run is not NIC RX zero-copy or performance proof.
+All downloads and run reports live in --state (default:
+~/.cache/rivet-verification/linux-<selector>). No Cargo or kernel build is
+performed by this script. A passing loopback run is not NIC RX zero-copy,
+ordinary-user permission coverage or performance proof.
 """
 
 import argparse
@@ -52,7 +53,7 @@ import time
 import uuid
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_STATE = Path.home() / ".cache/rivet-verification/linux-7.2.7"
+STATE_ROOT = Path.home() / ".cache/rivet-verification"
 
 
 def sha256(path):
@@ -130,11 +131,10 @@ def static_x86_64(path):
                 raise RuntimeError(f"Dynamic ELF needs a loader; supply a static musl binary: {path}")
 
 
-def prepare(state):
+def prepare(state, kernel):
     for tool in ("curl", "dpkg-deb", "sqv"):
         if shutil.which(tool) is None:
             raise RuntimeError(f"Missing host prerequisite: {tool}; no host package changes made")
-    kernel = load_json(HERE / "linux-kernel.lock.json")
     tools = load_json(HERE / "debian-tools.lock.json")
     downloads = state / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
@@ -223,8 +223,23 @@ def cpio_entry(target, inode, name, mode, payload=b"", device=(0, 0)):
     target.write(b"\0" * (-len(payload) % 4))
 
 
-def guest_init(kernel_release, run_id, smoke_hash, seconds, smoke_args):
-    smoke_command = shlex.join(["/smoke", *smoke_args])
+def guest_init(kernel_release, required_config, run_id, cases, seconds):
+    commands = []
+    for index, case in enumerate(cases):
+        command = shlex.join([f"/cases/{index}", *case["args"]])
+        commands.append(f"""
+actual=$(/bin/busybox sha256sum /cases/{index})
+actual=${{actual%% *}}
+printf 'RIVET_VM_CASE_SHA256 {run_id} {index} %s\\n' "$actual"
+[ "$actual" = {shlex.quote(case["sha256"])} ] || finish 125
+printf 'RIVET_VM_CASE_EXEC {run_id} {index}\\n'
+/bin/busybox timeout -s KILL {seconds} {command}
+code="$?"
+printf '\\nRIVET_VM_CASE_RESULT {run_id} {index} exit=%s\\n' "$code"
+[ "$code" -eq 0 ] || finish "$code"
+""")
+    configuration = shlex.join(required_config)
+    executions = "".join(commands)
     return f"""#!/bin/sh
 export PATH=/bin
 export RUST_BACKTRACE=1
@@ -245,43 +260,72 @@ printf 'RIVET_VM_UNAME {run_id} %s\\n' "$release"
 /bin/busybox cat /proc/version
 [ "$release" = {shlex.quote(kernel_release)} ] || finish 125
 /bin/busybox zcat /proc/config.gz > /run/kernel.config || finish 125
-for option in IO_URING IO_URING_ZCRX INET IPV6; do
+for option in {configuration}; do
     /bin/busybox grep -x "CONFIG_${{option}}=y" /run/kernel.config || finish 125
 done
 ulimit -n 65536 || finish 125
 ulimit -l 262144 || finish 125
 /bin/busybox ip link set lo up || finish 125
 /bin/busybox ip address show dev lo
-actual=$(/bin/busybox sha256sum /smoke)
-actual=${{actual%% *}}
-printf 'RIVET_VM_SMOKE_SHA256 {run_id} %s\\n' "$actual"
-[ "$actual" = {shlex.quote(smoke_hash)} ] || finish 125
-printf 'RIVET_VM_EXEC {run_id}\\n'
-/bin/busybox timeout -s KILL {seconds} {smoke_command}
-finish "$?"
+{executions}
+finish 0
 """.encode("utf-8")
 
 
-def make_initramfs(path, busybox, smoke, init):
+def make_initramfs(path, busybox, cases, init):
     entries = [(name, stat.S_IFDIR | 0o755, b"", (0, 0))
-               for name in ("bin", "dev", "proc", "sys", "run", "tmp")]
+               for name in ("bin", "cases", "dev", "proc", "sys", "run", "tmp")]
     entries.extend([
         ("dev/console", stat.S_IFCHR | 0o600, b"", (5, 1)),
         ("dev/null", stat.S_IFCHR | 0o666, b"", (1, 3)),
         ("bin/busybox", stat.S_IFREG | 0o755, busybox.read_bytes(), (0, 0)),
         ("bin/sh", stat.S_IFLNK | 0o777, b"busybox", (0, 0)),
         ("init", stat.S_IFREG | 0o755, init, (0, 0)),
-        ("smoke", stat.S_IFREG | 0o755, smoke.read_bytes(), (0, 0)),
-        ("TRAILER!!!", 0, b"", (0, 0)),
     ])
     with path.open("wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as target:
         for inode, (name, mode, payload, device) in enumerate(entries, 1):
             cpio_entry(target, inode, name, mode, payload, device)
+        for index, case in enumerate(cases):
+            cpio_entry(target, len(entries) + index + 1, f"cases/{index}",
+                       stat.S_IFREG | 0o755, case["path"].read_bytes())
+        cpio_entry(target, len(entries) + len(cases) + 1, "TRAILER!!!", 0)
 
 
-def run_guest(state, args):
+def payloads(args):
+    if args.command == "run":
+        definitions = [{"name": args.smoke.name, "executable": str(args.smoke),
+                        "args": args.smoke_args}]
+        base = Path.cwd()
+    else:
+        manifest = args.manifest.resolve(strict=True)
+        definitions = load_json(manifest)
+        base = manifest.parent
+    if not isinstance(definitions, list) or not 1 <= len(definitions) <= 128:
+        raise RuntimeError("A suite must contain between 1 and 128 cases")
+    cases = []
+    total_bytes = 0
+    names = set()
+    for definition in definitions:
+        if not isinstance(definition, dict) or set(definition) != {"name", "executable", "args"}:
+            raise RuntimeError("Each case must contain exactly name, executable and args")
+        name, executable, arguments = (definition[key] for key in ("name", "executable", "args"))
+        if not isinstance(name, str) or not name or name in names:
+            raise RuntimeError("Case names must be nonempty and unique")
+        if not isinstance(executable, str) or not isinstance(arguments, list) or any(
+                not isinstance(value, str) or "\0" in value for value in arguments):
+            raise RuntimeError("Case executable and arguments must be strings without NUL")
+        path = (base / executable).resolve(strict=True)
+        static_x86_64(path)
+        total_bytes += path.stat().st_size
+        if total_bytes > 256 * 1024 * 1024:
+            raise RuntimeError("Combined payloads exceed the 256 MiB initramfs input limit")
+        names.add(name)
+        cases.append({"name": name, "path": path, "args": arguments, "sha256": sha256(path)})
+    return cases
+
+
+def run_guest(state, kernel, required_config, args):
     prepared = load_json(state / "prepared.json")
-    kernel = load_json(HERE / "linux-kernel.lock.json")
     if prepared["kernel"] != kernel:
         raise RuntimeError("Kernel lock changed; prepare a new state directory")
     if sha256(HERE / "debian-tools.lock.json") != prepared["tools_manifest_sha256"]:
@@ -296,18 +340,14 @@ def run_guest(state, args):
         if sha256(path) != prepared[key]:
             raise RuntimeError(f"Prepared artifact changed: {path}")
     if args.accel == "kvm" and not os.access("/dev/kvm", os.R_OK | os.W_OK):
-        raise RuntimeError("KVM access unavailable. Use process-local setpriv as documented, or explicitly select --accel tcg")
-    smoke = args.smoke.resolve(strict=True)
-    static_x86_64(smoke)
-    if smoke.stat().st_size > 256 * 1024 * 1024:
-        raise RuntimeError("Smoke executable exceeds the 256 MiB initramfs input limit")
-    smoke_hash = sha256(smoke)
+        raise RuntimeError("KVM access unavailable; explicitly select --accel tcg")
+    cases = payloads(args)
     run_id = uuid.uuid4().hex
     directory = state / "runs" / run_id
     directory.mkdir(parents=True)
     initramfs = directory / "initramfs.cpio.gz"
-    make_initramfs(initramfs, busybox, smoke,
-                   guest_init(kernel["release"], run_id, smoke_hash, args.smoke_timeout, args.smoke_args))
+    make_initramfs(initramfs, busybox, cases,
+                   guest_init(kernel["release"], required_config, run_id, cases, args.smoke_timeout))
     command = [
         str(qemu), "-machine", "q35", "-accel", args.accel,
         "-cpu", "host" if args.accel == "kvm" else "max",
@@ -323,8 +363,9 @@ def run_guest(state, args):
         "run_id": run_id, "status": "starting", "host_uname": list(platform.uname()),
         "kernel_package_sha256": kernel["package"]["sha256"],
         "kernel_image_sha256": prepared["kernel_image_sha256"],
-        "expected_guest_release": kernel["release"], "smoke": str(smoke),
-        "smoke_sha256": smoke_hash, "smoke_args": args.smoke_args,
+        "expected_guest_release": kernel["release"], "required_config": required_config,
+        "cases": [{"name": case["name"], "executable": str(case["path"]),
+                   "sha256": case["sha256"], "args": case["args"]} for case in cases],
         "initramfs_sha256": sha256(initramfs), "accelerator": args.accel,
         "cpus": args.cpus, "memory_mib": args.memory_mib,
         "smoke_timeout_seconds": args.smoke_timeout, "vm_timeout_seconds": args.vm_timeout,
@@ -354,18 +395,30 @@ def run_guest(state, args):
                     process.wait(timeout=5)
     text = serial.read_text(encoding="utf-8", errors="replace").replace("\r", "")
     releases = re.findall(rf"^RIVET_VM_UNAME {run_id} (.+)$", text, re.MULTILINE)
-    hashes = re.findall(rf"^RIVET_VM_SMOKE_SHA256 {run_id} ([0-9a-f]{{64}})$", text, re.MULTILINE)
+    hashes = re.findall(rf"^RIVET_VM_CASE_SHA256 {run_id} (\d+) ([0-9a-f]{{64}})$", text, re.MULTILINE)
+    executed = re.findall(rf"^RIVET_VM_CASE_EXEC {run_id} (\d+)$", text, re.MULTILINE)
+    results = re.findall(rf"^RIVET_VM_CASE_RESULT {run_id} (\d+) exit=(\d+)$", text, re.MULTILINE)
     exits = re.findall(rf"^RIVET_VM_RESULT {run_id} exit=(\d+)$", text, re.MULTILINE)
-    executed = f"RIVET_VM_EXEC {run_id}" in text.splitlines()
     finished = f"RIVET_VM_DONE {run_id}" in text.splitlines()
+    expected_indices = [str(index) for index in range(len(cases))]
     passed = (not timed_out and process.returncode == 0 and releases == [kernel["release"]]
-              and hashes == [smoke_hash] and exits == ["0"] and executed and finished)
+              and hashes == [(str(index), case["sha256"]) for index, case in enumerate(cases)]
+              and executed == expected_indices
+              and results == [(index, "0") for index in expected_indices]
+              and exits == ["0"] and finished)
+    for index, case in enumerate(report["cases"]):
+        key = str(index)
+        case.update({
+            "guest_hashes": [digest for case_index, digest in hashes if case_index == key],
+            "guest_exit_codes": [int(code) for case_index, code in results if case_index == key],
+            "executed": key in executed,
+        })
     report.update({
         "status": "passed" if passed else ("timed_out" if timed_out else "failed"),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "qemu_exit_code": process.returncode, "guest_releases": releases,
-        "guest_smoke_hashes": hashes, "guest_exit_codes": [int(code) for code in exits],
-        "guest_exec_observed": executed, "guest_finish_observed": finished,
+        "guest_exit_codes": [int(code) for code in exits],
+        "guest_case_executions": executed, "guest_finish_observed": finished,
     })
     save_json(report_path, report)
     print(text, end="")
@@ -374,29 +427,41 @@ def run_guest(state, args):
 
 
 def main():
+    kernels = load_json(HERE / "linux-kernel.lock.json")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--state", type=Path, default=DEFAULT_STATE, help="Isolated downloads/tools/reports directory")
+    parser.add_argument("--kernel", choices=kernels["kernels"], default=kernels["default"],
+                        help="Pinned guest selector; not an application version requirement")
+    parser.add_argument("--state", type=Path, help="Isolated downloads/tools/reports directory")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("prepare", help="Download, authenticate and extract only; never build or boot")
-    run = sub.add_parser("run", help="Boot the signed kernel and execute an existing static smoke ELF")
-    run.add_argument("--accel", choices=("kvm", "tcg"), default="kvm")
-    run.add_argument("--cpus", type=int, choices=range(1, 17), default=2)
-    run.add_argument("--memory-mib", type=int, default=2048)
-    run.add_argument("--smoke-timeout", type=int, default=120)
-    run.add_argument("--vm-timeout", type=int, default=240)
-    run.add_argument("smoke", type=Path)
-    run.add_argument("smoke_args", nargs=argparse.REMAINDER, help="Arguments passed verbatim to the smoke binary")
+    for name, help_text in (("run", "Execute one existing static ELF"),
+                            ("run-suite", "Execute a JSON suite of existing static ELFs in one boot")):
+        run = sub.add_parser(name, help=help_text)
+        run.add_argument("--accel", choices=("kvm", "tcg"), default="kvm")
+        run.add_argument("--cpus", type=int, choices=range(1, 17), default=2)
+        run.add_argument("--memory-mib", type=int, default=2048)
+        run.add_argument("--smoke-timeout", type=int, default=120)
+        run.add_argument("--vm-timeout", type=int, default=240)
+        if name == "run":
+            run.add_argument("smoke", type=Path)
+            run.add_argument("smoke_args", nargs=argparse.REMAINDER,
+                             help="Arguments passed verbatim to the binary")
+        else:
+            run.add_argument("manifest", type=Path,
+                             help="JSON cases; relative executable paths resolve from this file")
     args = parser.parse_args()
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         parser.error("Run inside x86_64 Debian 13 / WSL Debian, not directly under Windows")
-    state = args.state.expanduser().resolve()
+    selection = kernels["kernels"][args.kernel]
+    kernel = selection["artifact"]
+    state = (args.state or STATE_ROOT / f"linux-{args.kernel}").expanduser().resolve()
     if args.command == "prepare":
-        return prepare(state)
+        return prepare(state, kernel)
     if not 512 <= args.memory_mib <= 16384:
         parser.error("--memory-mib must be between 512 and 16384")
     if not 1 <= args.smoke_timeout <= 3600 or not args.smoke_timeout + 30 <= args.vm_timeout <= 7200:
         parser.error("Use smoke-timeout 1..3600 and vm-timeout at least 30 seconds longer, at most 7200")
-    return run_guest(state, args)
+    return run_guest(state, kernel, selection["required_config"], args)
 
 
 if __name__ == "__main__":
