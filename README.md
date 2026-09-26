@@ -146,6 +146,25 @@ async fn request(stream: &rivet::TcpStream) -> std::io::Result<()> {
 - `TcpStream::abort(self)` 显式选择 RST 式关闭，设置失败可观察；Linux／Android 会断开底层连接，宿主保留的 FD 别名不会延后中止。它不改变普通 Drop／半关闭的语义，也不提前释放在途发送的内核内存引用。
 - 原生 TCP socket 的正值 `SO_LINGER` 会阻塞关闭或导致非阻塞关闭失败，因此在接管及配置钩子后拒绝；不偷偷改成 abortive linger。
 
+## TCP 源地址绑定
+
+`TcpStream::connect_from(local, peer, options)` 显式选择出站 TCP 的本地 IP／端口，返回与普通建连相同的惰性 `Connect` Future：
+
+```rust
+use rivet::{SocketOptions, TcpStream};
+use std::{io, net::SocketAddr};
+
+async fn connect_bound(local: SocketAddr, peer: SocketAddr) -> io::Result<TcpStream> {
+    TcpStream::connect_from(local, peer, SocketOptions::default()).await
+}
+```
+
+- 本地端口 `0` 由系统分配；非零端口按原值绑定。本地和对端必须同属 IPv4 或 IPv6，族不一致在首次 poll 时、宿主 hook／原生 socket 创建前返回 `InvalidInput`。
+- bind 失败原样返回错误，不以默认源地址重试。Linux direct-descriptors 路径也释放已经分配的固定描述符槽，失败不能持续吞掉准入额度。
+- `connect`／`connect_with_options` 保留自动源地址语义：Windows 仍执行 ConnectEx 所需的通配地址绑定，Linux／Android 不增加提前 bind。
+- 使用显式入口时，hook 负责保护、出口接口设置等宿主配置，不再自行 bind／connect。Android 先完成 protect 和指定 Network 绑定，再绑定本地地址。
+- UDP 和 listener 继续使用已有的本地地址参数；`SocketOptions` 不增加第二个地址来源，导入的 socket 不重新绑定。取消已提交连接仍按原生完成路径回收，不承诺固定源端口可以立即复用。
+
 ## UDP、接管与宿主接入
 
 `UdpSocket` 支持连接／非连接收发、来源地址、截断和可用的原始长度信息。`send_batch` 接受可复用的 `Datagram` 数组并保留每项结果及所有权；`recv_batch` 填入调用方空槽，收到至少一项即可返回，不等待填满。
@@ -207,9 +226,15 @@ cargo test --all-targets
 
 `runtime_services` 覆盖真实阻塞任务与异步网络并行、非 socket pipe／Windows event、任务组、计时器重置与周期、watch 最终值、受监督 echo／停止和对端 RST。相同场景也集成到 Android 普通 App。`cargo test --test signal_behavior` 在隔离子进程中验证真实退出信号及默认处理恢复，不向运行测试的宿主发送信号。
 
-`native_traits` 是仅使用 IPv4 回环的可执行代理场景：原生 `serve_until` 放置连接，泛型转发保留写半关闭后的反向响应；同时验证泛型 UDP 空报文／来源、`!Send` 本地任务输出、工厂投递、阻塞执行和计时器原位重置。它不建立外部连接，也不修改宿主 TUN、路由或 IPv6 设置。
+`native_traits` 是仅使用 IPv4 回环的可执行代理场景：原生 `serve_until` 放置连接，出站通过 `connect_from` 绑定 `127.0.0.2` 并在源站核验，泛型转发保留写半关闭后的反向响应；同时验证泛型 UDP 空报文／来源、`!Send` 本地任务输出、工厂投递、阻塞执行和计时器原位重置。它不建立外部连接，也不修改宿主 TUN、路由或 IPv6 设置。
 
-本次原生 trait 验证：Windows IPv4 模式下 124 项回归通过，`native_traits` 默认双 worker／单 worker 与原有 `loopback` 均通过；严格 Clippy、rustdoc 和变更 Rust 文件格式检查通过。Linux x86_64 GNU／musl、Android ARM64／x86_64、Windows GNU 完成所有 feature／target 的编译检查；这些检查不代替原生执行。本次没有执行 IPv6 连通性或 Linux／Android 原生场景，没有修改宿主 TUN／网络设置。
+本次 TCP 源地址绑定验证：
+
+- Windows：IPv4 模式下 128 项回归通过，`native_traits` 实际代理确认源地址与写半关闭后的反向响应。
+- Linux：隔离 `7.2.7-arch1-1` guest 的 4 项绑定回归覆盖普通、fixed-files、direct-descriptors；`native_traits --enable direct-descriptors` 实跑通过。guest 使用 TCG、无外部 NIC，仅操作自身 IPv4 回环。
+- 静态检查：Clippy／rustdoc 将警告视为错误；新增回归和修改后的代理示例通过格式检查。Linux x86_64 GNU／musl、Android ARM64／x86_64、Windows GNU 完成 `--all-features --all-targets` 编译检查，Linux GNU 另通过无 feature 检查。
+
+本次未执行 IPv6 连通性或 Android 原生场景；Android 编译检查不代替原生执行。未修改宿主 TUN、路由或 IPv6 设置。
 
 Windows 主机明确只允许 IPv4 时，可为**验证进程**设置 `RIVET_VERIFY_IPV4_ONLY=1`。相关测试／示例明确打印未执行 IPv6；默认仍测试两个地址族，生产库不读取此变量。
 

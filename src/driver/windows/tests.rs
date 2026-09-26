@@ -39,7 +39,12 @@ fn one_completion_budget_services_overlapped_before_rio_backlog_drains() {
     driver.accept_capacity(listener.id, 1).unwrap();
     let outside_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     driver
-        .connect(Token(2), outside_listener.local_addr().unwrap(), &options)
+        .connect(
+            Token(2),
+            outside_listener.local_addr().unwrap(),
+            None,
+            &options,
+        )
         .unwrap();
     let mut events = Vec::new();
     driver.service(&mut events, &mut 0);
@@ -154,6 +159,7 @@ fn synchronous_continuation_failure_returns_accepted_prefix_and_retry_sends_only
         .connect(
             Token(1),
             listener.local_addr().unwrap(),
+            None,
             &SocketOptions::default(),
         )
         .unwrap();

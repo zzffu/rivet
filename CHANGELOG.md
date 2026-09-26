@@ -2,10 +2,14 @@
 
 ## 0.1.0
 
+- 新增 `TcpStream::connect_from(local, peer, options)`，在惰性建连时显式绑定源 IP／端口；端口 0 由系统分配，非零端口保持指定值，地址族不匹配在原生 socket／hook 之前拒绝，绑定失败不回退到自动源地址。原有 TCP 自动选源与 UDP 绑定接口不变。
+- Windows 在显式源地址和默认通配地址之间二选一，只执行一次 ConnectEx 前置绑定；Linux／Android 仅在请求显式源地址时增加绑定。Linux direct-descriptors 绑定失败同时回收固定文件槽和导出 FD，保留原有建连完成／取消生命周期；hook 继续负责 protect／接口配置，不负责绑定。
+- 新增源地址／端口、惰性构造、双向地址族误配及连续绑定失败后的资源复用回归；更新系统架构、实现契约和 `native_traits`，由代理源站核验 `127.0.0.2` 及写半关闭后的完整反向响应。
+- 本次源地址绑定验证：Windows IPv4 模式 128 项回归与代理实跑通过；隔离 Linux 7.2.7 guest 的 4 项绑定回归覆盖普通／fixed-files／direct-descriptors，严格启用 direct-descriptors 的代理实跑通过。严格 Clippy／rustdoc、Linux GNU／musl、Android ARM64／x86_64、Windows GNU 跨目标检查及 Linux 无 feature 检查通过；本次未执行 IPv6 连通性或 Android 原生场景，未修改宿主 TUN／网络设置。
 - 新增开放的 Rivet 原生流／数据报收发 trait，直接复用拥有型缓冲区、原生 Future 和发送分组；包含惰性 flush 与异步写半关闭，保留接收等待者冲突、取消、输入字节计数和租约回收契约，不引入逐操作装箱或 payload 复制。
 - 新增 `LocalSpawn`、`Spawn`、`BlockingSpawn`、`Timer` 与无状态 `Current` 入口；保留 `!Send` 本地 Future、工厂跨 worker 投递、原生任务句柄／错误及 `Sleep::reset`。Connector／Acceptor 和代理策略仍由上层定义。
 - 新增 `native_traits` IPv4 回环代理示例和 flush／半关闭生命周期回归；泛型双向转发保留请求 EOF 后的反向响应，并覆盖数据报、任务执行和可重置计时。补充系统架构、接口契约和使用文档。
-- 本次原生 trait 验证在 TUN／IPv6 阻断保持不变的条件下进行：Windows IPv4 模式 124 项回归通过，默认双 worker／单 worker 代理与原有 loopback 通过；严格 Clippy、rustdoc、变更 Rust 文件格式检查及 Linux GNU／musl、Android ARM64／x86_64、Windows GNU 跨目标检查通过。本次未执行 IPv6 连通性或 Linux／Android 原生运行。
+- 原生 trait 初次验证在 TUN／IPv6 阻断保持不变的条件下进行：Windows IPv4 模式 124 项回归通过，默认双 worker／单 worker 代理与原有 loopback 通过；严格 Clippy、rustdoc、变更 Rust 文件格式检查及 Linux GNU／musl、Android ARM64／x86_64、Windows GNU 跨目标检查通过。当时未执行 IPv6 连通性或 Linux／Android 原生运行。
 - 修复 Android 导入 TCP 仍有宿主 FD 别名时 `abort` 不能立即中止连接的问题；使用 `AF_UNSPEC` 断开底层 TCP，补充 IPv4／IPv6 保留别名时的真实 RST 回归。
 - 修复信号 Waker 同步销毁等待任务及最后订阅时的重入死锁；改用单等待者 `AtomicWaker`，取消等待注销 Waker 但保留待处理信号，补充隔离子进程销毁／重新订阅回归。
 - 新增按需启动的有界阻塞池，区分排队取消与运行中工作，Runtime 停止时保留额度、清理责任和原生线程 join。

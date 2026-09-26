@@ -16,6 +16,16 @@ This document specifies the internal ownership and completion contracts. The sys
 
 `ImportError { error: io::Error, socket: OwnedSocket }` returns ownership on import failure. `SocketOptions` is cloneable, contains ordinary TCP/UDP options, an optional Android network handle, and an optional `Arc<dyn SocketHook>` invoked before connect or the first send. `SocketHook::configure(BorrowedSocket<'_>) -> io::Result<()>` is synchronous, Send + Sync, and may not close or retain ownership of the borrowed handle. Android Network binding and protection failures stop connection establishment.
 
+## Outbound TCP source binding
+
+`TcpStream::connect_from(local: SocketAddr, peer: SocketAddr, options: SocketOptions) -> Connect` selects the local endpoint explicitly. The same lazy native future backs `connect` and `connect_with_options`, which carry `None`; the new method carries `Some(local)`. No socket, hook or bind occurs at construction. On first poll, the common interface rejects mismatched local/peer address families with `InvalidInput` before allocating a native socket or invoking the hook. Port zero requests ephemeral allocation; a specified port is preserved. Native bind errors are returned without retry or fallback.
+
+The local address travels separately from shared `SocketOptions` through `Core::connect(driver, peer, local, options, waker)` and `Driver::connect(token, peer, local, options)`. UDP/listener binding arguments and import ownership remain unchanged. Hooks used with explicit source binding configure host protection/interface options but must not perform their own bind or connect.
+
+Windows configures the new registered-I/O socket and binds either the explicit address or the existing wildcard before ConnectEx, never both. Linux optionally binds after socket/hook setup and before submitting the io_uring connect; no local address means no explicit bind. Android optionally binds only after the existing protect hook, Android Network binding and option setup, before its nonblocking connect.
+
+Binding failures occur before publishing the socket or submitting connect. Ordinary owning handles are dropped; a Linux direct-descriptor creation additionally unregisters its already-allocated fixed-file slot using the existing failure cleanup pattern. Core removes its allocated connect operation on synchronous driver rejection. Repeated bind failures under small capacities must not exhaust socket, operation or fixed-file admission. In-flight cancellation and local-endpoint reporting reuse the existing native completion path; cancellation does not promise immediate fixed-port reuse.
+
 ## Buffer seam
 
 The buffer implementation provides:
@@ -74,7 +84,7 @@ Required methods:
 - `Driver::capabilities(&self) -> &CapabilityReport`.
 - `Driver::listen(&mut self, addr: SocketAddr, options: &SocketOptions) -> io::Result<SocketInfo>`.
 - `Driver::bind_udp(&mut self, addr: SocketAddr, peer: Option<SocketAddr>, options: &SocketOptions) -> io::Result<SocketInfo>`.
-- `Driver::connect(&mut self, token: Token, addr: SocketAddr, options: &SocketOptions) -> io::Result<()>`.
+- `Driver::connect(&mut self, token: Token, addr: SocketAddr, local: Option<SocketAddr>, options: &SocketOptions) -> io::Result<()>`.
 - `Driver::import(&mut self, socket: OwnedSocket, kind: SocketKind, options: &SocketOptions) -> Result<SocketInfo, ImportError>`.
 - `Driver::take_idle_socket(&mut self, socket: SocketId) -> io::Result<OwnedSocket>`; internal new-connection dispatch only, fails for active I/O or queued receive data.
 - `Driver::start_accept(&mut self, socket: SocketId, token: Token) -> io::Result<()>`.

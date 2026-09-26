@@ -20,6 +20,10 @@ pub type RawSocket = std::os::windows::io::RawSocket;
 /// The handle is borrowed. Implementations must not close it, retain ownership,
 /// perform network I/O on it, or change it after returning. Host-side effects
 /// cannot be rolled back by Rivet if a later setup step fails.
+///
+/// With [`TcpStream::connect_from`](crate::net::TcpStream::connect_from), hooks
+/// run before Rivet binds the explicit local endpoint. They must not bind or
+/// connect the socket themselves; Rivet owns those steps.
 pub trait SocketHook: Send + Sync + 'static {
     fn configure(&self, socket: BorrowedSocket<'_>) -> io::Result<()>;
 }

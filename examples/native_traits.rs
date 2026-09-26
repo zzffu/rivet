@@ -116,9 +116,16 @@ where
 async fn proxy_roundtrip<L: LocalSpawn>(executor: &L, pool: &BufferPool) -> io::Result<()> {
     let origin = TcpListener::bind(local())?;
     let origin_address = origin.local_addr();
+    let outbound_source = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), 0));
     let origin_task = executor
         .spawn_local(async move {
             let stream = origin.accept().await?;
+            require(
+                stream
+                    .peer_addr()
+                    .is_some_and(|peer| peer.ip() == outbound_source.ip()),
+                "origin did not observe the requested proxy source address",
+            )?;
             respond(&stream, &runtime::buffer_pool()?).await
         })
         .map_err(failed)?;
@@ -144,7 +151,18 @@ async fn proxy_roundtrip<L: LocalSpawn>(executor: &L, pool: &BufferPool) -> io::
                                 // Setup/routing belongs here, outside the generic transfer code.
                                 // serve_until already placed this unused connection on its worker.
                                 let transfer = async {
-                                    let outgoing = TcpStream::connect(origin_address).await?;
+                                    let outgoing = TcpStream::connect_from(
+                                        outbound_source,
+                                        origin_address,
+                                        SocketOptions::default(),
+                                    )
+                                    .await?;
+                                    let actual_source = outgoing.local_addr();
+                                    require(
+                                        actual_source.ip() == outbound_source.ip()
+                                            && actual_source.port() != 0,
+                                        "proxy connection did not retain its selected source",
+                                    )?;
                                     try_join(
                                         forward(&incoming, &outgoing),
                                         forward(&outgoing, &incoming),
@@ -183,7 +201,8 @@ async fn proxy_roundtrip<L: LocalSpawn>(executor: &L, pool: &BufferPool) -> io::
     stop.cancel();
     serving.await.map_err(failed)??;
     println!(
-        "TCP proxy: {request} request bytes, {response} response bytes after write EOF; supervised workers joined"
+        "TCP proxy: source={}, {request} request bytes, {response} response bytes after write EOF; supervised workers joined",
+        outbound_source.ip()
     );
     Ok(())
 }

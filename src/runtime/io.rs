@@ -259,6 +259,7 @@ impl IoState {
         &mut self,
         driver: &mut Driver,
         address: SocketAddr,
+        local: Option<SocketAddr>,
         options: &crate::socket::SocketOptions,
         waker: &Waker,
     ) -> io::Result<Token> {
@@ -268,7 +269,7 @@ impl IoState {
             waker: Some(waker.clone()),
             abandoned: false,
         }))?;
-        if let Err(error) = driver.connect(token, address, options) {
+        if let Err(error) = driver.connect(token, address, local, options) {
             self.operations.remove(token.0);
             return Err(error);
         }

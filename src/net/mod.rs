@@ -259,11 +259,31 @@ impl TcpStream {
     pub fn connect_with_options(address: SocketAddr, options: SocketOptions) -> Connect {
         Connect {
             address,
+            local: None,
             options,
             owner: None,
             token: None,
             done: false,
         }
+    }
+    /// Connect to `peer` using an explicit local IP address and port.
+    ///
+    /// Setup is lazy and worker-local: no native socket, hook or bind occurs
+    /// until the returned future is first polled in a Rivet worker. Dropping
+    /// an unpolled future has no native side effects.
+    ///
+    /// A local port of zero requests an ephemeral port; a nonzero port is used
+    /// exactly. Bind errors propagate without falling back to another endpoint.
+    /// After the usual worker and option checks, mismatched local/peer address
+    /// families return [`io::ErrorKind::InvalidInput`] before socket creation
+    /// or hook invocation.
+    ///
+    /// Any [`SocketOptions::hook`] must only configure host protection or
+    /// interface options; it must not bind or connect the socket itself.
+    pub fn connect_from(local: SocketAddr, peer: SocketAddr, options: SocketOptions) -> Connect {
+        let mut connect = Self::connect_with_options(peer, options);
+        connect.local = Some(local);
+        connect
     }
     pub fn import(socket: OwnedSocket, options: SocketOptions) -> Result<Self, ImportError> {
         Socket::import(socket, SocketKind::TcpStream, options).map(|socket| Self { socket })
@@ -352,6 +372,7 @@ impl StreamShutdown for TcpStream {
 #[must_use = "connections start when polled"]
 pub struct Connect {
     address: SocketAddr,
+    local: Option<SocketAddr>,
     options: SocketOptions,
     owner: Option<Rc<Worker>>,
     token: Option<Token>,
@@ -364,6 +385,15 @@ impl Future for Connect {
         if self.owner.is_none() {
             match runtime::current().and_then(|owner| {
                 self.options.validate()?;
+                if self
+                    .local
+                    .is_some_and(|local| local.is_ipv4() != self.address.is_ipv4())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "TCP local and peer address families differ",
+                    ));
+                }
                 Ok(owner)
             }) {
                 Ok(owner) => self.owner = Some(owner),
@@ -378,6 +408,7 @@ impl Future for Connect {
             match owner.io.borrow_mut().connect(
                 &mut owner.driver.borrow_mut(),
                 self.address,
+                self.local,
                 &self.options,
                 cx.waker(),
             ) {

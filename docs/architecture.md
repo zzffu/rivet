@@ -223,6 +223,36 @@ Unix 仅接管默认／忽略 disposition，遇到现有自定义 handler 返回
 
 验收使用真实回环代理：泛型双向转发、请求写半关闭后仍返回响应、flush 上下文错误、未轮询关闭无副作用、数据报空包和元数据，以及本地任务、自动放置工厂、阻塞执行和可重置计时。已有取消、发送分组、额度与回收回归继续执行。宿主使用 TUN 且阻断 IPv6 时，验证进程设置 `RIVET_VERIFY_IPV4_ONLY=1`，仅运行 IPv4 回环并明确记录 IPv6 未执行；不更改 TUN、路由、代理或 IPv6 阻断，也不让生产库读取这个验证开关。
 
+### 8.10 出站 TCP 显式本地绑定
+
+#### 8.10.1 Interface 与范围
+
+新增 `TcpStream::connect_from(local: SocketAddr, peer: SocketAddr, options: SocketOptions) -> Connect`，明确本地 IP／端口，不把本地地址放进 TCP／UDP／listener 共用的 `SocketOptions`。本地端口 `0` 表示由系统分配；指定非零端口时不得悄悄改为其他端口。`connect`／`connect_with_options` 继续表示未显式选择本地地址，并使用同一个拥有型 `Connect` Future。
+
+构造 Future 不创建 socket、不运行 hook、不执行 bind；首次 poll 才在当前 worker 验证选项及本地／对端地址族。族不一致返回 `InvalidInput`，在原生 socket 创建和宿主 hook 之前停止。真实 bind 错误直接向调用方传播，不以默认源地址重试，不改宿主接口或路由。UDP 的 `bind_with_options(local, ...)`／`bind_connected(local, peer, ...)` 和 listener 的绑定参数仍是其唯一地址来源；接管已有 socket 不重绑。
+
+#### 8.10.2 数据流与原生绑定顺序
+
+`Connect` 保存一个 `Option<SocketAddr>`，经 `runtime::io::Core::connect` 传给平台 `Driver::connect(token, peer, local, options)`；`None` 保留原有行为，`Some` 只要求一次显式原生 bind，不增加任务、队列、分配或另一套建连 Implementation。
+
+| 平台 | 未指定本地地址 | 指定本地地址 |
+| --- | --- | --- |
+| Windows | socket 配置／hook → 通配地址 bind → ConnectEx | socket 配置／hook → 指定地址 bind → ConnectEx |
+| Linux | socket 配置／hook → io_uring connect，不提前 bind | socket 配置／hook → 指定地址 bind → io_uring connect |
+| Android | protect／宿主 hook → Network／socket 配置 → connect | protect／宿主 hook → Network／socket 配置 → 指定地址 bind → connect |
+
+显式绑定调用中的 hook 只负责保护、接口设置等宿主配置，不再调用 bind 或 connect。Windows 不再在指定源地址之后另做通配地址绑定。Linux／Android 的无源地址路径不增加 bind，保留内核原有的自动源地址和端口分配时机。完成后的 `local_addr` 与对端观察的来源必须反映实际内核端点。
+
+#### 8.10.3 失败、取消与资源
+
+绑定发生在 socket 发布及原生 connect 提交之前。普通 FD／Windows socket／Android FD 在失败时通过既有所有权回收；Linux direct-descriptors 在创建阶段已经占用固定描述符槽，bind 失败还必须注销该槽，不能只关闭临时导出的 FD。Core 在 Driver 同步拒绝时释放连接操作额度。错误不发布半初始化连接，不影响后续正常准入。
+
+已提交连接仍使用原有代际 token、取消、完成处理和关闭回收路径；未轮询 Future 的丢弃没有原生副作用。已绑定后取消不承诺立即复用固定源端口，内核可能仍在收敛请求或保持 TCP 状态；应用不能绕过真实完成重用原生资源。
+
+#### 8.10.4 验收与环境约束
+
+真实回环验证源 IP／端口及数据传输；错误地址族须在 hook 之前拒绝，未轮询取消不能产生绑定，已占用源端口必须失败且不能回退，低容量下重复失败后仍能成功建连。Linux 普通、fixed-files、direct-descriptors 分别执行，以证明绑定及错误回收不是只覆盖一个创建分支。Windows 和 Linux 7.2.7 隔离 guest 执行 IPv4 场景；保留 IPv6 源地址类型及测试能力，但本机验证不进行 IPv6 连通性测试。Android执行编译检查，设备原生证据独立记录。不得修改现有 TUN、IPv6 阻断、宿主路由、DNS 或网络接口。
+
 ## 9. 验证
 
 - Windows 实际 RIO/IOCP TCP/UDP、IPv4/IPv6、接管、超时、关闭和数据完整性。

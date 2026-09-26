@@ -232,6 +232,7 @@ impl Driver {
         &mut self,
         token: Token,
         addr: SocketAddr,
+        local: Option<SocketAddr>,
         options: &SocketOptions,
     ) -> io::Result<()> {
         self.check_creation()?;
@@ -245,6 +246,9 @@ impl Driver {
             options,
             false,
         )?;
+        if let Some(local) = local {
+            socket::bind(socket.as_raw_fd(), local)?;
+        }
         let ready = socket::connect(socket.as_raw_fd(), addr)?;
         let info = self
             .insert_socket(socket, SocketKind::TcpStream, options.clone())

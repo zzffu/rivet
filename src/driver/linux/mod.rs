@@ -1753,10 +1753,20 @@ impl Driver {
         &mut self,
         token: Token,
         addr: SocketAddr,
+        local: Option<SocketAddr>,
         options: &SocketOptions,
     ) -> io::Result<()> {
         net::validate_address(addr, true)?;
         let (fd, direct) = self.create(addr, SocketKind::TcpStream, options)?;
+        if let Some(local) = local
+            && let Err(error) = socket2::SockRef::from(&fd).bind(&local.into())
+        {
+            #[cfg(feature = "direct-descriptors")]
+            if let Some(index) = direct {
+                self.fixed.as_mut().unwrap().remove(&self.ring, index)?;
+            }
+            return Err(error);
+        }
         let info = self
             .add_socket(fd, SocketKind::TcpStream, options, direct)
             .map_err(|error| error.error)?;

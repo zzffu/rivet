@@ -531,20 +531,21 @@ impl Driver {
         &mut self,
         token: Token,
         addr: SocketAddr,
+        local: Option<SocketAddr>,
         options: &SocketOptions,
     ) -> io::Result<()> {
         self.room_for_operation(token)?;
         self.room_for_socket()?;
         let socket = sys::new_socket(addr, SocketKind::TcpStream)?;
         sys::configure(&socket, SocketKind::TcpStream, options, true)?;
-        let wildcard: SocketAddr = if addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        }
-        .parse()
-        .unwrap();
-        socket.bind(&SockAddr::from(wildcard))?;
+        let bind_address = local.unwrap_or_else(|| {
+            if addr.is_ipv4() {
+                SocketAddr::from(([0; 4], 0))
+            } else {
+                SocketAddr::from(([0; 8], 0))
+            }
+        });
+        socket.bind(&SockAddr::from(bind_address))?;
         let connect: LPFN_CONNECTEX =
             unsafe { sys::extension(socket.as_raw_socket() as _, &WSAID_CONNECTEX)? };
         let connect =
