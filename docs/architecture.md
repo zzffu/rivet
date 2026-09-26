@@ -2,7 +2,7 @@
 
 ## 1. 范围与不可变约束
 
-Rivet 是 Rust 原生网络异步运行时。Linux 基线为 7.2.7，Windows 使用 RIO + IOCP，Android 普通应用使用 epoll 和非阻塞 socket。公开 Interface 使用标准 `Future`，不依赖 Tokio，不提供 TLS、DNS、HTTP、QUIC、RPC 编解码、原生异步文件 I/O、用户态协议栈、DMA-BUF 或 BPF 执行。同步文件及 FFI 工作可交给有界阻塞执行通道。
+Rivet 是 Rust 原生网络异步运行时。Linux 最低支持稳定内核 7.2.7，支持该版本及后续稳定版本；Windows 使用 RIO + IOCP，Android 普通应用使用 epoll 和非阻塞 socket。公开 Interface 使用标准 `Future`，不依赖 Tokio，不提供 TLS、DNS、HTTP、QUIC、RPC 编解码、原生异步文件 I/O、用户态协议栈、DMA-BUF 或 BPF 执行。同步文件及 FFI 工作可交给有界阻塞执行通道。
 
 支持 IPv4/IPv6、TCP 客户端与服务端、UDP connected/unconnected、批量数据报、分段发送、外部 socket 接管以及 Android Network/VPN 接入。广播和组播不在交付范围内。TCP splice 是纯字节流透明转发优化，不是文件 I/O 或协议代理框架。
 
@@ -12,13 +12,19 @@ Rivet 是 Rust 原生网络异步运行时。Linux 基线为 7.2.7，Windows 使
 
 ## 2. 平台支持
 
-| 平台 | 支持基线 | Implementation |
+| 平台 | 最低支持版本（含） | Implementation |
 | --- | --- | --- |
-| Linux | 7.2.7+；x86_64、aarch64 | 项目内 7.2.7 UAPI、SQ/CQ、资源注册和网络状态机 |
-| Windows | Windows 11 / Server 2022+；x86_64 | 注册缓冲区 RIO，IOCP 通知及 overlapped 连接/接受 |
-| Android | API 29+；arm64-v8a，x86_64 验证目标 | epoll、非阻塞 socket、libandroid Network 绑定、宿主保护回调 |
+| Linux x86_64、aarch64 | 稳定内核 7.2.7 及后续版本；不支持 RC | 以 7.2.7 UAPI 定义为依据的项目内 SQ/CQ、资源注册和网络状态机 |
+| Windows x86_64 | Windows 10／Server 2016 及后续版本（当前 Rust 目标基线）；不额外校验 OS 版本号 | 注册缓冲区 RIO，IOCP 通知及 overlapped 连接/接受 |
+| Android arm64-v8a；x86_64 验证目标 | API 23 及后续版本 | epoll、非阻塞 socket、libandroid Network 绑定、宿主保护回调 |
 
-Linux 不维护 6.x 兼容 Implementation，不自动退到 epoll。Android 不尝试调用 io_uring。平台通过条件编译选择，不在每次网络操作上进行平台动态分派。
+这里声明最低版本及后续版本的支持范围，不将运行环境锁定到某个精确版本。Linux／Android 初始化检查各自版本下限；Windows 按原生能力初始化，不读取 OS 版本号。达到工具链及平台下限不保证可选优化、权限或硬件资源可用。公开 Rust `Future` Interface 的兼容性不替代底层 OS/ABI 契约。项目内 UAPI 定义的参考版本、验证 runner 固定的 guest 版本和实际验证记录各有用途，不能把它们混同为唯一支持版本，也不能用支持范围冒充已完成的原生验证。
+
+Linux 不支持低于 7.2.7 的内核或 RC，也不自动退到 epoll。Android 不尝试调用 io_uring。平台通过条件编译选择，不在每次网络操作上进行平台动态分派。
+
+Windows RIO 的接口引入版本为 Windows 8／Server 2012，但这不是本包的工具链或验证基线。Rust 1.77 的常规 MSVC 目标基线包含 Win8；Rust 1.78 起不再覆盖它。本包要求 Rust 1.98／edition 2024，遵循当前 Windows 10／Server 2016 目标基线，不承诺 Win8。后端不设置 OS 版本／build 门禁，直接初始化 Winsock 2.2、registered-I/O socket、RIO／IOCP 及连接扩展；原生能力缺失或资源失败仍显式报错，不降级为其他后端。
+
+Android 保留 API23 引入的 `android_setsocknetwork`，启动时通过 API23 可用的系统属性接口读取 `ro.build.version.sdk`，拒绝低于 23 或无法判定版本的环境。不能直接强链接 API29 的 `android_get_device_api_level` 再用它判断旧系统版本。验证应用的构建与安装下限同步为 API23；可选 UDP offload 仍按实际内核能力与策略决定。
 
 ## 3. Module 与职责
 
@@ -113,7 +119,7 @@ Cargo features 只决定构建内容。`linux-full` 是编译聚合，不是运�
 
 显式启用优化默认 `RequireCapability`。`Off` 不要求该项能力；`Auto` 必须显式选择，才允许回到正常路径。报告区分 compiled、supported、enabled、inactive reason，以及可选的实际复制统计。未实现的功能不得被报告为支持。
 
-Linux 基础能力低于 7.2.7，或 io_uring 整体不可用时，初始化失败。ZC `Auto` 可以选择普通 io_uring 数据路径，不能悄悄替换平台后端。`RequireCapability` 要求能力/资源成立，不承诺内核每个请求都不复制。
+Linux 内核低于 7.2.7、版本为 RC，或 io_uring 整体不可用时，初始化失败。ZC `Auto` 可以选择普通 io_uring 数据路径，不能悄悄替换平台后端。`RequireCapability` 要求能力/资源成立，不承诺内核每个请求都不复制。
 
 ### 6.1 优化目录
 
@@ -281,10 +287,10 @@ Unix 仅接管默认／忽略 disposition，遇到现有自定义 handler 返回
 ## 9. 验证
 
 - Windows 实际 RIO/IOCP TCP/UDP、IPv4/IPv6、接管、超时、关闭和数据完整性。
-- Linux 7.2.7 实际 syscall 与网络路径；分别验证各优化和合法组合。
+- Linux 实际 syscall 与网络路径；记录实际内核版本，分别验证各优化和合法组合，不将单个版本的结果扩展为整个支持范围的实测证明。
 - 真实 RX ZC 需要相应网卡/驱动；NODEV 仅验证该内核 Interface 的复制接收与回收流程。
 - Android 在普通 App 进程内验证，不能用 root/adb shell 成功替代。
 - 特性开关不改变字节流/数据报语义；失败、取消和资源压力不产生提前回收、重复发送、丢失唤醒或句柄重复关闭。
 - 同资源预算下测量小消息、大块 TCP、UDP、混跑和空闲唤醒；不得捏造未测性能。
 
-现有本机 Windows 可运行验证；WSL 6.18 不满足 Linux 基线，须使用隔离的 7.2.7 环境或用户升级后的主机。不得擅自升级用户 VPS 或更改现有 WSL 全局内核。Android 使用专用验证应用和隔离模拟器，不改变用户现有 VPN 配置。
+现有本机 Windows 可运行验证；WSL 6.18 低于 Linux 最低支持版本，须使用满足 7.2.7 下限的稳定内核环境。仓库验证 runner 固定使用 7.2.7 guest 以便复现，这不限制后端只能在该版本运行。不得擅自升级用户 VPS 或更改现有 WSL 全局内核。Android 使用专用验证应用和隔离模拟器，不改变用户现有 VPN 配置。

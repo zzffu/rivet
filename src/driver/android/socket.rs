@@ -11,15 +11,22 @@ unsafe extern "C" {
     fn android_setsocknetwork(network: u64, fd: libc::c_int) -> libc::c_int;
 }
 
-unsafe extern "C" {
-    fn android_get_device_api_level() -> libc::c_int;
-}
-
 pub(super) fn require_api() -> io::Result<()> {
-    if unsafe { android_get_device_api_level() } < 29 {
+    // Match the NDK's pre-29 inline implementation without importing its API 29 symbol.
+    let mut value = [0u8; libc::PROP_VALUE_MAX as usize];
+    // SAFETY: the property name is NUL-terminated and value has the required capacity.
+    let length = unsafe {
+        libc::__system_property_get(c"ro.build.version.sdk".as_ptr(), value.as_mut_ptr().cast())
+    };
+    let api_level = value
+        .get(..length as usize)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|text| text.parse::<u32>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Android API level"))?;
+    if api_level < 23 {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "Android API 29 or later is required",
+            "Android API 23 or later is required",
         ))
     } else {
         Ok(())

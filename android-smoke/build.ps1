@@ -37,15 +37,15 @@ $oldLinker = [Environment]::GetEnvironmentVariable($linkerName, 'Process')
 try {
     $env:ANDROID_NDK_HOME = $ndk
     $env:CARGO_TARGET_DIR = Join-Path $root 'build/cargo'
-    [Environment]::SetEnvironmentVariable($linkerName, "$toolchain/bin/${target}29-clang.cmd", 'Process')
+    [Environment]::SetEnvironmentVariable($linkerName, "$toolchain/bin/${target}23-clang.cmd", 'Process')
     Invoke-Checked 'cargo' @('build', '--manifest-path', "$root/native/Cargo.toml", '--target', $target, '--release')
     Invoke-Checked (JavaTool 'javac') @('--release', '17', '-classpath', $androidJar,
         '-d', "$out/classes", "$root/app/src/main/java/dev/rivet/smoke/MainActivity.java",
         "$root/app/src/main/java/dev/rivet/smoke/SmokeResult.java")
     Invoke-Checked (JavaTool 'jar') @('--create', '--file', "$out/classes.jar", '-C', "$out/classes", '.')
-    Invoke-Checked "$tools/d8.bat" @('--lib', $androidJar, '--min-api', '29', '--output', "$out/dex", "$out/classes.jar")
+    Invoke-Checked "$tools/d8.bat" @('--lib', $androidJar, '--min-api', '23', '--output', "$out/dex", "$out/classes.jar")
     Invoke-Checked "$tools/aapt2.exe" @('link', '--manifest', "$root/app/src/main/AndroidManifest.xml",
-        '-I', $androidJar, '--min-sdk-version', '29', '--target-sdk-version', '37', '-o', "$out/base.apk")
+        '-I', $androidJar, '--min-sdk-version', '23', '--target-sdk-version', '37', '-o', "$out/base.apk")
     Copy-Item "$out/base.apk" "$out/unaligned.apk" -Force
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -70,9 +70,10 @@ try {
     }
     $apk = "$out/rivet-smoke.apk"
     Invoke-Checked "$tools/apksigner.bat" @('sign', '--ks', $keystore, '--ks-key-alias', 'smoke', '--ks-pass', 'pass:android',
-        '--key-pass', 'pass:android', '--min-sdk-version', '29', '--out', $apk, "$out/aligned.apk")
+        '--key-pass', 'pass:android', '--min-sdk-version', '23', '--v1-signing-enabled', 'true',
+        '--out', $apk, "$out/aligned.apk")
     Invoke-Checked "$tools/zipalign.exe" @('-c', '-P', '16', '4', $apk)
-    Invoke-Checked "$tools/apksigner.bat" @('verify', '--verbose', $apk)
+    Invoke-Checked "$tools/apksigner.bat" @('verify', '--verbose', '--min-sdk-version', '23', $apk)
     Write-Output "APK: $apk"
     Write-Output 'Launch dev.rivet.smoke/.MainActivity in an isolated emulator; results appear on screen and files/smoke-result.json.'
 } finally {

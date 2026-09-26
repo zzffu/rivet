@@ -24,7 +24,7 @@ fn main() {
         .join(if cfg!(windows) { "clang.exe" } else { "clang" });
     let object = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("jni.o");
     let status = Command::new(clang)
-        .arg(format!("--target={target}29"))
+        .arg(format!("--target={target}23"))
         .arg(format!("--sysroot={}", toolchain.join("sysroot").display()))
         .args(["-fPIC", "-O2", "-c", "src/jni.c", "-o"])
         .arg(&object)

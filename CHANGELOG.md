@@ -2,6 +2,15 @@
 
 ## 0.1.0
 
+- 移除 Windows 11／Server 2022 的显式版本门禁，删除 `require_supported_windows`、`VersionInfo`、`RtlGetVersion` 声明及废弃导入，不替换为另一个版本号检查。启动仍要求真实 Winsock 2.2、registered-I/O socket、完整 RIO 扩展表及相关原生能力，缺失时保持可观察错误，不静默回退。
+- Windows 文档改为当前 Rust 工具链的 Windows 10／Server 2016 基线，明确不额外按 OS 版本号拦截，不承诺 Win8 或未经执行的版本覆盖。本次 Windows 11 上 IPv4 模式 128 项全 feature／全 target 回归、`native_traits`／`runtime_services` 实跑、严格 Clippy、修改文件格式及 Windows GNU 编译检查通过；两个实跑程序均不再导入 `RtlGetVersion`。未执行 Windows 10／Server 2016 原生验证，Linux／Android 实现与门槛未改动。
+- Android 最低支持版本调整为 API23：启动读取 `ro.build.version.sdk`，去掉 API29 `android_get_device_api_level` 强符号依赖，保留版本读取失败报错与低于 23 的拒绝。`android_setsocknetwork` 的 API23 Network 绑定能力不变。
+- 验证 App 的原生链接／JNI C、DEX、manifest、签名最低版本同步为 23，明确保留 v1 签名及 16KiB 对齐；Java 向 JNI 传入实际 API level。移除 API24 `CompletableFuture` 和 API26 `java.nio.file` 依赖，保留每进程单次运行、Activity 停止／恢复时的结果交付以及旧结果失效和初始化失败持久化。
+- API23 完整回归发现并修复 Android IPv6 TCP `abort` 的旧 SELinux 长度检查：`AF_UNSPEC` 请求提供完整 `sockaddr_in6` 存储，保持宿主 FD 别名仍打开时立即 RST。既有回归失败前／修复后结果均保留，不改变 Linux 实现，不吞掉原生错误。
+- 本次验证：API23／x86_64／4KiB 普通 App 17 项通过、1 项不支持的 UDP offload 明确跳过，另有 127 项 Android 原生回归通过；API37／x86_64／16KiB 普通 App 18 项及 3 项 abort 回归通过。双 ABI API23 APK 的签名／对齐与全部强符号检查通过，严格 Android Clippy、修改文件格式与既有 Java 持久化回归通过；ARM64 未做本次原生运行。
+- 新增 `docs/linux-io-uring-compatibility.md` 归档接口沿革及默认路径／可选优化下限分析；现有 Linux 门禁、UAPI／runner pin 和承诺不变。Windows 代码不动，文档区分 Rust1.77 的历史 Win7+ 基线、Rust1.78 起的 Win10 基线与本包 Rust1.98／edition2024、Windows11／Server2022 门禁，不承诺 Win8。
+- 统一平台支持表述为“最低支持版本（含）及后续版本”，区分版本下限、原生能力条件、UAPI 参考版本、固定验证 guest 和实际测试范围。仅更新文档与 Linux 模块注释，不降低版本门槛、不改变能力探测，也不扩大已验证范围。
+- 本次文档校验：Linux 版本下限／vendor 后缀／RC 拒绝的既有配置回归通过，Windows IPv4 `native_traits` 实跑通过；未新增 Linux／Android／Windows 最低支持版本上的原生验证。
 - 收紧后端管理 Interface：`CapabilityReport::{new, decide, finish}` 与 `Optimization::bit` 改为 crate 内部可见，删除无调用者的 `enabled_mask`。这是一次有意的公开面收口；外部迁移为从 `Runtime::capabilities()` 获取报告，再用 `states`／`state`／`enabled` 按优化项查询。原有能力决策回归迁入内部单元测试，不保留兼容别名。
 - 先更新系统架构与实施契约，再落实公开兼容说明：以本次收口后的 Interface 为 `0.1.x` 兼容基线，保留拥有型缓冲区、取消、worker、任务、flush／半关闭、数据报和计时器行为，以及开放 trait 的实现要求；将 `sync` 重导出的 `async-channel`／`async-lock`／`futures-channel` 类型身份与行为纳入兼容评估。本次不修改配置／结果结构构造方式、枚举匹配规则或依赖版本，不添加 `#[non_exhaustive]` 或包装层。
 - 本次收口验证：Windows IPv4 模式 `--all-features --all-targets` 的 128 项回归、严格 Clippy／rustdoc、修改文件格式检查及双／单 worker `native_traits` 实跑通过；临时外部程序实际查询能力并验证公开 channel／锁／guard／semaphore／oneshot 类型互操作，5 个后端管理／位图入口均按预期被编译器拒绝。未执行 Linux／Android 原生场景或 IPv6 连通性，未修改宿主网络设置。

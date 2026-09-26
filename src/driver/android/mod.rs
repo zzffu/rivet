@@ -1,4 +1,4 @@
-//! Android API 29+ readiness backend. Only synchronous nonblocking socket
+//! Android API 23+ readiness backend. Only synchronous nonblocking socket
 //! syscalls touch payload memory; the kernel never retains a completed lease.
 mod notifier;
 mod socket;
@@ -523,14 +523,19 @@ impl Driver {
         socket2::SockRef::from(&state.socket).set_linger(Some(Duration::ZERO))?;
         // An imported socket may still have host-owned aliases. Disconnect the
         // underlying TCP connection now; closing our fd need not be the last close.
-        let address = libc::sockaddr {
-            sa_family: libc::AF_UNSPEC as libc::sa_family_t,
-            sa_data: [0; 14],
+        // Older SELinux hooks validate length using the socket's family before
+        // handling AF_UNSPEC, so supply a full IPv6 address for either family.
+        let address = libc::sockaddr_in6 {
+            sin6_family: libc::AF_UNSPEC as libc::sa_family_t,
+            sin6_port: 0,
+            sin6_flowinfo: 0,
+            sin6_addr: libc::in6_addr { s6_addr: [0; 16] },
+            sin6_scope_id: 0,
         };
         socket::cvt(unsafe {
             libc::connect(
                 state.socket.as_raw_fd(),
-                &address,
+                std::ptr::from_ref(&address).cast(),
                 mem::size_of_val(&address) as libc::socklen_t,
             )
         })?;

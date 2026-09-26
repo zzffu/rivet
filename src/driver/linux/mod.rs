@@ -1,4 +1,4 @@
-//! Owner-thread io_uring networking, pinned to Linux 7.2.7 and newer.
+//! Owner-thread io_uring networking for stable Linux 7.2.7 and later (excluding RC).
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("the Linux backend supports x86_64 and aarch64 only");

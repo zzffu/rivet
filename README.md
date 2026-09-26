@@ -6,13 +6,19 @@
 
 ## 平台与构建
 
-| 平台 | 基线 | 后端 |
+| 平台 | 最低支持版本（含） | 后端 |
 | --- | --- | --- |
-| Linux x86_64／aarch64 | 稳定内核 7.2.7+；拒绝旧内核和 RC | io_uring；无静默 epoll 回退 |
-| Windows x86_64 | Windows 11／Server 2022+ | RIO 数据路径＋IOCP／AcceptEx／ConnectEx |
-| Android ARM64；x86_64 验证 | API 29+，普通 App 进程 | 非阻塞 socket＋epoll；不探测或依赖 io_uring |
+| Linux x86_64／aarch64 | 稳定内核 7.2.7 及后续版本；不支持 RC | io_uring；无静默 epoll 回退 |
+| Windows x86_64 | Windows 10／Server 2016 及后续版本（当前 Rust 目标基线）；不额外按 OS 版本号拦截 | RIO 数据路径＋IOCP／AcceptEx／ConnectEx |
+| Android ARM64；x86_64 验证 | API 23 及后续版本，普通 App 进程 | 非阻塞 socket＋epoll；不探测或依赖 io_uring |
+
+表中版本是包含下限的支持范围，不是只支持某个精确版本，也不代表每个后续版本都已完成原生验证。运行仍要求后端所需的原生接口、权限与资源可用；可选优化还受编译 feature、运行策略和能力探测约束。公开 Rust `Future` 接口兼容与底层 OS 支持是不同契约，不能仅凭前者推断任意旧系统可运行。实际验证环境与限制见下文“已执行的原生验证”。
 
 Rust 1.98+，edition 2024。当前包名为 `rivet-runtime`、库名为 `rivet`；本仓库不配置 crates.io 发布。
+
+Windows 的接口可用版本、Rust 目标基线和实测范围不同：[RIO 从 Windows 8／Server 2012 引入](https://learn.microsoft.com/en-us/windows/win32/api/mswsock/ns-mswsock-rio_extension_function_table)；[Rust 1.77 的常规 MSVC 目标基线为 Windows 7+](https://doc.rust-lang.org/1.77.2/rustc/platform-support.html)，包含 Win8，但旧系统依赖社区测试；[Rust 1.78 起提高到 Windows 10](https://blog.rust-lang.org/2024/02/26/Windows-7/)，[当前服务器基线为 Server 2016](https://doc.rust-lang.org/rustc/platform-support/windows-msvc.html)。本包需要 Rust 1.98／edition 2024，不能用旧工具链的基线承诺 Win8 支持。Windows 后端不读取 OS 版本号，也不设置 Windows 11／Server 2022 门槛；初始化仍要求 Winsock 2.2、registered-I/O socket 和完整 RIO 扩展表可用，失败返回真实错误，不替换后端。表中版本不代表本仓库已在每个版本原生验证。
+
+Android 最低 API 23 保留 `android_setsocknetwork` 的 Network 绑定能力。版本检测按 NDK 的低 API 实现读取 `ro.build.version.sdk`，不强链接 API 29 才导出的 `android_get_device_api_level`；读取失败不伪造版本。验证 App 的原生链接、DEX、manifest 和签名最低版本均为 23，SDK／NDK 工具版本不等于部署最低版本。
 
 ```toml
 [dependencies]
@@ -264,9 +270,18 @@ cargo run --release --all-features --example loopback -- --enable zc-rx-nodev --
 
 `tools/verification/linux_vm.py` 提供签名／校验和固定的、无磁盘和无外部 NIC 的 Linux 7.2.7 guest；记录实际 guest 内核、配置、可执行文件 SHA256、串口输出与退出状态。它不修改 WSL 全局内核。KVM 不可用时须显式选择 TCG，不静默回退。loopback／NODEV 不能证明真实 NIC RX ZC、RSS、NAPI 或硬件吞吐。
 
-Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用普通 App，支持 `-Abi x86_64` 和 `-Abi arm64-v8a`，不依赖 Gradle。NDK 目标为 API29，JNI 库采用 16KiB ELF／APK 对齐和真正未压缩的 ZIP 条目。界面、`RivetSmoke` logcat 标签和私有 `files/smoke-result.json` 给出结构化结果；每次进程运行先清除旧成功状态，JNI 初始化失败也持久化。验证 APK 的 debuggable 配置和测试签名不能用于生产应用。
+Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用普通 App，支持 `-Abi x86_64` 和 `-Abi arm64-v8a`，不依赖 Gradle。NDK 目标和 APK 最低版本为 API23，JNI 库采用 16KiB ELF／APK 对齐和真正未压缩的 ZIP 条目，并保留 API23 所需的 v1 签名。界面、`RivetSmoke` logcat 标签和私有 `files/smoke-result.json` 给出结构化结果；每次进程运行先清除旧成功状态，JNI 初始化失败也持久化。验证 APK 的 debuggable 配置和测试签名不能用于生产应用。
 
 ### 已执行的原生验证
+
+本次 API23 下限迁移的验证：
+
+- Android 6.0／API23、x86_64、4KiB 页、kernel 3.10.0+、SELinux Enforcing：普通 App UID 10055 的 17 项场景通过，1 项不可用的 UDP GSO/GRO 明确跳过；实际覆盖 IPv4／IPv6、Network 绑定和通用运行时能力。旋转及后台恢复继续显示缓存结果，不重跑原生场景。
+- 同一 API23 环境的 Android 目标全 feature 原生回归共 127 项通过。既有保留 FD 别名的 IPv6 `abort` 回归先暴露 `EINVAL`；修正 Android 的 `AF_UNSPEC` 地址长度后通过，不跳过断言或吞掉错误。adb shell 回归与普通 App 结果分别记录。
+- API37／x86_64／16KiB 页普通 App 的 18 项场景通过；另执行 3 项 `tcp_abort_behavior` 回归通过。两个 ABI 的 API23 APK 均完成 v1 签名与 16KiB 对齐校验，全部 77 个强动态引用都能在相应 ABI 的 API23 NDK 导出中匹配，不再引用 API29 getter；两个 Android 目标严格 Clippy、修改 Rust 文件格式检查和既有 Java 结果持久化回归通过。
+- 证据、最终 APK SHA256 与限制见 `artifacts/android-api23/verification-summary.json`，原始结果与截图在该目录及 `artifacts/android-api23-modern/`。本次 ARM64 仅构建／符号检查，未执行 API23 ARM64 真机，也未改动或重新验证 Linux／Windows 后端。
+
+此前各轮原生验证记录：
 
 | 环境 | 已观察结果 | 限制 |
 | --- | --- | --- |

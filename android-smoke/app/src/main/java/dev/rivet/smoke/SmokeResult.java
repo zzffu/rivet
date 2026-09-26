@@ -4,7 +4,6 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.util.concurrent.Callable;
 
 /** File-based reports must describe this run, including failures before JNI loads. */
@@ -14,7 +13,7 @@ final class SmokeResult {
     static String run(File destination, Callable<String> suite) {
         String json;
         try {
-            Files.deleteIfExists(destination.toPath());
+            invalidate(destination);
             write(destination, RUNNING);
             json = suite.call();
             if (json == null) { throw new IOException("JNI returned no smoke result"); }
@@ -26,11 +25,17 @@ final class SmokeResult {
         } catch (Throwable failure) {
             // An unwritable report is a failed run, never a displayed pass. If
             // publication partly wrote a passing result, remove that result.
-            try { Files.deleteIfExists(destination.toPath()); }
+            try { invalidate(destination); }
             catch (Throwable invalidation) { failure.addSuppressed(invalidation); }
             json = failed("result-write", failure);
         }
         return json;
+    }
+
+    private static void invalidate(File destination) throws IOException {
+        if (!destination.delete() && destination.exists()) {
+            throw new IOException("Could not remove previous smoke result: " + destination);
+        }
     }
 
     private static void write(File destination, String json) throws IOException {

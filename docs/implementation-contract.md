@@ -10,6 +10,18 @@ This document specifies the internal ownership and completion contracts. The sys
 
 `runtime::blocking` owns bounded synchronous work independently of the network workers. `io` owns bounded non-socket native registrations; `sync` supplies executor-independent coordination; `signal` owns explicitly scoped process-signal subscriptions. None of these modules implements a Tokio reactor or a protocol stack.
 
+## Platform support
+
+Minimum supported versions are stable Linux 7.2.7, Windows 10 (client) / Windows Server 2016 (server, following the current Rust target baseline), and Android API 23, including those versions and later releases. Linux RC kernels are excluded. These are lower bounds, not exact-version pins. Linux and Android enforce their OS-version bounds; Windows adds no OS-version/build-number check. All backends require their native facilities; optional optimizations additionally depend on compiled features, policy, permissions and hardware capabilities. Public Rust `Future` compatibility does not by itself establish OS/ABI compatibility or support for older systems.
+
+Native validation records identify the actual OS, architecture and execution environment tested; they do not prove every release in the declared support range. Keep the verification runner's pinned guest version and historical results exact.
+
+Android keeps the API23 `android_setsocknetwork` interface. Startup reads `ro.build.version.sdk` through `__system_property_get`, following the NDK's pre-29 API-level implementation without a strong reference to the API29 getter. Unreadable/invalid versions fail initialization; versions below23 are unsupported. The smoke app also targets minimum23 throughout native linking, DEX, manifest and signing, and passes Java's device API level to JNI for reporting.
+
+Android abort uses an `AF_UNSPEC` address backed by a full `sockaddr_in6`: API23-era SELinux hooks validate length against the existing socket family before recognizing disconnect. Preserve immediate TCP reset even while imported FD aliases remain open; neither shorten the address to generic `sockaddr` nor suppress `EINVAL`.
+
+Windows startup directly initializes Winsock 2.2 and requires registered-I/O sockets, the complete RIO extension table, IOCP and the connection extensions. It does not query `RtlGetVersion` or impose a Windows11/Server2022 gate; native failures remain observable with no backend fallback. RIO's Windows8/Server2012 introduction and Rust1.77's Windows7+ baseline do not override this package's Rust1.98/edition2024 requirement. The current ordinary Rust target baseline is Windows10/Server2016; Windows8 compatibility and unexecuted native-version coverage are not promised.
+
 ## Capability report ownership
 
 Backends construct reports during runtime initialization. Consumers obtain them through `Runtime::capabilities()` and keep the existing metadata fields and `CapabilityReport::{states, state, enabled}` queries. `Optimization::{ALL, name, compiled}` and structured `CapabilityError` identity remain public.
@@ -127,7 +139,7 @@ Cold socket creation/listen/bind/import may use synchronous nonblocking socket s
 
 ## Linux ring/extension seam
 
-`linux::uapi` and `linux::ring` pin the project-owned syscall layouts to Linux 7.2.7, including mixed CQEs, SQ_REWIND and the updated ZCRX structures. Their sizes, offsets and memory ordering are part of the backend contract rather than assumptions about a third-party wrapper.
+`linux::uapi` and `linux::ring` take their project-owned syscall layout definitions from Linux 7.2.7, including mixed CQEs, SQ_REWIND and the updated ZCRX structures. This identifies the reference ABI, not an exact runtime-kernel requirement. Their sizes, offsets and memory ordering are part of the backend contract rather than assumptions about a third-party wrapper.
 
 `Ring` exposes native SQE reservation/submission, normalized CQE retrieval preserving enabled 32-byte extras, a registration syscall helper, raw ring fd, and feature bits. Optional implementation modules, native resources and submission branches follow their Cargo compile gates independently of runtime policy. Extension code must not approximate updated structures with older library bindings.
 

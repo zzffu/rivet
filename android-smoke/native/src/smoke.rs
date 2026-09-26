@@ -1080,13 +1080,9 @@ pub fn suite(network: u64) -> Vec<CaseResult> {
     cases
 }
 
-pub fn json(network: u64) -> String {
+pub fn json(network: u64, api_level: i32) -> String {
     let uid = unsafe { libc::getuid() };
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    unsafe extern "C" {
-        fn android_get_device_api_level() -> i32;
-    }
-    let api_level = unsafe { android_get_device_api_level() };
     let mut cases = suite(network);
     if uid < 10000 {
         cases.push(CaseResult {

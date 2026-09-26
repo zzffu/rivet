@@ -4,7 +4,7 @@ use crate::{driver::SocketKind, socket::SocketOptions};
 use socket2::{SockAddr, Socket, Type};
 use std::{
     io,
-    mem::{size_of, zeroed},
+    mem::size_of,
     net::SocketAddr,
     os::windows::io::{AsRawSocket, AsSocket, FromRawSocket},
     ptr,
@@ -50,7 +50,6 @@ pub(super) struct Winsock;
 
 impl Winsock {
     pub fn new() -> io::Result<Self> {
-        require_supported_windows()?;
         let mut data = WSADATA::default();
         let error = unsafe { WSAStartup(0x0202, &mut data) };
         if error != 0 {
@@ -70,48 +69,6 @@ impl Drop for Winsock {
             WSACleanup();
         }
     }
-}
-
-#[repr(C)]
-struct VersionInfo {
-    size: u32,
-    major: u32,
-    minor: u32,
-    build: u32,
-    platform: u32,
-    service_pack: [u16; 128],
-    service_pack_major: u16,
-    service_pack_minor: u16,
-    suite: u16,
-    product_type: u8,
-    reserved: u8,
-}
-
-#[link(name = "ntdll")]
-unsafe extern "system" {
-    fn RtlGetVersion(info: *mut VersionInfo) -> i32;
-}
-
-fn require_supported_windows() -> io::Result<()> {
-    let mut version: VersionInfo = unsafe { zeroed() };
-    version.size = size_of::<VersionInfo>() as u32;
-    let status = unsafe { RtlGetVersion(&mut version) };
-    if status < 0 {
-        return Err(io::Error::from_raw_os_error(unsafe {
-            windows_sys::Win32::Foundation::RtlNtStatusToDosError(status)
-        } as i32));
-    }
-    let minimum_build = if version.product_type == 1 {
-        22000
-    } else {
-        20348
-    };
-    if version.major < 10 || (version.major == 10 && version.build < minimum_build) {
-        return Err(unsupported(
-            "Rivet requires Windows 11 or Windows Server 2022 or newer",
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn new_socket(addr: SocketAddr, kind: SocketKind) -> io::Result<Socket> {
