@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- 按系统架构与实现契约新增按需、只读的 `BufferPool::usage()`、当前 worker 的 `runtime::resource_snapshot()` 和单个 UDP 的 `receive_snapshot()`。结果类型集中在 `diagnostics`，采用私有字段和 getter；不增加全局聚合、后台采样、资源租约或公开构造义务，保持 0.2.x 的源兼容边界。
+- 快照区分普通 payload／lease 元数据／待回收、逻辑队列／原生占用／关闭退休，以及 RIO 窗口中的 ready、idle、最近分配受阻和真实重投分配失败累计值。Linux 原生占用同时考虑尚未释放的 ZC 内存 guard；Android 不伪造异步内核占用，平台无对应语义时返回 `None`。成功采集不分配、不执行 I/O、不推进回收、不触发回调；worker／driver 正在可变借用的重入查询返回 `WouldBlock`，而不是借用 panic。
+- 资源回归发现并修复 Windows teardown 的无限等待：软件服务可在没有完成事件时退休最后一个未投递接收窗口；关闭中的 driver 已 idle 时，`poll` 不再无限等待 IOCP。保留触发旧行为的原生回归，不伪造完成、不提前释放 kernel guard，也不改变正常空闲休眠。
+- 本轮资源观测验证（2026-09-28）：Windows IPv4 默认及全 feature／all-targets 各 145 项通过，精简构建的池／观测回归 22 项通过；原生示例与外部压力／退休／租约消费者通过。隔离 Linux 6.18.54-1-lts TCG guest 中，全 feature 和精简构建的相关回归各 21 项及 `native_traits` 通过。严格 Clippy／rustdoc、格式、Linux 全 feature／精简检查、Android 双 ABI 全 feature／all-targets 及独立 ARM64 smoke 包编译检查通过；Windows IPv6、Android 原生、物理 NIC 和吞吐未在本轮执行。证据索引：`artifacts/resource-observation-20260928/verification-summary.json`。
+
 - 先补充系统架构与实现契约，再新增 `WriteBuf::as_mut_slice()`：只安全借出已初始化前缀，不扩大长度、不分配或复制；保留普通存储唯一拥有、外部区域不可恢复及内核 guard 阻止写入的约束。补强清空、切片恢复和空尾切片的可变视图回归。
 - 新增全平台可调用的纯算术 `Limits::windows_udp_receive_bytes(receive_chunk)`，计算单个 Windows UDP 接收窗口的初始 payload 需求并检查非法尺寸／乘法溢出。结果允许超过当前池，用于部署规划，不冒充资源预留或原生成功保证。
 - 明确每 socket 的接收窗口与每 worker 共享的 payload／lease／operation 预算，给出多 socket、旧租约及重投余量算例。现有 RIO 准入失败补充请求规模和预算类别，仅在失败路径格式化，保留错误类别、完整窗口回滚和接管所有权；默认槽数及正常 I/O 路径不变。

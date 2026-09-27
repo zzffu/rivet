@@ -19,6 +19,7 @@ use crate::{
     buffer::{BufferPool, SendBuf, SendPayload, WriteBuf},
     capability::{CapabilityReport, ZcStats},
     config::{Limits, RuntimeConfig},
+    diagnostics::{DriverResources, RioReceiveResources},
     driver::{Arena, Event, Received, SendOutcome, SocketId, SocketInfo, SocketKind, Token},
     socket::{ImportError, OwnedSocket, SocketOptions},
 };
@@ -75,6 +76,7 @@ struct DatagramReceive {
     pending: usize,
     ready: VecDeque<u64>,
     idle: VecDeque<u64>,
+    rearm_allocation_failures_total: u64,
     stopping: bool,
     discard: bool,
     error: Option<io::Error>,
@@ -141,6 +143,7 @@ enum OperationKind {
         writable: Option<WriteBuf>,
         reserve: Option<SendBuf>,
         ready: Option<Received>,
+        last_pool_blocked: bool,
     },
     Send {
         data: Option<SendPayload>,
@@ -178,6 +181,7 @@ impl Operation {
                 writable: Some(buffer),
                 reserve: None,
                 ready: None,
+                last_pool_blocked: false,
             },
         );
         operation.token = None;
@@ -203,6 +207,7 @@ pub(crate) struct Driver {
     iocp_first: bool,
     accept_reservations: usize,
     datagram_queue_slots: usize,
+    udp_rearm_allocation_failures_total: u64,
     send_bytes: usize,
     shutting_down: bool,
 }
@@ -253,6 +258,7 @@ impl Driver {
             iocp_first: true,
             accept_reservations: 0,
             datagram_queue_slots: 0,
+            udp_rearm_allocation_failures_total: 0,
             send_bytes: 0,
             shutting_down: false,
             limits,
@@ -264,6 +270,102 @@ impl Driver {
     }
     pub fn zc_stats(&self) -> ZcStats {
         ZcStats::default()
+    }
+
+    /// Native counts retain one record per outstanding request, including
+    /// deferred RIO commits. Software completions include queued events and
+    /// stored operation results, EOFs and terminal datagram errors, never CQ
+    /// contents. Admission availability also respects accept reservations and
+    /// the shared operation/completion budget.
+    pub fn resource_snapshot(&self) -> DriverResources {
+        let mut pending_completions = self.pending.len();
+        let mut closing_sockets = 0;
+        for (_, record) in self.sockets.iter() {
+            closing_sockets += usize::from(record.handle.is_none());
+            if let Some(group) = &record.datagrams {
+                pending_completions += usize::from(group.error.is_some());
+            }
+        }
+        let mut native_outstanding = 0;
+        let mut retiring_native = 0;
+        for (_, operation) in self.operations.iter() {
+            if operation.in_flight {
+                native_outstanding += 1;
+                let record = self.sockets.get(operation.socket.0).unwrap();
+                if operation.cancelled
+                    || record.handle.is_none()
+                    || record
+                        .datagrams
+                        .as_ref()
+                        .is_some_and(|group| group.stopping)
+                    || self.shutting_down
+                {
+                    retiring_native += 1;
+                }
+            }
+            pending_completions += match &operation.kind {
+                OperationKind::Connect { .. } => 0,
+                OperationKind::Accept { ready, .. } => usize::from(ready.is_some()),
+                OperationKind::Receive { ready, eof, .. } => {
+                    usize::from(ready.is_some()) + usize::from(*eof)
+                }
+                OperationKind::DatagramReceive { ready, .. } => usize::from(ready.is_some()),
+                OperationKind::Send { result, .. } => usize::from(result.is_some()),
+            };
+        }
+        DriverResources {
+            sockets: self.sockets.len(),
+            available_socket_slots: self.sockets.available() - self.accept_reservations,
+            operations: self.operations.len(),
+            available_operation_slots: self.operations.available().min(
+                self.limits
+                    .max_operations
+                    .saturating_sub(self.operations.len() + self.pending.len()),
+            ),
+            pending_completions,
+            closing_sockets,
+            native_outstanding: Some(native_outstanding),
+            retiring_native: Some(retiring_native),
+            rio_receive_queue_slots: Some(self.datagram_queue_slots),
+            udp_rearm_allocation_failures_total: Some(self.udp_rearm_allocation_failures_total),
+        }
+    }
+
+    /// Visits only this socket's receive list. The group's pending count mixes
+    /// native requests and ready results, so it cannot stand in for posted I/O.
+    pub fn receive_snapshot(&self, socket: SocketId) -> io::Result<crate::driver::ReceiveState> {
+        let record = self.socket(socket)?;
+        let mut native_outstanding = 0;
+        let mut last_pool_blocked_lanes = 0;
+        let mut next = record.receive;
+        while let Some(key) = next {
+            let operation = self.operations.get(key).unwrap();
+            native_outstanding += usize::from(operation.in_flight);
+            if let OperationKind::DatagramReceive {
+                next: following,
+                last_pool_blocked,
+                ..
+            } = &operation.kind
+            {
+                last_pool_blocked_lanes += usize::from(*last_pool_blocked);
+                next = *following;
+            } else {
+                break;
+            }
+        }
+        Ok(crate::driver::ReceiveState {
+            publication_credits: record.receive_credits,
+            native_outstanding: Some(native_outstanding),
+            rio: record.datagrams.as_ref().map(|group| RioReceiveResources {
+                admitted_lanes: group.lanes,
+                ready_results: group.ready.len(),
+                idle_lanes: group.idle.len(),
+                last_pool_blocked_lanes,
+                rearm_allocation_failures_total: group.rearm_allocation_failures_total,
+                commit_pending: record.receive_commit,
+                stopping: group.stopping,
+            }),
+        })
     }
 
     fn socket(&self, id: SocketId) -> io::Result<&SocketRecord> {
@@ -397,6 +499,7 @@ impl Driver {
                 pending: 0,
                 ready: VecDeque::with_capacity(self.limits.max_pending_receives),
                 idle: VecDeque::with_capacity(self.limits.max_pending_receives),
+                rearm_allocation_failures_total: 0,
                 stopping: false,
                 discard: false,
                 error: None,

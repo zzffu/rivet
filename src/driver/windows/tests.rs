@@ -283,6 +283,16 @@ fn udp_zero_credits_retain_native_burst_and_cancel_stops_only_after_publication(
         driver.drain_rio(&mut 4).unwrap();
         std::thread::yield_now();
     }
+    let receive = driver.receive_snapshot(receiver.id).unwrap();
+    assert_eq!(receive.publication_credits, 0);
+    assert_eq!(receive.native_outstanding, Some(0));
+    let rio = receive.rio.unwrap();
+    assert_eq!(rio.admitted_lanes, 4);
+    assert_eq!(rio.ready_results, 4);
+    assert_eq!(rio.idle_lanes, 0);
+    let resources = driver.resource_snapshot();
+    assert_eq!(resources.pending_completions, 4);
+    assert_eq!(resources.native_outstanding, Some(0));
     driver.cancel(Token(10)).unwrap();
     let mut events = Vec::new();
     driver.poll(Some(Duration::ZERO), &mut events).unwrap();
@@ -290,6 +300,11 @@ fn udp_zero_credits_retain_native_burst_and_cancel_stops_only_after_publication(
         events.is_empty(),
         "zero credits published data or discarded it to publish Stopped"
     );
+    let receive = driver.receive_snapshot(receiver.id).unwrap();
+    assert_eq!(receive.native_outstanding, Some(0));
+    assert_eq!(receive.rio.unwrap().ready_results, 4);
+    assert!(receive.rio.unwrap().stopping);
+    assert_eq!(driver.resource_snapshot().pending_completions, 4);
     let mut held = Vec::new();
     let mut stopped = 0;
     for window in 0..2 {
@@ -325,7 +340,22 @@ fn udp_zero_credits_retain_native_burst_and_cancel_stops_only_after_publication(
         assert_eq!(held.len(), (window + 1) * 2);
         assert_eq!(stopped, window);
     }
+    let receive = driver.receive_snapshot(receiver.id).unwrap();
+    assert_eq!(receive.native_outstanding, Some(0));
+    assert!(
+        receive.rio.is_none(),
+        "retired lanes must not survive as an empty RIO group"
+    );
+    let resources = driver.resource_snapshot();
+    assert_eq!(resources.operations, 0);
+    assert_eq!(resources.pending_completions, 0);
+    assert_eq!(resources.retiring_native, Some(0));
+    assert_eq!(resources.rio_receive_queue_slots, Some(3));
     driver.close(receiver.id).unwrap();
+    assert_eq!(
+        driver.receive_snapshot(receiver.id).err().unwrap().kind(),
+        io::ErrorKind::NotConnected
+    );
     driver.poll(Some(Duration::ZERO), &mut events).unwrap();
     assert!(
         events.is_empty(),
@@ -389,11 +419,25 @@ fn udp_post_failure_after_import_preserves_data_and_reports_error_after_native_c
         driver.drain_rio(&mut 4).unwrap();
         std::thread::yield_now();
     }
+    let receive = driver.receive_snapshot(receiver.id).unwrap();
+    assert_eq!(receive.native_outstanding, Some(1));
+    assert_eq!(receive.rio.unwrap().ready_results, 1);
+    assert_eq!(driver.resource_snapshot().pending_completions, 1);
     // Two requests were genuinely posted: one now retains data and one remains
     // native-owned. Fail only a later submission, never its real completion.
     let native_receive = driver.rio.table.RIOReceiveEx.replace(reject_receive);
     driver.receive_capacity(receiver.id, 4).unwrap();
     driver.rio.table.RIOReceiveEx = native_receive;
+    let resources = driver.resource_snapshot();
+    assert_eq!(resources.native_outstanding, Some(1));
+    assert_eq!(resources.retiring_native, Some(1));
+    assert_eq!(resources.closing_sockets, 1);
+    assert_eq!(resources.pending_completions, 2);
+    assert_eq!(resources.udp_rearm_allocation_failures_total, Some(0));
+    assert_eq!(
+        driver.receive_snapshot(receiver.id).err().unwrap().kind(),
+        io::ErrorKind::NotConnected
+    );
     let mut events = Vec::new();
     let mut retained = None;
     let mut stopped = 0;
@@ -436,8 +480,161 @@ fn udp_post_failure_after_import_preserves_data_and_reports_error_after_native_c
         }
     }
     assert_eq!(stopped, 1);
+    let resources = driver.resource_snapshot();
+    assert_eq!(resources.native_outstanding, Some(0));
+    assert_eq!(resources.retiring_native, Some(0));
+    assert_eq!(resources.pending_completions, 0);
+    assert_eq!(resources.closing_sockets, 0);
+    assert_eq!(resources.sockets, 0);
+    assert_eq!(resources.rio_receive_queue_slots, Some(0));
     driver.poll(Some(Duration::ZERO), &mut events).unwrap();
     assert!(events.is_empty());
     drop(driver);
     assert_eq!(retained.unwrap().as_slice(), b"completed before failure");
+}
+
+#[test]
+fn udp_rearm_snapshots_count_failed_attempts_and_keep_driver_history_after_close() {
+    let mut driver = driver(8);
+    let mut options = SocketOptions::udp();
+    options.receive_chunk = 1024;
+    let receiver = driver
+        .bind_udp("127.0.0.1:0".parse().unwrap(), None, &options)
+        .unwrap();
+    driver.start_recv(receiver.id, Token(30)).unwrap();
+    driver.receive_capacity(receiver.id, 4).unwrap();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut spare = Vec::new();
+    loop {
+        match driver.pool.try_acquire() {
+            Ok(buffer) => spare.push(buffer),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("unexpected pool allocation error: {error}"),
+        }
+    }
+    let mut failures = 0;
+    let mut events = Vec::new();
+    for reuse_reserve in [true, false] {
+        sender.send_to(b"held", receiver.local_addr).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while driver
+            .receive_snapshot(receiver.id)
+            .unwrap()
+            .rio
+            .unwrap()
+            .ready_results
+            == 0
+        {
+            assert!(Instant::now() < deadline, "native receive did not complete");
+            driver.drain_rio(&mut 4).unwrap();
+            std::thread::yield_now();
+        }
+        driver.service_datagrams(receiver.id, &mut events, &mut 1);
+        let Event::Received {
+            token: Token(30),
+            result,
+        } = events.pop().unwrap()
+        else {
+            panic!("expected a retained datagram");
+        };
+        let mut held = Some(result.unwrap().data);
+        assert_eq!(held.as_ref().unwrap().as_slice(), b"held");
+        for _ in 0..2 {
+            driver.receive_capacity(receiver.id, 4).unwrap();
+            failures += 1;
+            let receive = driver.receive_snapshot(receiver.id).unwrap();
+            assert_eq!(receive.publication_credits, 4);
+            assert_eq!(receive.native_outstanding, Some(3));
+            let rio = receive.rio.unwrap();
+            assert_eq!(rio.idle_lanes, 1);
+            assert_eq!(rio.ready_results, 0);
+            assert_eq!(rio.last_pool_blocked_lanes, 1);
+            assert_eq!(rio.rearm_allocation_failures_total, failures);
+            let resources = driver.resource_snapshot();
+            assert_eq!(
+                resources.udp_rearm_allocation_failures_total,
+                Some(failures)
+            );
+            assert_eq!(resources.native_outstanding, Some(3));
+            assert_eq!(resources, driver.resource_snapshot());
+            assert_eq!(Some(rio), driver.receive_snapshot(receiver.id).unwrap().rio);
+        }
+        if reuse_reserve {
+            drop(held.take());
+        } else {
+            drop(spare.pop().unwrap());
+        }
+        driver.rearm_datagrams(receiver.id);
+        let receive = driver.receive_snapshot(receiver.id).unwrap();
+        assert_eq!(receive.native_outstanding, Some(4));
+        let rio = receive.rio.unwrap();
+        assert_eq!(rio.last_pool_blocked_lanes, 0);
+        assert_eq!(rio.idle_lanes, 0);
+        assert_eq!(rio.rearm_allocation_failures_total, failures);
+        assert!(rio.commit_pending);
+        assert_eq!(driver.resource_snapshot().native_outstanding, Some(4));
+        assert_eq!(Some(rio), driver.receive_snapshot(receiver.id).unwrap().rio);
+        driver.commit_datagrams(receiver.id);
+        assert!(
+            !driver
+                .receive_snapshot(receiver.id)
+                .unwrap()
+                .rio
+                .unwrap()
+                .commit_pending
+        );
+        if let Some(data) = held {
+            assert_eq!(data.as_slice(), b"held");
+        }
+    }
+    driver.close(receiver.id).unwrap();
+    let resources = driver.resource_snapshot();
+    assert_eq!(resources.native_outstanding, Some(4));
+    assert_eq!(resources.retiring_native, Some(4));
+    assert_eq!(resources.closing_sockets, 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !driver.is_idle() {
+        assert!(
+            Instant::now() < deadline,
+            "closed receive window did not retire"
+        );
+        driver
+            .poll(Some(Duration::from_millis(10)), &mut events)
+            .unwrap();
+        events.clear();
+    }
+    let resources = driver.resource_snapshot();
+    assert_eq!(resources.sockets, 0);
+    assert_eq!(resources.native_outstanding, Some(0));
+    assert_eq!(
+        resources.udp_rearm_allocation_failures_total,
+        Some(failures)
+    );
+    let replacement = driver
+        .bind_udp("127.0.0.1:0".parse().unwrap(), None, &options)
+        .unwrap();
+    assert_eq!(
+        driver
+            .receive_snapshot(replacement.id)
+            .unwrap()
+            .rio
+            .unwrap()
+            .rearm_allocation_failures_total,
+        0
+    );
+    assert_eq!(
+        driver
+            .resource_snapshot()
+            .udp_rearm_allocation_failures_total,
+        Some(failures)
+    );
+    assert_eq!(
+        driver.receive_snapshot(receiver.id).err().unwrap().kind(),
+        io::ErrorKind::NotConnected
+    );
+    // Leave this replacement window unprimed. There are admitted records but
+    // no native requests left to generate a completion; Drop must notice when
+    // software service makes shutdown idle rather than wait forever on IOCP.
+    assert_eq!(driver.resource_snapshot().native_outstanding, Some(0));
+    assert!(!driver.is_idle());
 }

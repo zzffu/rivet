@@ -592,6 +592,34 @@ pub fn zc_stats() -> stdio::Result<ZcStats> {
     Ok(current()?.driver.borrow().zc_stats())
 }
 
+/// Observe the current worker's logical I/O, pool and native-driver resources.
+///
+/// This is not a whole-runtime aggregate. Collection scans bounded local state
+/// without allocation, native calls, polling, recycling, credit updates or wakes.
+/// The returned value owns no live resource and may be retained or sent elsewhere.
+///
+/// Returns `NotConnected` outside a running worker. Reentry while Core or driver
+/// state is mutably borrowed (for example from a completion waker) returns
+/// `WouldBlock` rather than panicking or advancing I/O to obtain a snapshot.
+pub fn resource_snapshot() -> stdio::Result<crate::diagnostics::WorkerResources> {
+    let worker = current()?;
+    let io = worker
+        .io
+        .try_borrow()
+        .map_err(|_| stdio::Error::from(stdio::ErrorKind::WouldBlock))?;
+    let driver = worker
+        .driver
+        .try_borrow()
+        .map_err(|_| stdio::Error::from(stdio::ErrorKind::WouldBlock))?;
+    let report = driver.capabilities();
+    Ok(io.resource_snapshot(
+        report.worker,
+        report.backend,
+        worker.pool.usage(),
+        driver.resource_snapshot(),
+    ))
+}
+
 struct RootWake {
     ready: AtomicBool,
     notifier: Arc<Notifier>,

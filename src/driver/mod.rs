@@ -38,6 +38,13 @@ pub(crate) struct SocketInfo {
     pub peer_addr: Option<SocketAddr>,
 }
 
+/// Backend receive bookkeeping without Core queue state or observation side effects.
+pub(crate) struct ReceiveState {
+    pub(crate) publication_credits: usize,
+    pub(crate) native_outstanding: Option<usize>,
+    pub(crate) rio: Option<crate::diagnostics::RioReceiveResources>,
+}
+
 #[derive(Debug)]
 pub struct Received {
     pub data: ReadBuf,
@@ -158,7 +165,6 @@ impl<T> Arena<T> {
         self.used -= 1;
         Some(value)
     }
-    #[cfg(any(windows, test))]
     pub fn len(&self) -> usize {
         self.used
     }

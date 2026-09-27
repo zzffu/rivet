@@ -160,6 +160,35 @@ impl BufferPool {
         })
     }
 
+    /// Observe normal payload storage, distinct lease slots and deferred returns.
+    ///
+    /// Free payload bytes do not imply that a lease slot or a sufficiently large
+    /// contiguous range is available. External leases consume metadata, not the
+    /// normal payload arena; aliases and slices share their original allocation.
+    ///
+    /// This query allocates nothing, invokes no provider or wake callbacks, and
+    /// does not retry deferred returns. It remains available after its runtime
+    /// has been dropped, as long as this pool handle is retained.
+    pub fn usage(&self) -> crate::diagnostics::PoolUsage {
+        // Allocator borrows end before provider and wake callbacks, so even a
+        // callback reentering this infallible query can borrow it immutably.
+        let allocator = self.inner.allocator.borrow();
+        let mut payload_available = 0;
+        let mut largest_free_extent = 0;
+        for extent in &allocator.free_extents {
+            payload_available += extent.len;
+            largest_free_extent = largest_free_extent.max(extent.len);
+        }
+        crate::diagnostics::PoolUsage {
+            payload_capacity: self.inner.config.bytes,
+            payload_available,
+            largest_free_extent,
+            lease_capacity: self.inner.config.max_leases,
+            leases_available: allocator.free_slots.len(),
+            pending_recycles: self.inner.pending_count.get(),
+        }
+    }
+
     /// Acquire at least the configured receive block size.
     ///
     /// `WouldBlock` means the arena or its lease slots are currently exhausted.

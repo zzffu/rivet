@@ -970,6 +970,33 @@ impl UdpSocket {
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.socket.info.peer_addr
     }
+    /// Observe this socket's queued receives and existing backend receive state.
+    ///
+    /// Requires the owning worker, with the same context/lifetime errors as I/O.
+    /// Callback reentry during Core/driver mutation returns `WouldBlock`.
+    /// This does not register a waiter, start receiving, harvest completions,
+    /// flush pending credits, rearm lanes, recycle storage or allocate.
+    ///
+    /// Core queue availability may differ from backend publication credits while
+    /// an update is pending. Native counts describe software bookkeeping, not
+    /// instantaneous kernel/NIC capacity. RIO-specific state is optional.
+    pub fn receive_snapshot(&self) -> io::Result<crate::diagnostics::ReceiveResources> {
+        let owner = self.socket.owner()?;
+        let core = owner
+            .io
+            .try_borrow()
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let driver = owner
+            .driver
+            .try_borrow()
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        core.receive_snapshot(
+            self.socket.key(),
+            driver.capabilities().worker,
+            driver.receive_snapshot(self.socket.info.id)?,
+        )
+    }
+
     pub fn recv(&self) -> RecvDatagram<'_> {
         RecvDatagram {
             socket: &self.socket,

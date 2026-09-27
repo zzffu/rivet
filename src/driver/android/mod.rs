@@ -11,6 +11,7 @@ use crate::{
     buffer::{BufferPool, SendPayload},
     capability::{CapabilityReport, ZcStats},
     config::{Optimization, Policy, RuntimeConfig},
+    diagnostics::DriverResources,
     socket::{ImportError, OwnedSocket, SocketOptions},
 };
 use std::{
@@ -187,6 +188,38 @@ impl Driver {
     }
     pub fn zc_stats(&self) -> ZcStats {
         ZcStats::default()
+    }
+
+    /// Operations use the existing logical admission budget, including queued
+    /// terminal results until publication. Software completions count those
+    /// queued events and any synchronous result awaiting delivery, not epoll
+    /// readiness entries. Close removes socket storage synchronously, so there
+    /// are no retained closing sockets; asynchronous native ownership and RIO
+    /// measurements do not apply to this backend.
+    pub fn resource_snapshot(&self) -> DriverResources {
+        DriverResources {
+            sockets: self.sockets.len(),
+            available_socket_slots: self.sockets.available(),
+            operations: self.operations,
+            available_operation_slots: self.max_operations - self.operations,
+            pending_completions: self.pending.len() + usize::from(self.delivery.is_some()),
+            closing_sockets: 0,
+            native_outstanding: None,
+            retiring_native: None,
+            rio_receive_queue_slots: None,
+            udp_rearm_allocation_failures_total: None,
+        }
+    }
+
+    /// Reports installed publication credits without running a receive syscall.
+    /// A synchronous readiness backend has no asynchronous native receive count.
+    pub fn receive_snapshot(&self, socket: SocketId) -> io::Result<crate::driver::ReceiveState> {
+        let state = self.get(socket)?;
+        Ok(crate::driver::ReceiveState {
+            publication_credits: state.recv_credit,
+            native_outstanding: None,
+            rio: None,
+        })
     }
 
     pub fn listen(&mut self, addr: SocketAddr, options: &SocketOptions) -> io::Result<SocketInfo> {

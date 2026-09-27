@@ -1,4 +1,4 @@
-//! IPv4-only native capability example: supervised proxy, datagrams and execution.
+//! IPv4 native traits and resource observation: proxy, datagrams and execution.
 use futures_lite::future::poll_once;
 use futures_util::future::{Either, select, try_join};
 use rivet::{
@@ -248,6 +248,30 @@ where
     Ok(())
 }
 
+fn print_datagram_resources(
+    stage: &str,
+    pool: &BufferPool,
+    server: &UdpSocket,
+    client: &UdpSocket,
+) -> io::Result<()> {
+    // Diagnostics stay on the concrete sockets, outside the generic transfer
+    // traits. These synchronous observations do not poll or replenish receives.
+    let worker = runtime::resource_snapshot()?;
+    let usage = pool.usage();
+    let server = server.receive_snapshot()?;
+    let client = client.receive_snapshot()?;
+    require(
+        server.worker() == worker.worker()
+            && client.worker() == worker.worker()
+            && *worker.pool() == usage,
+        "UDP diagnostics did not describe their current owner and pool",
+    )?;
+    println!(
+        "UDP resources ({stage}; current worker only, not a runtime total):\n  worker: {worker:?}\n  pool: {usage:?}\n  server receive: {server:?}\n  client receive: {client:?}"
+    );
+    Ok(())
+}
+
 async fn execution<S, L, T>(handle: &S, local: &L, timer: &T) -> io::Result<()>
 where
     S: Spawn + BlockingSpawn,
@@ -318,6 +342,7 @@ fn main() -> io::Result<()> {
             let server = UdpSocket::bind(local())?;
             let client =
                 UdpSocket::bind_connected(local(), server.local_addr(), SocketOptions::udp())?;
+            print_datagram_resources("after bind", &pool, &server, &client)?;
             exchange_datagrams(
                 &server,
                 &client,
@@ -325,14 +350,15 @@ fn main() -> io::Result<()> {
                 client.local_addr(),
                 &pool,
             )
-            .await
+            .await?;
+            print_datagram_resources("after exchange", &pool, &server, &client)
         })
         .await
         .map_err(failed)?
     })?;
     drop(runtime);
     println!(
-        "PASS: native traits, IPv4 proxy half-close, UDP metadata, task ownership and reusable timers"
+        "PASS: native traits, IPv4 proxy half-close, UDP metadata and resource snapshots, task ownership and reusable timers"
     );
     Ok(())
 }

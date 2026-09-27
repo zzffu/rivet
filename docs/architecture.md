@@ -125,7 +125,27 @@ Drop Future 不保证撤回网络效果。未提交操作可撤销；已提交�
 
 例如 N=8、chunk=64 KiB、block=16 KiB、U=4 时，初始 RX 为 2 MiB／32 leases／32 native operations，另有 4 个 Core receives；若上层仍保留完整旧窗口，同时要求挂满新窗口，RX 规划需再留 2 MiB／32 leases。池总空闲字节充足仍可能因碎片缺少连续 extent，且池预算不等于进程 RSS。
 
-继续复用已有 bind/import 准入和回滚；错误补充窗口规模及资源类别，但保留 `WouldBlock`、`InvalidInput` 和原生错误身份。不得通过静默缩小窗口、扩池或提高默认槽数掩盖配置问题。未投递接收时 RIO 不保证普通 UDP 式的内核排队，`receive_buffer_bytes` 不能替代注册接收窗口。窗口耗尽时仍可能丢包；预算公式不是吞吐或无丢包承诺。本次不增加资源快照、全局遥测或热路径日志。
+继续复用已有 bind/import 准入和回滚；错误补充窗口规模及资源类别，但保留 `WouldBlock`、`InvalidInput` 和原生错误身份。不得通过静默缩小窗口、扩池或提高默认槽数掩盖配置问题。未投递接收时 RIO 不保证普通 UDP 式的内核排队，`receive_buffer_bytes` 不能替代注册接收窗口。窗口耗尽时仍可能丢包；预算公式不是吞吐或无丢包承诺。静态预算计算不创建动态快照；运行中的资源观测遵守下一节的独立只读契约。
+
+### 5.5 按需资源诊断
+
+资源诊断只回答“占用了什么、在哪个所有权阶段等待”，不判断泄漏／丢包，不自动调整容量。公开 `diagnostics` Module 保存独立的 `PoolUsage`、`WorkerResources`、`DriverResources`、`ReceiveResources` 和 `RioReceiveResources` 值类型；字段对消费者不可写，通过只读 getter 查询，类型不持有 payload、句柄或 Runtime 引用。保留既有 `Limits`／`ZcStats`／结果结构、枚举及 trait 的构造和实现义务，不添加兼容别名或必需 trait 方法。
+
+三个查询 Seam：
+
+- `BufferPool::usage() -> PoolUsage`：无需运行时上下文，即使 Runtime 已销毁也能查询保留的池。普通 arena 的容量、占用、空闲与最大连续空闲 extent 单独计量；distinct lease 容量／占用／可用包含 normal 和 external 租约以及等待 provider 接受的回收。别名不重复收费，payload 统计使用 allocation 容量，不是初始化或可见字节数；外部 backing 不计入普通 arena 字节。查询不调用 recycler。
+- `runtime::resource_snapshot() -> io::Result<WorkerResources>`：当前 worker 的身份、后端名、Core socket／operation 占用及可用槽和上限、排队 receive／accept 结果、Core send-byte 准入预算、池和 driver 快照。没有运行中 worker 时保持 `NotConnected`；I/O 分发或回调重入导致不可变借用不可用时返回 `WouldBlock`，不 panic。不提供隐式全 Runtime 汇总，不把自动 spawn N 次当成逐 worker 遍历。
+- `UdpSocket::receive_snapshot() -> io::Result<ReceiveResources>`：沿用 socket 的 owner／存活检查，报告该 socket 的队列容量／占用、waiter、逻辑接收是否活跃、Core 额度更新是否待提交、后端当前发布额度以及可用的 native／RIO 细节。Core 队列余量和 driver 已获额度可能暂时不同；查询绝不为消除差异而 flush。
+
+`DriverResources` 统计保留的 socket／operation 槽、实际可用槽、软件持有的完成记录、关闭后仍保留的 socket，以及可用时的 native outstanding／retiring operation 数。后两者计 operation record，不计裸 SQE/CQE、唤醒或取消控制请求。Linux 包含仍有 native 操作或零拷贝 guard 的记录；Windows 使用尚未收割完成的 RIO／overlapped 状态，包含 deferred commit；“retiring”是其中已经停止／取消或 socket 关闭的子集。Android readiness 没有这种跨异步调用的 native 内存引用，两项返回 `None`，不能以零冒充同一后端模型。软件快照不是内核／NIC 瞬时可用接收数量。
+
+Windows 单 UDP socket 的 RIO 分区报告已准入 lane、完成后待发布的数据、空闲 lane、最近一次补挂因 pool 不足而暂停的 lane、累计 rearm allocation failures、commit pending 和 stopping。`DatagramReceive.pending` 同时包含 native 未完成及已完成未发布的工作，不能直接命名为 posted receives。pool-blocked 标记只表示最近一次尝试，资源刚归还但尚未再次补挂时可以仍为真；它在该 lane 成功获得可写存储时清除。仅真实分配 `WouldBlock` 分支递增本地饱和 `u64`，分别保留 socket 生命周期计数和 worker 累计计数；不是丢包数，也不是不同数据包的失败数。其他后端的 RIO 分区及计数为 `None`。
+
+成功查询只读现有 owner-local 状态：不分配、复制 payload、持有全局锁、增加逐包原子计数或调用 OS；不 poll、回收、试分配、重投、消耗 credits 或唤醒任务。池扫描 free extents，worker 扫描有界 socket／operation 表，单 RIO socket 只遍历自己的 lane；成本按需发生，不维护成功 I/O 的镜像统计。查询返回值可跨线程传递，但不因此使 Runtime／socket／lease 可迁移。跨 worker 采集不是同一时刻的原子视图，时间戳、序列化、展示和告警属于调用方。
+
+验收围绕可见转移：字节足够但 lease 耗尽、总空闲足够但连续 extent 不足、provider 拒绝回收、旧 RX 租约阻止补挂及释放后恢复、已排队 waiter 取消、关闭后的 native 退役、join 结果继续拥有租约，以及重入查询明确失败。查询前后资源和交付行为必须相同，重复成功查询必须无分配。Windows 原生回环与各平台编译／原生证据分别记录，不用静态检查冒充 native 生命周期证明。
+
+关闭轮询可能在同一轮软件 service 中释放最后一个尚未投递的窗口，且不生成应用完成事件。Windows 在 shutdown 期间必须于进入 IOCP 等待前再次确认 driver 是否已经 idle；已收敛时只做非阻塞收割，不能等待一个再也不会到达的完成。该检查不把正常 idle 运行改成自旋，也不伪造 native 完成或释放。
 
 ## 6. 功能选择与能力契约
 

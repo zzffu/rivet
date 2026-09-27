@@ -28,6 +28,7 @@ compile_error!("rivet supports Linux, Windows, and Android");
 pub mod buffer;
 pub mod capability;
 pub mod config;
+pub mod diagnostics;
 pub mod io;
 pub mod net;
 pub mod runtime;

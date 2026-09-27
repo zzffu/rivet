@@ -33,6 +33,7 @@ use crate::{
     buffer::{BufferPool, SendPayload, WriteBuf},
     capability::{CapabilityReport, KernelVersion, ZcStats},
     config::{Optimization, Policy, RuntimeConfig},
+    diagnostics::DriverResources,
     driver::{Arena, Event, Received, SendOutcome, SocketId, SocketInfo, SocketKind, Token},
     socket::{ImportError, OwnedSocket, SocketOptions},
 };
@@ -1176,6 +1177,67 @@ impl Driver {
             return result;
         }
         ZcStats::default()
+    }
+
+    /// Counts occupied application operation records, not SQEs or internal
+    /// wake/cancel/control requests. A TX record remains native-outstanding
+    /// while either its request or its separate zero-copy guard is active.
+    /// Software completions are retained deferred entries (a receive bundle
+    /// may expand into several) plus the one CQE awaiting deferred capacity;
+    /// neither the mapped CQ nor the ready-to-submit queue is inspected.
+    pub fn resource_snapshot(&self) -> DriverResources {
+        let mut operations = 0;
+        let mut native_outstanding = 0;
+        let mut retiring_native = 0;
+        for op in self.operations.iter() {
+            if op.kind == Kind::Idle {
+                continue;
+            }
+            operations += 1;
+            let native = op.native_pending;
+            #[cfg(feature = "zc-tx")]
+            let native = native || !op.zc.is_idle();
+            if native {
+                native_outstanding += 1;
+                let closing = self.sockets.get(op.socket.0).is_some_and(|s| s.closing);
+                #[cfg(feature = "tcp-splice")]
+                let closing = closing
+                    || op
+                        .destination
+                        .and_then(|socket| self.sockets.get(socket.0))
+                        .is_some_and(|s| s.closing);
+                if op.stopping || closing || self.stopping {
+                    retiring_native += 1;
+                }
+            }
+        }
+        DriverResources {
+            sockets: self.sockets.len(),
+            available_socket_slots: self.sockets.available(),
+            operations,
+            available_operation_slots: self.free_operations.len(),
+            pending_completions: self.deferred.len() + usize::from(self.blocked_ingest.is_some()),
+            closing_sockets: self.sockets.iter().filter(|(_, s)| s.closing).count(),
+            native_outstanding: Some(native_outstanding),
+            retiring_native: Some(retiring_native),
+            rio_receive_queue_slots: None,
+            udp_rearm_allocation_failures_total: None,
+        }
+    }
+
+    /// The persistent receive owns at most one native request, including a
+    /// multishot request; retained publications are not additional requests.
+    /// Credits are the last installed driver credits, not Core's dirty update.
+    pub fn receive_snapshot(&self, socket: SocketId) -> io::Result<crate::driver::ReceiveState> {
+        let entry = self.check_socket(socket, None)?;
+        let native_outstanding = entry
+            .receive
+            .map_or(0, |key| usize::from(self.op(key).unwrap().native_pending));
+        Ok(crate::driver::ReceiveState {
+            publication_credits: entry.receive_credits,
+            native_outstanding: Some(native_outstanding),
+            rio: None,
+        })
     }
 }
 

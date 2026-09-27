@@ -38,7 +38,10 @@ impl Driver {
         let operation = self.operations.get_mut(key).unwrap();
         let record = self.sockets.get_mut(operation.socket.0).unwrap();
         let OperationKind::DatagramReceive {
-            writable, reserve, ..
+            writable,
+            reserve,
+            last_pool_blocked,
+            ..
         } = &mut operation.kind
         else {
             unreachable!()
@@ -56,10 +59,21 @@ impl Driver {
                         *writable = Some(buffer);
                         drop(reserve.take());
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        *last_pool_blocked = true;
+                        let group = record.datagrams.as_mut().unwrap();
+                        group.rearm_allocation_failures_total =
+                            group.rearm_allocation_failures_total.saturating_add(1);
+                        self.udp_rearm_allocation_failures_total =
+                            self.udp_rearm_allocation_failures_total.saturating_add(1);
+                        return Ok(());
+                    }
                     Err(error) => return Err(error),
                 }
             }
+        }
+        if *last_pool_blocked {
+            *last_pool_blocked = false;
         }
         let buffer = writable.as_mut().unwrap();
         buffer.clear();

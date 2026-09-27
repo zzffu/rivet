@@ -37,6 +37,9 @@ impl Driver {
             || events.len() != initial_events
             || event_budget == 0
             || completion_budget == 0
+            // Software service can retire an unprimed window without an event.
+            // Shutdown must not sleep after its last native owner has retired.
+            || (self.shutting_down && self.is_idle())
         {
             Some(Duration::ZERO)
         } else {

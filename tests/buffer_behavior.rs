@@ -130,26 +130,69 @@ fn only_initialized_bytes_are_published_and_failed_append_is_atomic() {
 }
 
 #[test]
+fn usage_distinguishes_free_payload_from_exhausted_lease_metadata() {
+    let pool = pool(32, 8, 1);
+    let empty = pool.usage();
+    assert_eq!(empty.payload_capacity(), 32);
+    assert_eq!(empty.payload_available(), 32);
+    assert_eq!(empty.payload_in_use(), 0);
+    assert_eq!(empty.largest_free_extent(), 32);
+    assert_eq!(empty.lease_capacity(), 1);
+    assert_eq!(empty.leases_available(), 1);
+    assert_eq!(empty.leases_in_use(), 0);
+    assert_eq!(empty.pending_recycles(), 0);
+
+    let lease = pool.try_acquire().unwrap();
+    let occupied = pool.usage();
+    assert_eq!(occupied.payload_available(), 24);
+    assert_eq!(occupied.payload_in_use(), 8);
+    assert_eq!(occupied.largest_free_extent(), 24);
+    assert_eq!(occupied.leases_available(), 0);
+    assert_eq!(occupied.leases_in_use(), 1);
+    assert_eq!(
+        pool.try_acquire().unwrap_err().kind(),
+        ErrorKind::WouldBlock
+    );
+    let allocations = allocations_during(|| {
+        for _ in 0..128 {
+            assert_eq!(pool.usage(), occupied);
+        }
+    });
+    assert_eq!(allocations, 0, "pool usage must not allocate");
+
+    drop(lease);
+    assert_eq!(pool.usage(), empty);
+}
+
+#[test]
 fn every_alias_including_empty_ranges_keeps_memory_unwritable() {
     let pool = pool(8, 8, 1);
+    let empty_usage = pool.usage();
     let original = filled(&pool, b"abcdef");
+    let occupied_usage = pool.usage();
+    assert_eq!(occupied_usage.payload_in_use(), 8);
+    assert_eq!(occupied_usage.leases_in_use(), 1);
     let clone = original.clone();
     let middle = original.slice(2..5);
     let empty = middle.slice(1..1);
+    assert_eq!(pool.usage(), occupied_usage);
     drop(original);
     drop(clone);
     assert_eq!(middle.as_slice(), b"cde");
+    assert_eq!(pool.usage(), occupied_usage);
     assert_eq!(
         pool.try_acquire().unwrap_err().kind(),
         ErrorKind::WouldBlock
     );
     drop(middle);
     assert!(empty.is_empty());
+    assert_eq!(pool.usage(), occupied_usage);
     assert_eq!(
         pool.try_acquire().unwrap_err().kind(),
         ErrorKind::WouldBlock
     );
     drop(empty);
+    assert_eq!(pool.usage(), empty_usage);
     let mut recovered = pool.try_acquire().unwrap();
     recovered.extend_from_slice(b"reused!").unwrap();
     assert_eq!(recovered.freeze().as_slice(), b"reused!");
@@ -205,6 +248,10 @@ fn variable_size_allocations_obey_budget_and_coalesce_after_last_alias() {
     let mut middle = pool.try_acquire_at_least(13).unwrap();
     middle.extend_from_slice(b"large-payload").unwrap();
     let last = pool.try_acquire_at_least(7).unwrap();
+    let full = pool.usage();
+    assert_eq!(full.payload_available(), 0);
+    assert_eq!(full.largest_free_extent(), 0);
+    assert_eq!(full.leases_in_use(), 3);
     assert_eq!(
         pool.try_acquire().unwrap_err().kind(),
         ErrorKind::WouldBlock
@@ -220,11 +267,20 @@ fn variable_size_allocations_obey_budget_and_coalesce_after_last_alias() {
     drop(last);
     drop(middle);
     assert_eq!(retained.as_slice(), b"payload");
+    let fragmented = pool.usage();
+    assert_eq!(fragmented.payload_available(), 11);
+    assert_eq!(fragmented.payload_in_use(), 13);
+    assert_eq!(fragmented.largest_free_extent(), 7);
+    assert_eq!(fragmented.leases_available(), 5);
     assert_eq!(
-        pool.try_acquire_at_least(13).unwrap_err().kind(),
+        pool.try_acquire_at_least(8).unwrap_err().kind(),
         ErrorKind::WouldBlock
     );
     drop(retained);
+    let coalesced = pool.usage();
+    assert_eq!(coalesced.payload_available(), 24);
+    assert_eq!(coalesced.largest_free_extent(), 24);
+    assert_eq!(coalesced.leases_available(), 6);
 
     let whole_arena = pool.try_acquire_at_least(24).unwrap();
     assert_eq!(whole_arena.capacity(), 24);
@@ -319,6 +375,7 @@ struct RefillQueue {
     queued: Mutex<VecDeque<ReturnToken>>,
     accepted: Mutex<Vec<ReturnToken>>,
     retired: AtomicBool,
+    attempts: AtomicUsize,
 }
 
 impl RefillQueue {
@@ -328,6 +385,7 @@ impl RefillQueue {
             queued: Mutex::new(VecDeque::new()),
             accepted: Mutex::new(Vec::new()),
             retired: AtomicBool::new(false),
+            attempts: AtomicUsize::new(0),
         })
     }
     fn consume(&self) -> Option<ReturnToken> {
@@ -340,6 +398,7 @@ impl RefillQueue {
 
 impl Recycle for RefillQueue {
     fn recycle(&self, token: ReturnToken) -> bool {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         if !self.retired.load(Ordering::SeqCst) {
             let mut queued = self.queued.lock();
             if queued.len() == self.capacity {
@@ -528,6 +587,140 @@ impl Wake for WakeCount {
 }
 
 #[test]
+fn usage_does_not_retry_pending_returns_or_notify_the_owner() {
+    let pool = pool(8, 8, 1);
+    let notifications = Arc::new(WakeCount(AtomicUsize::new(0)));
+    pool.set_recycle_waker(Waker::from(notifications.clone()));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let memory = CpuArea::new(b"external", &drops);
+    let recycler = RefillQueue::new(0);
+    let token = ReturnToken {
+        offset: 0,
+        length: 8,
+        tag: 40,
+    };
+    let external = unsafe {
+        pool.lease_external(memory, 0, 8, recycler.clone(), token)
+            .unwrap()
+    };
+    let live = pool.usage();
+    assert_eq!(live.payload_available(), 8);
+    assert_eq!(live.payload_in_use(), 0);
+    assert_eq!(live.leases_in_use(), 1);
+    assert_eq!(live.pending_recycles(), 0);
+    drop(external);
+
+    let pending = pool.usage();
+    assert_eq!(pending.payload_available(), 8);
+    assert_eq!(pending.payload_in_use(), 0);
+    assert_eq!(pending.largest_free_extent(), 8);
+    assert_eq!(pending.leases_available(), 0);
+    assert_eq!(pending.pending_recycles(), 1);
+    let notifications_before = notifications.0.load(Ordering::SeqCst);
+    let attempts_before = recycler.attempts.load(Ordering::SeqCst);
+    assert_eq!(attempts_before, 1);
+
+    // The provider can now accept the return; observation must not retry it.
+    recycler.retired.store(true, Ordering::SeqCst);
+    let allocations = allocations_during(|| {
+        for _ in 0..128 {
+            assert_eq!(pool.usage(), pending);
+        }
+    });
+    assert_eq!(allocations, 0, "pending-return usage must not allocate");
+    assert_eq!(recycler.attempts.load(Ordering::SeqCst), attempts_before);
+    assert_eq!(notifications.0.load(Ordering::SeqCst), notifications_before);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        pool.try_acquire().unwrap_err().kind(),
+        ErrorKind::WouldBlock
+    );
+
+    pool.flush_recycles();
+    assert_eq!(recycler.accepted(), vec![token]);
+    assert_eq!(
+        recycler.attempts.load(Ordering::SeqCst),
+        attempts_before + 1
+    );
+    assert!(notifications.0.load(Ordering::SeqCst) > notifications_before);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(pool.usage().pending_recycles(), 0);
+    assert_eq!(pool.usage().leases_available(), 1);
+    assert_eq!(pool.usage().payload_available(), 8);
+}
+
+#[test]
+fn usage_remains_available_inside_recycle_and_wake_callbacks() {
+    use std::cell::RefCell;
+
+    thread_local! {
+        #[cfg_attr(
+            target_os = "android",
+            allow(
+                clippy::missing_const_for_thread_local,
+                reason = "Already const; Android std TLS false positive (rust-lang/rust-clippy#13422)."
+            )
+        )]
+        static OBSERVED_POOL: RefCell<Option<BufferPool>> = const { RefCell::new(None) };
+    }
+    #[derive(Default)]
+    struct Observer(Mutex<Option<rivet::diagnostics::PoolUsage>>);
+    impl Observer {
+        fn observe(&self) {
+            OBSERVED_POOL.with(|pool| {
+                *self.0.lock() = Some(pool.borrow().as_ref().unwrap().usage());
+            });
+        }
+    }
+    impl Recycle for Observer {
+        fn recycle(&self, _: ReturnToken) -> bool {
+            self.observe();
+            true
+        }
+    }
+    impl Wake for Observer {
+        fn wake(self: Arc<Self>) {
+            self.observe();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observe();
+        }
+    }
+
+    let pool = pool(8, 8, 1);
+    let empty = pool.usage();
+    OBSERVED_POOL.with(|observed| *observed.borrow_mut() = Some(pool.clone()));
+    let notifications = Arc::new(Observer::default());
+    pool.set_recycle_waker(Waker::from(notifications.clone()));
+    drop(pool.try_acquire().unwrap());
+    assert_eq!(*notifications.0.lock(), Some(empty));
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let memory = CpuArea::new(b"external", &drops);
+    let recycler = Arc::new(Observer::default());
+    let external = unsafe {
+        pool.lease_external(
+            memory,
+            0,
+            8,
+            recycler.clone(),
+            ReturnToken {
+                offset: 0,
+                length: 8,
+                tag: 42,
+            },
+        )
+        .unwrap()
+    };
+    let occupied = pool.usage();
+    drop(external);
+    assert_eq!(*recycler.0.lock(), Some(occupied));
+    assert_eq!(*notifications.0.lock(), Some(empty));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    OBSERVED_POOL.with(|observed| observed.borrow_mut().take());
+}
+
+#[test]
 fn alias_uniqueness_and_pending_returns_wake_the_owner_without_idle_spin() {
     let pool = pool(8, 8, 1);
     let notifications = Arc::new(WakeCount(AtomicUsize::new(0)));
@@ -667,4 +860,123 @@ fn repeated_normal_and_external_leases_reuse_preallocated_storage() {
         "warm leases must not allocate payload or control blocks"
     );
     assert_eq!(recycler.0.load(Ordering::SeqCst), 128);
+}
+
+#[test]
+fn successful_pool_worker_and_udp_observation_allocates_nothing() {
+    use futures_lite::future::poll_once;
+    use rivet::{Optimization, Policy, Runtime, RuntimeConfig, SocketOptions, UdpSocket, runtime};
+    use std::time::Duration;
+
+    let mut config = RuntimeConfig::single_thread()
+        .with_policy(Optimization::ProvidedBuffers, Policy::Off)
+        .with_policy(Optimization::RegisteredBuffers, Policy::Off);
+    config.limits.max_tasks = 4;
+    config.limits.max_sockets = 1;
+    config.limits.max_operations = 8;
+    config.limits.max_pending_receives = 2;
+    config.limits.max_pending_accepts = 2;
+    config.limits.pool.bytes = 64 * 1024;
+    config.limits.pool.block_size = 1024;
+    config.limits.pool.max_leases = 64;
+    let mut runtime = Runtime::new(config).unwrap();
+    let pool = runtime.buffer_pool();
+    let retained = filled(&pool, b"alive after runtime");
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+
+    runtime.block_on(async {
+        let socket = UdpSocket::bind_with_options(
+            "127.0.0.1:0".parse().unwrap(),
+            SocketOptions {
+                receive_chunk: 1024,
+                ..SocketOptions::udp()
+            },
+        )
+        .unwrap();
+        let mut receive = socket.recv();
+        assert!(poll_once(&mut receive).await.is_none());
+        let waiting = socket.receive_snapshot().unwrap();
+        assert!(waiting.active());
+        assert!(waiting.waiter_registered());
+        assert_eq!(waiting.queue_capacity(), 2);
+        assert_eq!(waiting.queued_results(), 0);
+        assert_eq!(waiting.queue_available(), 2);
+        let admitted = runtime::resource_snapshot().unwrap();
+        assert_eq!(admitted.sockets(), 1);
+        assert_eq!(admitted.socket_capacity(), 1);
+        assert_eq!(admitted.available_socket_slots(), 0);
+        assert_eq!(admitted.operations(), 1);
+        assert_eq!(admitted.operation_capacity(), 8);
+        assert_eq!(admitted.available_operation_slots(), 7);
+        assert_eq!(
+            UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::WouldBlock
+        );
+
+        let bytes = b"queued observation";
+        assert_eq!(
+            sender.send_to(bytes, socket.local_addr()).unwrap(),
+            bytes.len()
+        );
+        rivet::time::timeout(Duration::from_secs(5), async {
+            while socket.receive_snapshot().unwrap().queued_results() != 1 {
+                runtime::yield_now().await;
+            }
+        })
+        .await
+        .expect("native UDP result must reach the bounded receive queue");
+
+        let expected_pool = pool.usage();
+        let expected_worker = runtime::resource_snapshot().unwrap();
+        let expected_receive = socket.receive_snapshot().unwrap();
+        assert_eq!(expected_worker.sockets(), 1);
+        assert_eq!(expected_worker.available_socket_slots(), 0);
+        assert_eq!(expected_worker.driver().sockets(), 1);
+        assert_eq!(expected_worker.queued_receives(), 1);
+        assert_eq!(expected_worker.pool(), &expected_pool);
+        assert_eq!(expected_receive.queued_results(), 1);
+        assert_eq!(expected_receive.queue_available(), 1);
+        assert!(expected_receive.waiter_registered());
+        let allocations = allocations_during(|| {
+            for _ in 0..128 {
+                assert_eq!(pool.usage(), expected_pool);
+                assert_eq!(runtime::resource_snapshot().unwrap(), expected_worker);
+                assert_eq!(socket.receive_snapshot().unwrap(), expected_receive);
+            }
+        });
+        assert_eq!(
+            allocations, 0,
+            "successful resource queries must not allocate"
+        );
+
+        let received = receive.await.unwrap();
+        assert_eq!(received.data.as_slice(), bytes);
+        assert_eq!(received.peer, Some(sender.local_addr().unwrap()));
+    });
+
+    drop(runtime);
+    let after_runtime = pool.usage();
+    assert_eq!(after_runtime.payload_capacity(), 64 * 1024);
+    assert_eq!(after_runtime.payload_in_use(), 1024);
+    assert_eq!(after_runtime.payload_available(), 63 * 1024);
+    assert_eq!(after_runtime.leases_in_use(), 1);
+    assert_eq!(after_runtime.leases_available(), 63);
+    assert_eq!(after_runtime.pending_recycles(), 0);
+    assert_eq!(retained.as_slice(), b"alive after runtime");
+    let allocations = allocations_during(|| {
+        for _ in 0..128 {
+            assert_eq!(pool.usage(), after_runtime);
+        }
+    });
+    assert_eq!(
+        allocations, 0,
+        "retained pool observation must not allocate"
+    );
+    drop(retained);
+    let released = pool.usage();
+    assert_eq!(released.payload_available(), released.payload_capacity());
+    assert_eq!(released.largest_free_extent(), released.payload_capacity());
+    assert_eq!(released.leases_available(), released.lease_capacity());
 }

@@ -1,7 +1,10 @@
 use crate::{
     buffer::SendPayload,
     config::Limits,
-    driver::{Arena, Driver, Event, Received, SendOutcome, SocketInfo, SocketKind, Token},
+    diagnostics::{DriverResources, PoolUsage, ReceiveResources, WorkerResources},
+    driver::{
+        Arena, Driver, Event, ReceiveState, Received, SendOutcome, SocketInfo, SocketKind, Token,
+    },
 };
 use std::{
     collections::VecDeque,
@@ -131,6 +134,60 @@ impl IoState {
             dirty_credits: Vec::with_capacity(limits.max_sockets),
         }
     }
+    pub fn resource_snapshot(
+        &self,
+        worker: usize,
+        backend: &'static str,
+        pool: PoolUsage,
+        driver: DriverResources,
+    ) -> WorkerResources {
+        let (queued_receives, queued_accepts) =
+            self.sockets
+                .iter()
+                .fold((0, 0), |(receives, accepts), (_, socket)| {
+                    (
+                        receives + socket.receives.len(),
+                        accepts + socket.accepts.len(),
+                    )
+                });
+        WorkerResources {
+            worker,
+            backend,
+            sockets: self.sockets.len(),
+            socket_capacity: self.limits.max_sockets,
+            available_socket_slots: self.sockets.available(),
+            operations: self.operations.len(),
+            operation_capacity: self.limits.max_operations,
+            available_operation_slots: self.operations.available(),
+            queued_receives,
+            queued_accepts,
+            send_bytes: self.send_bytes,
+            send_byte_capacity: self.limits.max_send_bytes,
+            pool,
+            driver,
+        }
+    }
+
+    pub fn receive_snapshot(
+        &self,
+        key: u64,
+        worker: usize,
+        native: ReceiveState,
+    ) -> io::Result<ReceiveResources> {
+        let socket = self.sockets.get(key).ok_or_else(closed)?;
+        Ok(ReceiveResources {
+            worker,
+            queue_capacity: self.limits.max_pending_receives,
+            queued_results: socket.receives.len(),
+            waiter_registered: socket.receive_waiter.is_some(),
+            active: socket.receive_token.is_some(),
+            credits_pending: socket.credits_dirty,
+            backend_publication_credits: native.publication_credits,
+            native_outstanding: native.native_outstanding,
+            rio: native.rio,
+        })
+    }
+
     pub fn can_open(&self) -> io::Result<()> {
         if self.closing {
             return Err(closed());

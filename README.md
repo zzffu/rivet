@@ -230,6 +230,53 @@ Android 的 `android_network` 使用真实 `android_setsocknetwork`。已连接�
 
 准入失败仍保留原错误类别：池／槽位暂时不足为 `WouldBlock`，单块超过池等非法请求为 `InvalidInput`，原生调用保留 OS 错误。窗口失败诊断显示请求规模和配置预算，不把总预算冒充当前空闲量。碎片、旧租约和慢消费都可能暂停 rearm；窗口扩大是突发容量与并发 socket 成本的取舍，不是无丢包保证。详细 RQ 预约及所有权规则见[系统架构](docs/architecture.md#54-windows-udp-容量规划)。
 
+## 按需资源诊断
+
+三个只读入口返回 `rivet::diagnostics` 中的独立值类型，不改变配置或驱动行为：
+
+| 查询 | 范围 |
+| --- | --- |
+| `pool.usage()` | 指定池的普通 arena 字节、最大连续空闲块、distinct lease 槽和待重试外部回收；不依赖 Runtime 存活 |
+| `runtime::resource_snapshot()?` | **当前 worker** 的 Core 准入／队列、池及 native driver 状态，不是全 Runtime 汇总 |
+| `udp.receive_snapshot()?` | 当前 worker 所拥有的这一个 UDP socket：队列、waiter、发布额度和可用的 native／RIO 细节 |
+
+例如在持有 socket 的 worker 上低频查询：
+
+```rust
+fn observe(udp: &rivet::UdpSocket) -> std::io::Result<()> {
+    let worker = rivet::runtime::resource_snapshot()?;
+    let receive = udp.receive_snapshot()?;
+    println!(
+        "worker={} pool_free={} largest_extent={} free_leases={} queued={} native={:?}",
+        worker.worker(),
+        worker.pool().payload_available(),
+        worker.pool().largest_free_extent(),
+        worker.pool().leases_available(),
+        receive.queued_results(),
+        receive.native_outstanding(),
+    );
+    if let Some(rio) = receive.rio() {
+        println!(
+            "lanes={} ready={} idle={} last_pool_blocked={} allocation_failures={}",
+            rio.admitted_lanes(),
+            rio.ready_results(),
+            rio.idle_lanes(),
+            rio.last_pool_blocked_lanes(),
+            rio.rearm_allocation_failures_total(),
+        );
+    }
+    Ok(())
+}
+```
+
+- 普通池按 allocation 容量收费，别名／切片不会重复计数；外部 backing 的字节不在普通 arena 中，但占用相同的 lease 槽。空闲字节不等于可分配：还要检查 lease 可用量及 `max(请求尺寸, 配置的 block_size)` 是否能放入最大连续 extent。
+- Core socket／operation 和 driver 保留的记录是不同域。任务 join 或逻辑 socket 消失后，native 请求、待交付完成和用户租约可以继续存在。`send_bytes()` 是 Core 准入额度，不是对端 ACK 或所有内核占用字节。
+- `queue_available()` 是 Core 队列余量，`backend_publication_credits()` 是后端已经获得的额度；`credits_pending()` 为真时可能暂时不同。查询不 flush，也不会为未开始接收的 Linux／Android UDP 自动注册操作。
+- native outstanding 计尚待完成／释放的应用 operation record，不是 SQE/CQE 总数或 NIC 可用槽。Linux 包含仍活跃的 ZC guard，Windows 包含 deferred RIO submission；Android 相应字段为 `None`。RIO 分区在其他平台或原生窗口已退役后为 `None`，不能把缺失当成零压力。
+- `last_pool_blocked_lanes()` 只记录上次补挂失败；内存刚归还但未再尝试时可仍非零。failure counter 只在真实替换分配 `WouldBlock` 时递增并饱和，worker 累计值跨 socket 关闭保留；它不是丢包数。
+
+成功查询无分配、不复制 payload、不调用 OS、不 poll／回收／重投／修改 credits／唤醒。它按需扫描有界表和 free extents，不能当作逐包热路径计数器。无运行中 worker 返回 `NotConnected`，错误 worker／销毁 Runtime 沿用 socket 上下文错误；完成回调重入遇到 Core／driver 可变借用时返回 `WouldBlock` 而非 panic。快照不持有资源，可以交给上层展示或序列化；跨 worker 不承诺同一时刻一致，也不附带采样线程、日志、exporter 或自动容量调整。
+
 ## Linux 优化策略
 
 默认编译 `linux-full`，Linux 在初始化期间根据已编译实现、内核版本／修复条件、实际原生能力和资源选择合法组合。**不是把每项策略都设为 Auto，也不是版本足够就全开**：
@@ -307,6 +354,15 @@ cargo run --release --all-features --example loopback -- --enable zc-rx-nodev --
 Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用普通 App，支持 `-Abi x86_64` 和 `-Abi arm64-v8a`，不依赖 Gradle。NDK 目标和 APK 最低版本为 API23，JNI 库采用 16KiB ELF／APK 对齐和真正未压缩的 ZIP 条目，并保留 API23 所需的 v1 签名。界面、`RivetSmoke` logcat 标签和私有 `files/smoke-result.json` 给出结构化结果；每次进程运行先清除旧成功状态，JNI 初始化失败也持久化。验证 APK 的 debuggable 配置和测试签名不能用于生产应用。
 
 ### 已执行的原生验证
+
+资源可观测性改进的本轮验证（2026-09-28）：
+
+- Windows x64 IPv4：默认及 `--all-features --all-targets` 各 **145 通过、0 失败**；`--no-default-features` 的池／资源观测回归 **22 通过**。覆盖无分配采集、回收／唤醒无副作用、重入时 `WouldBlock`、worker 隔离、取消后的队列保留和 Runtime 销毁后的未消费任务结果。
+- `native_traits -- --workers 2` 与 `runtime_services -- --workers 2` 实跑通过。临时外部消费者实际观察到 RIO 替换分配受阻、释放内存后由后续 worker 推进恢复、逻辑关闭后的 native retirement，以及 Runtime 销毁后仍由用户租约持有的 256 字节最终归还；采集本身不执行这些转换。验证后删除临时源码。
+- 新原生回归暴露 Windows 关闭期间的软件退休／IOCP 等待缺口；调试器确认最后一个未投递窗口已退休、无原生请求与完成事件，却仍准备无限等待。补上关闭后的 idle 复查后，该回归和整套 Windows 测试通过。
+- Linux x86_64：隔离 **6.18.54-1-lts** TCG guest 中，全 feature 及精简静态 musl 构建的 `buffer_behavior`／`resource_observation` 各 **21 通过**，全 feature `native_traits` 完成真实 TCP／UDP 收发并输出 io_uring 快照。guest 校验了全部五个 ELF 的 SHA-256 和零退出码；仅 root／loopback，无 NIC、宿主挂载或磁盘。
+- 严格 Clippy、严格 rustdoc、格式检查通过。Linux x86_64 的全 feature／精简 all-targets、Android ARM64／x86_64 的全 feature／all-targets 和独立 Android ARM64 smoke 包编译检查通过；Android 检查不是 APK 安装或原生执行。
+- `RIVET_VERIFY_IPV4_ONLY=1` 仅作用于 Windows 测试子进程；本轮未执行 Windows IPv6、Android 原生、物理 NIC 或吞吐验证，未修改宿主 TUN／网络。命令、日志及关闭缺口的诊断索引：`artifacts/resource-observation-20260928/verification-summary.json`。
 
 本轮缓冲区／容量／生命周期 Interface 改进的验证（2026-09-28）：
 
