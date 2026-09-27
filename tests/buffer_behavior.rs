@@ -94,6 +94,7 @@ fn only_initialized_bytes_are_published_and_failed_append_is_atomic() {
     let mut buffer = pool.try_acquire().unwrap();
     assert_eq!(buffer.initialized_len(), 0);
     assert_eq!(buffer.as_slice(), b"");
+    assert_eq!(buffer.as_mut_slice(), b"");
 
     for (destination, byte) in buffer.spare_capacity_mut().iter_mut().zip(*b"abc") {
         destination.write(byte);
@@ -103,15 +104,19 @@ fn only_initialized_bytes_are_published_and_failed_append_is_atomic() {
     }
     buffer.extend_from_slice(b"de").unwrap();
     assert_eq!(buffer.as_slice(), b"abcde");
+    buffer.as_mut_slice()[1..4].make_ascii_uppercase();
+    assert_eq!(buffer.as_slice(), b"aBCDe");
+    assert!(buffer.as_mut_slice().get_mut(5).is_none());
     assert_eq!(
         buffer.extend_from_slice(b"toolong").unwrap_err().kind(),
         ErrorKind::InvalidInput
     );
-    assert_eq!(buffer.as_slice(), b"abcde");
+    assert_eq!(buffer.as_slice(), b"aBCDe");
     assert_eq!(buffer.spare_capacity_mut().len(), 3);
 
     buffer.clear();
     assert_eq!(buffer.as_slice(), b"");
+    assert_eq!(buffer.as_mut_slice(), b"");
     buffer.extend_from_slice(b"xy").unwrap();
     let published = buffer.freeze();
     assert_eq!(published.as_slice(), b"xy");
@@ -163,9 +168,10 @@ fn unique_normal_views_recover_only_their_own_initialized_range() {
     drop(original);
     let mut writable = middle.try_into_write().unwrap();
     assert_eq!(writable.as_slice(), b"cd");
+    writable.as_mut_slice().make_ascii_uppercase();
     assert_eq!(writable.capacity(), 6);
     writable.extend_from_slice(b"XY").unwrap();
-    assert_eq!(writable.as_slice(), b"cdXY");
+    assert_eq!(writable.as_slice(), b"CDXY");
     writable.clear();
     writable.extend_from_slice(b"reuse!").unwrap();
     assert_eq!(writable.as_slice(), b"reuse!");
@@ -174,6 +180,21 @@ fn unique_normal_views_recover_only_their_own_initialized_range() {
     let restored = pool.try_acquire_at_least(8).unwrap();
     assert_eq!(restored.capacity(), 8);
     assert_eq!(restored.initialized_len(), 0);
+}
+
+#[test]
+fn empty_end_slice_can_recover_an_empty_mutable_view() {
+    let pool = pool(8, 8, 1);
+    let original = filled(&pool, b"12345678");
+    let end = original.slice(8..8);
+    drop(original);
+    let mut writable = end.try_into_write().unwrap();
+    assert_eq!(writable.as_mut_slice(), b"");
+    assert_eq!(
+        writable.extend_from_slice(b"x").unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(writable.freeze().as_slice(), b"");
 }
 
 #[test]

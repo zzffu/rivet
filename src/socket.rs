@@ -44,7 +44,15 @@ pub struct SocketOptions {
     pub reuse_address: bool,
     pub reuse_port: bool,
     pub only_v6: Option<bool>,
+    /// Maximum bytes requested per native receive; UDP defaults to 65,536.
+    ///
+    /// A pool allocation is at least its configured block size. On Windows,
+    /// every UDP receive lane reserves its own allocation; increasing this
+    /// value multiplies the per-socket cost of `Limits::max_pending_receives`.
     pub receive_chunk: usize,
+    /// OS receive-buffer request, separate from Rivet's registered receive pool.
+    /// This does not replace posted Windows RIO UDP receives or guarantee that
+    /// datagrams queue in the kernel when no receive is posted.
     pub receive_buffer_bytes: Option<usize>,
     pub send_buffer_bytes: Option<usize>,
     pub backlog: i32,

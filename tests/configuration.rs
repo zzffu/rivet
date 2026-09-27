@@ -155,6 +155,53 @@ fn unaddressable_completion_queue_is_a_configuration_error() {
 }
 
 #[test]
+fn windows_udp_payload_estimate_uses_exact_allocations_and_the_shared_pool_minimum() {
+    let mut limits = rivet::config::Limits {
+        max_pending_receives: 3,
+        pool: rivet::buffer::PoolConfig {
+            bytes: 4096,
+            block_size: 1024,
+            max_leases: 8,
+        },
+        ..Default::default()
+    };
+    assert_eq!(limits.windows_udp_receive_bytes(256).unwrap(), 3072);
+    // The allocator takes exact extents, not a rounded count of pool blocks.
+    assert_eq!(limits.windows_udp_receive_bytes(1537).unwrap(), 4611);
+    // An over-budget estimate remains available for offline configuration.
+    limits.pool.bytes = 1024;
+    limits.pool.max_leases = 1;
+    limits.max_operations = 1;
+    assert_eq!(limits.windows_udp_receive_bytes(1537).unwrap(), 4611);
+}
+
+#[test]
+fn windows_udp_payload_estimate_rejects_invalid_sizes_and_overflow() {
+    for (lanes, block, chunk) in [
+        (0, 1024, 1024),
+        (1, 0, 1024),
+        (1, 1024, 0),
+        (1, 1024, i32::MAX as usize + 1),
+        (usize::MAX, 2, 1),
+    ] {
+        let limits = rivet::config::Limits {
+            max_pending_receives: lanes,
+            pool: rivet::buffer::PoolConfig {
+                bytes: 4096,
+                block_size: block,
+                max_leases: 8,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            limits.windows_udp_receive_bytes(chunk).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+            "lanes={lanes}, block={block}, chunk={chunk}",
+        );
+    }
+}
+
+#[test]
 fn polling_durations_cannot_truncate_to_unbounded_spin() {
     let mut config = RuntimeConfig::single_thread();
     config.linux.sqpoll_idle = std::time::Duration::from_nanos(1);

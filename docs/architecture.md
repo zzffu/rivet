@@ -88,6 +88,8 @@ Linux Driver 区分“等待完成或资源”和“SQ 满导致尚欠提交”�
 - 内存池及在途字节/租约数量都有上限；资源不足时施加背压或明确返回资源错误，不能无限增长。
 - 接收队列、接受队列和完成事件队列的容量在配置阶段按实际元素布局检查；不可寻址的数组返回 `InvalidInput`，不延迟到 worker／socket 创建时 panic。这不承诺任意可寻址预算都能由当前机器成功分配。
 
+`WriteBuf::as_mut_slice()` 只借出 `0..initialized_len()` 的可变字节视图，不改变长度、容量或初始化状态，不分配或复制。未初始化尾部仍只能通过 `spare_capacity_mut()` 初始化。只读租约必须先通过 `try_into_write()` 的唯一所有权检查；外部区域及尚有应用／内核别名的租约不能借此变为可写。该 Interface 将原地编解码的安全证明集中到 buffer Module，而不是让消费者从裸指针自行构造切片。
+
 接收缓冲区的“应用视图引用”和“内核剩余使用权”分别追踪。增量 buffer ring 与 ZCRX 可能让多个数据块共享同一区域；不能把一次 CQE 等同于整个缓冲区已归还。
 
 ### 5.2 发送
@@ -112,6 +114,18 @@ Drop Future 不保证撤回网络效果。未提交操作可撤销；已提交�
 普通 TCP 句柄关闭不默认设置 abortive linger：先发起写半关闭，异步收敛请求和发送释放通知，不阻塞 worker 等待对端 ACK。销毁整个 Runtime 则取消尚未结束的业务；Linux 必要时以 socket 级 `SO_LINGER(1,0)` 中止剩余连接，释放 native/fixed 引用，再等待真实内核释放。不得伪造通知或提前释放内存。需要保证业务完整交付时，应用应在销毁 Runtime 前完成 `shutdown(Write)` 与对端协议确认；发送结果本身不是远端交付确认。
 
 操作/连接使用代际 token，且内核仍可引用的槽位绝不复用。所有内核使用的控制结构必须放在稳定存储中。
+
+### 5.4 Windows UDP 容量规划
+
+`Limits` 配置复制到每个 worker，但 `max_pending_receives = N` 是每 socket 的逻辑接收队列上限；Windows UDP 还为每个 socket 预留 N 个 RIO 接收 lane。TCP 的同名队列上限不代表并行投递 N 个原生接收。worker 的 payload pool、distinct lease 槽和 operation 槽则由其全部 socket 共享。
+
+单个 UDP socket 的初始 RX payload 需求为 `N × max(receive_chunk, pool.block_size)`，每 lane 使用一个 distinct lease，不按 block 数拆成多个 lease。`Limits::windows_udp_receive_bytes(receive_chunk)` 提供有检查的纯算术计算，在所有平台可用于 Windows 部署规划；零／非法接收尺寸、零窗口／block 及乘法溢出返回 `InvalidInput`。结果允许超过当前池预算，以便调用者比较和调整；它不创建资源、不预留额度，也不保证原生初始化成功。
+
+同一 worker 的 U 个同尺寸 UDP socket 至少需要 `U × N × max(receive_chunk, pool.block_size)` payload、`U × N` distinct leases 和 driver native operation 槽；Core 另需 U 个逻辑 receive operation，两个 operation arena 分别受 `max_operations` 限制，不能合并计数。RIO RQ 的额外接收预约为 `U × (N - 1)`。异尺寸 socket 按各自需求求和。上述初始占用不包含 TX、TCP、metadata、待交付完成、关闭收敛或上层持有旧块时的替换块。
+
+例如 N=8、chunk=64 KiB、block=16 KiB、U=4 时，初始 RX 为 2 MiB／32 leases／32 native operations，另有 4 个 Core receives；若上层仍保留完整旧窗口，同时要求挂满新窗口，RX 规划需再留 2 MiB／32 leases。池总空闲字节充足仍可能因碎片缺少连续 extent，且池预算不等于进程 RSS。
+
+继续复用已有 bind/import 准入和回滚；错误补充窗口规模及资源类别，但保留 `WouldBlock`、`InvalidInput` 和原生错误身份。不得通过静默缩小窗口、扩池或提高默认槽数掩盖配置问题。未投递接收时 RIO 不保证普通 UDP 式的内核排队，`receive_buffer_bytes` 不能替代注册接收窗口。窗口耗尽时仍可能丢包；预算公式不是吞吐或无丢包承诺。本次不增加资源快照、全局遥测或热路径日志。
 
 ## 6. 功能选择与能力契约
 
@@ -209,6 +223,10 @@ Android 的中止顺序为零 linger → `connect(AF_UNSPEC)` 断开底层 TCP �
 ### 8.4 任务组和受监督连接
 
 `runtime::TaskGroup` 有明确容量，接收自动放置工厂或本地 Future，拥有所有子任务句柄。支持等待任意完成、统一 abort，以及可重试的异步 shutdown；取消一次 join/shutdown 等待不丢失其余任务的回收责任。组 Drop 请求取消，只有实际 join 才证明子任务已经终止。可克隆的 abort 控制不转移结果接收权。
+
+空组的 `join_next().await` 立即得到 `None`，不等待未来的 spawn，也不关闭任务组准入；以后仍可 spawn 并创建新的 join Future。动态 supervisor 在空组时等待外部准入／停止通知，不能对 `None` 忙循环或重复 poll 已完成的同一个 Future。普通 Future 不承诺 Ready 后继续可 poll；显式融合类型及 `Sleep::reset` 按各自契约复用，不强加统一 panic 义务，也不自动融合来隐藏 owner 状态错误。
+
+abort／Drop 是取消请求；join 证明子任务 Future／captures 的析构已经完成，不证明返回值中的资源已释放，更不证明 socket 的 native 引用已退役。Runtime 关闭另行推进 driver 到真实收敛，已发布的只读租约仍可跨 Runtime 存活。示例沿用 `runtime_services`，展示空组再次接纳和取消后 join；原生回归保留既有 burst／retirement 证据，并以唤醒或握手确认排队接收与背压状态，不用固定睡眠冒充这些状态。
 
 `TcpListener` 的受监督服务 Interface 在业务名额可用后才轮询下一次 accept，转交 idle socket 后把 handler 纳入任务组。停止信号优先于新准入；已有连接先获得协作取消通知并在宽限期内排空，超时才 abort 并 join。handler panic 和原生接管失败不能隐藏在 detached 任务中。业务名额与 driver 的有界预接受队列分别计数。简单 `serve` 也使用受监督实现，不再遗留无主 handler。
 

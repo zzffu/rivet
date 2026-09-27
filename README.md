@@ -127,9 +127,11 @@ where
 
 - `spawn_blocking`／`Handle::spawn_blocking` 接收 `Send` 闭包，返回 `BlockingJoinHandle<T>`。`RuntimeConfig.blocking` 的默认线程上限为 4、排队上限为 128；按需启动，满额显式返回 `BlockingSpawnError::AtCapacity`。外部 `Handle` 可在异步 worker 暂停时提交阻塞工作。
 - 排队中的阻塞工作可以取消；已开始的同步代码不能强杀。丢弃句柄不提前释放仍执行工作的额度。Runtime 先停止准入、取消排队工作并清理异步 worker，再等待正在运行的阻塞工作及原生线程退出。阻塞闭包必须能够自行结束，不能依赖 Runtime 销毁后继续推进的异步任务。
-- `runtime::TaskGroup<T>::new(capacity)` 拥有有界子任务集合。`spawn`／`spawn_on` 投递工厂，`spawn_local` 接收本地 Future；`join_next` 按就绪顺序取结果。完成但尚未 join 的任务仍占容量。
-- `JoinHandle::abort_handle()` 和任务组 spawn 返回的 `AbortHandle` 可克隆，只提供取消／完成状态，不转移结果所有权。`TaskGroup::shutdown().await` 关闭准入、abort 并排空；取消一次等待可以重试。组 Drop 只请求取消，不能冒充已经 join。
+- `runtime::TaskGroup<T>::new(capacity)` 拥有有界子任务集合。`spawn`／`spawn_on` 投递工厂，`spawn_local` 接收本地 Future；`join_next` 按就绪顺序取结果。完成但尚未 join 的任务仍占容量。空组立即返回 `None`，但仍可接纳新任务；动态 supervisor 应等待外部准入／停止通知，不能围绕 `None` 忙循环。
+- `JoinHandle::abort_handle()` 和任务组 spawn 返回的 `AbortHandle` 可克隆，只提供取消／完成状态，不转移结果所有权。`TaskGroup::shutdown().await` 关闭准入、abort 并排空；取消一次等待可以重试。组 Drop 只请求取消，join 才证明子任务 Future／captures 已析构；返回值持有的资源和 native I/O 引用可能仍然存活。
 - `TcpListener::serve_until(ServeConfig, stop, handler)` 在 `max_connections` 名额可用后轮询 accept；停止信号优先，handler 收到 `sync::CancellationToken`，经过 `shutdown_grace` 后才强制 abort 并 join。导入失败和任务 panic 作为错误返回。简单 `serve` 默认最多 1024 个 handler、30 秒错误清理宽限期。
+
+每次 `join_next()` 创建新的等待 Future；不要重复 poll 同一个已返回 Ready 的普通 Future。显式融合类型或 `Sleep::reset` 有自己的复用契约，不代表所有 Future 都可重复等待。`runtime_services` 展示动态空组准入和取消后 join；整个 Runtime 关闭还会单独推进 native 请求收敛。
 
 ### 非 socket I/O
 
@@ -151,11 +153,14 @@ where
 
 `BufferPool` 预分配稳定的普通内存及租约槽。`WriteBuf` 独占初始化，`freeze()` 生成只读 `SendBuf`；`ReadBuf` 与 `SendBuf` 使用同一只读所有权。克隆／切片不复制 payload，也不为每个包分配引用计数控制块。
 
+`WriteBuf::as_mut_slice()` 安全地借出已初始化前缀，适合原地编解码或修改报文头，不扩大长度、不分配、不复制。未初始化尾部仍通过 `spare_capacity_mut()` 写入。不要从 `ReadBuf`／`SendBuf` 的指针强造可写切片：先调用 `try_into_write()`，只有普通池存储唯一拥有且没有内核 guard 时才能成功。
+
 ```rust
 async fn request(stream: &rivet::TcpStream) -> std::io::Result<()> {
     let pool = rivet::runtime::buffer_pool()?;
     let mut writable = pool.try_acquire_at_least(5)?;
     writable.extend_from_slice(b"hello")?;
+    writable.as_mut_slice().make_ascii_uppercase();
     let outcome = stream.send_all(rivet::SendPayload::Single(writable.freeze())).await;
     outcome.result?;
     Ok(())
@@ -205,6 +210,25 @@ Linux 接管已启用 GRO 的 socket 时，即使没有编译 `udp-gro` 或策�
 RIO UDP 在 `bind/import` 返回前提交完整的 `max_pending_receives` 接收窗口，不能等第一次 `recv` 才投递。每个窗口槽预留一个原生操作、注册元数据及至少 `max(receive_chunk, pool.block_size)` 字节的池存储；完整窗口无法准入时显式报错，不缩小窗口。暂时没有空闲替换缓冲区时暂停补充；这不是无限收包保证，UDP 超出已投递窗口仍可能丢包。创建 RQ 前的接管失败返还原 socket；RQ 接管后的异步投递失败等待原生请求收敛，再通过该 socket 的接收结果报告，不返还已带 RQ 的句柄供伪重试。
 
 Android 的 `android_network` 使用真实 `android_setsocknetwork`。已连接的外部 TCP／UDP 不允许再指定 Network：旧内核可能保留原路由。先由宿主完成正确绑定／连接，再以 `android_network: None` 接管。`SocketHook` 提供建立连接／首次发送前的宿主控制入口，例如 `VpnService.protect`；宿主负责权限和 Java/JNI 生命周期，失败直接阻止建立。钩子不能关闭、保留或自行进行 socket I/O；其外部副作用无法回滚。库不附带 VPN 服务或进程级 Network 绑定。
+
+### Windows UDP 容量计算
+
+`max_pending_receives = N` 是**每 socket** 的窗口；`pool` 和 `max_operations` 是**每 worker 共享**的预算。`SocketOptions::receive_buffer_bytes` 只是 OS 缓冲区请求，不能替代已投递的 RIO 接收。
+
+`config.limits.windows_udp_receive_bytes(options.receive_chunk)?` 计算一个窗口的初始 payload 字节数，所有平台都可用来规划 Windows 部署。它采用有检查的 `N × max(receive_chunk, pool.block_size)`；非法尺寸或溢出返回 `InvalidInput`，但允许返回比当前池更大的需求，以便调用方诊断。它不预留资源，也不意味着 bind 必然成功。
+
+同一 worker 上 U 个同尺寸 UDP socket 的初始需求：
+
+| 资源 | 需求 | 约束 |
+| --- | --- | --- |
+| 普通 RX payload | `U × N × max(receive_chunk, block_size)` | `pool.bytes` |
+| distinct leases | `U × N` | `pool.max_leases` |
+| driver native receives | `U × N` | driver 的 `max_operations` |
+| Core logical receives | `U` | 独立的 Core `max_operations` |
+
+例如 N=8、chunk=64 KiB、block=16 KiB，4 个 socket 的初始 RX 为 2 MiB／32 leases。64 KiB allocation 只占一个 lease，不是四个。如果上层保留完整旧窗口、又要挂满新窗口，还需额外 2 MiB／32 leases。另留发送、TCP、其他 operation、待交付完成和关闭收敛的余量；metadata 不计入 payload pool，池预算不是进程 RSS。不同 chunk 按 socket 求和，多 socket 乘加也应检查溢出。
+
+准入失败仍保留原错误类别：池／槽位暂时不足为 `WouldBlock`，单块超过池等非法请求为 `InvalidInput`，原生调用保留 OS 错误。窗口失败诊断显示请求规模和配置预算，不把总预算冒充当前空闲量。碎片、旧租约和慢消费都可能暂停 rearm；窗口扩大是突发容量与并发 socket 成本的取舍，不是无丢包保证。详细 RQ 预约及所有权规则见[系统架构](docs/architecture.md#54-windows-udp-容量规划)。
 
 ## Linux 优化策略
 
@@ -283,6 +307,15 @@ cargo run --release --all-features --example loopback -- --enable zc-rx-nodev --
 Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用普通 App，支持 `-Abi x86_64` 和 `-Abi arm64-v8a`，不依赖 Gradle。NDK 目标和 APK 最低版本为 API23，JNI 库采用 16KiB ELF／APK 对齐和真正未压缩的 ZIP 条目，并保留 API23 所需的 v1 签名。界面、`RivetSmoke` logcat 标签和私有 `files/smoke-result.json` 给出结构化结果；每次进程运行先清除旧成功状态，JNI 初始化失败也持久化。验证 APK 的 debuggable 配置和测试签名不能用于生产应用。
 
 ### 已执行的原生验证
+
+本轮缓冲区／容量／生命周期 Interface 改进的验证（2026-09-28）：
+
+- Windows x64 IPv4：默认及 `--all-features --all-targets` 回归各 **135 通过、0 失败**。包括已排队 UDP waiter 取消、旧租约跨窗口保留、精确容量接管失败回滚，以及两方向实际受压时的独立反向进展和半关闭。
+- `native_traits`、`runtime_services -- --workers 1` 和 `--workers 2` 实跑通过。动态准入场景观察到三次空组等待、两个正常结果以及取消后本地析构完成。
+- 临时外部消费者实际调用 `as_mut_slice()` 和 `windows_udp_receive_bytes()`，验证只读别名阻止可写恢复、完整 RIO 窗口超预算时 `WouldBlock`、修改后的精确 UDP 字节，以及 Runtime 收敛后接收租约恢复可写。验证后删除临时源码，不把编译或单元测试当作该原生场景的替代。
+- 严格 Clippy、严格 rustdoc 和格式检查通过。Linux x86_64／Android ARM64 的全 feature／all-targets 检查及独立 Android smoke 包编译检查通过；这些不是 Linux／Android 原生执行或 APK 安装验证。
+- `RIVET_VERIFY_IPV4_ONLY=1` 仅作用于测试子进程；Windows IPv6 未执行，未修改宿主 TUN／网络，也不声称物理 NIC 或吞吐验证。命令与日志索引：`artifacts/rivet-contracts-20260928/verification-summary.json`。
+
 
 0.2.0 自动优化与兼容改造的本轮验证（2026-09-27）：
 

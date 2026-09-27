@@ -3,18 +3,22 @@
 use futures_lite::future::{poll_once, race, zip};
 use rivet::{
     BufferPool, Runtime, RuntimeConfig, SendBuf, SendPayload, SocketOptions, TcpListener,
-    TcpStream, UdpSocket,
+    TcpStream, UdpSocket, sync::oneshot,
 };
 use std::{
-    future::Future,
-    io::Read,
+    future::{Future, poll_fn},
+    io::{self, Read, Write},
     net::{Shutdown, SocketAddr},
     os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
-    time::Duration,
+    task::{Context, Poll, Wake, Waker},
+    thread,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::Networking::WinSock::*;
 mod support;
@@ -112,6 +116,176 @@ fn tcp_vectors_preserve_bytes_and_held_receives_across_half_close() {
             zip(sender, receiver).await;
         }));
     }
+}
+
+#[test]
+fn tcp_backpressure_in_each_direction_preserves_reverse_progress_and_half_close() {
+    const BYTES: usize = 2 * 1024 * 1024;
+    const REVERSE_MARKER: &[u8] = b"receive while RIO send is blocked";
+    const FORWARD_MARKER: &[u8] = b"send while receive queue is full";
+    const PEER_WAIT: Duration = Duration::from_secs(5);
+
+    fn fill_until_blocked(peer: &mut std::net::TcpStream, bytes: &[u8], sent: &mut usize) {
+        let until = Instant::now() + PEER_WAIT;
+        loop {
+            assert!(
+                Instant::now() < until,
+                "native send did not reach backpressure"
+            );
+            assert!(
+                *sent < bytes.len(),
+                "bounded output never reached backpressure"
+            );
+            // Winsock may accept one oversized write despite SO_SNDBUF.
+            // Probe fresh admission in bounded buffer-sized writes instead.
+            let end = (*sent + 4096).min(bytes.len());
+            match peer.write(&bytes[*sent..end]) {
+                Ok(0) => panic!("native send made no progress"),
+                Ok(count) => *sent += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(error) => panic!("native send failed: {error}"),
+            }
+        }
+    }
+
+    let forward_bytes: Vec<u8> = (0..BYTES)
+        .map(|n| ((n * 37 + n / 251) % 256) as u8)
+        .collect();
+    let reverse_bytes: Vec<u8> = (0..BYTES)
+        .map(|n| ((n * 53 + n / 127 + 19) % 256) as u8)
+        .collect();
+    let mut configuration = config();
+    configuration.limits.pool.bytes = 4 * 1024 * 1024;
+    let mut runtime = Runtime::new(configuration).unwrap();
+    let pool = runtime.buffer_pool();
+    // The scope joins the peer even if an assertion or the root deadline
+    // unwinds. Every peer-side I/O and gate also has a bounded wait.
+    thread::scope(|scope| {
+        runtime.block_on(deadline(async {
+            let options = SocketOptions {
+                receive_chunk: 4096,
+                receive_buffer_bytes: Some(4096),
+                send_buffer_bytes: Some(4096),
+                ..SocketOptions::default()
+            };
+            let listener =
+                TcpListener::bind_with_options("127.0.0.1:0".parse().unwrap(), options).unwrap();
+            let address = listener.local_addr();
+            let (arrived, first_byte) = oneshot::channel();
+            let (send_marker, marker_allowed) = mpsc::sync_channel(1);
+            let (allow_forward_read, forward_read_allowed) = mpsc::sync_channel(1);
+            let (blocked, reverse_blocked) = oneshot::channel();
+            let (marked, marker_received_while_blocked) = oneshot::channel();
+            let (allow_reverse_read, reverse_read_allowed) = mpsc::sync_channel(1);
+            let (finish, finished) = oneshot::channel();
+            let forward_expected = &forward_bytes;
+            let reverse_expected = &reverse_bytes;
+            let peer = scope.spawn(move || {
+                let socket = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                )
+                .unwrap();
+                socket.set_recv_buffer_size(4096).unwrap();
+                socket.set_send_buffer_size(4096).unwrap();
+                socket.connect_timeout(&address.into(), PEER_WAIT).unwrap();
+                let mut peer = std::net::TcpStream::from(socket);
+                peer.set_nodelay(true).unwrap();
+                peer.set_read_timeout(Some(PEER_WAIT)).unwrap();
+                peer.set_write_timeout(Some(PEER_WAIT)).unwrap();
+
+                let mut actual = vec![0; BYTES];
+                peer.read_exact(&mut actual[..1]).unwrap();
+                assert_eq!(actual[0], forward_expected[0]);
+                arrived.send(()).unwrap();
+                marker_allowed.recv_timeout(PEER_WAIT).unwrap();
+                // No forward reads until the root has received this marker
+                // and re-polled its already-submitted send as Pending.
+                peer.write_all(REVERSE_MARKER).unwrap();
+                forward_read_allowed.recv_timeout(PEER_WAIT).unwrap();
+                peer.read_exact(&mut actual[1..]).unwrap();
+                assert_eq!(actual, *forward_expected);
+
+                // Exchange the pressured direction. A real nonblocking
+                // WouldBlock proves the native sender cannot finish while
+                // Rivet leaves its bounded receive queue unconsumed.
+                let mut sent = 0;
+                peer.set_nonblocking(true).unwrap();
+                fill_until_blocked(&mut peer, reverse_expected, &mut sent);
+                blocked.send(sent).unwrap();
+                peer.set_nonblocking(false).unwrap();
+                let mut marker = vec![0; FORWARD_MARKER.len()];
+                peer.read_exact(&mut marker).unwrap();
+                assert_eq!(marker, FORWARD_MARKER);
+                assert_eq!(peer.read(&mut [0; 1]).unwrap(), 0);
+                peer.set_nonblocking(true).unwrap();
+                fill_until_blocked(&mut peer, reverse_expected, &mut sent);
+                marked.send(sent).unwrap();
+                peer.set_nonblocking(false).unwrap();
+                reverse_read_allowed.recv_timeout(PEER_WAIT).unwrap();
+                peer.write_all(&reverse_expected[sent..]).unwrap();
+                peer.shutdown(Shutdown::Write).unwrap();
+                finish.send(()).unwrap();
+            });
+
+            let stream = listener.accept().await.unwrap();
+            let mut forward = stream.send_all(SendPayload::Single(filled(&pool, &forward_bytes)));
+            assert!(poll_once(&mut forward).await.is_none());
+            first_byte.await.unwrap();
+            // Native receipt, not the first submission's Pending, establishes
+            // that this send is in flight while the peer's read gate is closed.
+            assert!(poll_once(&mut forward).await.is_none());
+            send_marker.send(()).unwrap();
+            {
+                let mut marker = std::pin::pin!(async {
+                    let mut received = 0;
+                    while received != REVERSE_MARKER.len() {
+                        let data = stream.recv().await.unwrap().unwrap();
+                        let end = received + data.len();
+                        assert!(end <= REVERSE_MARKER.len());
+                        assert_eq!(data.as_slice(), &REVERSE_MARKER[received..end]);
+                        received = end;
+                    }
+                });
+                poll_fn(|cx| {
+                    assert!(
+                        Pin::new(&mut forward).poll(cx).is_pending(),
+                        "forward send completed before the peer read gate opened"
+                    );
+                    marker.as_mut().poll(cx)
+                })
+                .await;
+            }
+            assert!(poll_once(&mut forward).await.is_none());
+            allow_forward_read.send(()).unwrap();
+            let outcome = forward.await;
+            assert_eq!(outcome.result.unwrap(), BYTES);
+            assert!(outcome.data.is_empty());
+
+            let first_blocked_at = reverse_blocked.await.unwrap();
+            assert!(first_blocked_at > 0 && first_blocked_at < BYTES);
+            let outcome = stream
+                .send_all(SendPayload::Single(filled(&pool, FORWARD_MARKER)))
+                .await;
+            assert_eq!(outcome.result.unwrap(), FORWARD_MARKER.len());
+            stream.shutdown(Shutdown::Write).unwrap();
+            let still_blocked_at = marker_received_while_blocked.await.unwrap();
+            assert!(still_blocked_at >= first_blocked_at && still_blocked_at < BYTES);
+            allow_reverse_read.send(()).unwrap();
+            let mut received = 0;
+            while let Some(data) = stream.recv().await.unwrap() {
+                let end = received + data.len();
+                assert!(end <= BYTES);
+                assert_eq!(data.as_slice(), &reverse_bytes[received..end]);
+                received = end;
+            }
+            assert_eq!(received, BYTES);
+            finished.await.unwrap();
+            peer.join().unwrap();
+        }));
+    });
 }
 
 #[test]
@@ -567,6 +741,130 @@ fn udp_bind_posts_whole_burst_before_first_recv_and_rotates_held_leases() {
 }
 
 #[test]
+fn udp_dropping_a_woken_waiter_preserves_the_queued_window_and_held_leases() {
+    struct ReceiveWake {
+        notified: AtomicBool,
+        root: Waker,
+    }
+
+    impl Wake for ReceiveWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.notified.store(true, Ordering::Release);
+            self.root.wake_by_ref();
+        }
+    }
+
+    const WINDOW: usize = 4;
+    const CHUNK: usize = 256;
+    let mut configuration = config();
+    configuration.limits.max_pending_receives = WINDOW;
+    let mut runtime = Runtime::new(configuration).unwrap();
+    runtime.block_on(deadline(async {
+        let mut options = SocketOptions::udp();
+        options.receive_chunk = CHUNK;
+        let receiver =
+            UdpSocket::bind_with_options("127.0.0.1:0".parse().unwrap(), options).unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let source = sender.local_addr().unwrap();
+        let mut abandoned = receiver.recv();
+        let notice = poll_fn(|cx| {
+            let notice = Arc::new(ReceiveWake {
+                notified: AtomicBool::new(false),
+                root: cx.waker().clone(),
+            });
+            let waker = Waker::from(notice.clone());
+            assert!(
+                Pin::new(&mut abandoned)
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            Poll::Ready(notice)
+        })
+        .await;
+        assert!(!notice.notified.load(Ordering::Acquire));
+        // Fill every native lane without polling the receiver again.
+        for sequence in 0..WINDOW {
+            let bytes = [sequence as u8; CHUNK];
+            let packet = if sequence == WINDOW / 2 {
+                &bytes[..0]
+            } else {
+                &bytes[..]
+            };
+            assert_eq!(
+                sender.send_to(packet, receiver.local_addr()).unwrap(),
+                packet.len()
+            );
+        }
+        poll_fn(|_| {
+            if notice.notified.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        // The forwarded wake witnesses native data entering the receive
+        // queue. Do not poll the old waiter to consume that queued result.
+        drop(abandoned);
+
+        let mut held = Vec::with_capacity(WINDOW);
+        for sequence in 0..WINDOW {
+            let packet = receiver.recv().await.unwrap();
+            let expected = [sequence as u8; CHUNK];
+            let expected = if sequence == WINDOW / 2 {
+                &expected[..0]
+            } else {
+                &expected[..]
+            };
+            assert_eq!(packet.data.as_slice(), expected);
+            assert_eq!(packet.peer, Some(source));
+            assert_eq!(packet.original_len, Some(expected.len()));
+            assert!(!packet.truncated);
+            held.push(packet.data);
+        }
+        // Keep all old leases alive while another complete, unpolled window
+        // arrives. Replacement lanes must not overwrite published data.
+        for sequence in 0..WINDOW {
+            let packet = [128 + sequence as u8; CHUNK];
+            assert_eq!(
+                sender.send_to(&packet, receiver.local_addr()).unwrap(),
+                packet.len()
+            );
+        }
+        for sequence in 0..WINDOW {
+            let packet = receiver.recv().await.unwrap();
+            assert_eq!(packet.data.as_slice(), &[128 + sequence as u8; CHUNK]);
+            assert_eq!(packet.peer, Some(source));
+            assert_eq!(packet.original_len, Some(CHUNK));
+            assert!(!packet.truncated);
+        }
+        let marker = b"after cancelled windows";
+        sender.send_to(marker, receiver.local_addr()).unwrap();
+        let packet = receiver.recv().await.unwrap();
+        assert_eq!(packet.data.as_slice(), marker);
+        assert_eq!(packet.peer, Some(source));
+        for (sequence, data) in held.iter().enumerate() {
+            let expected = [sequence as u8; CHUNK];
+            assert_eq!(
+                data.as_slice(),
+                if sequence == WINDOW / 2 {
+                    &expected[..0]
+                } else {
+                    &expected[..]
+                }
+            );
+        }
+    }));
+}
+
+#[test]
 fn udp_send_and_recv_batches_replenish_complete_windows() {
     const WINDOW: usize = 32;
     let mut configuration = config();
@@ -612,15 +910,19 @@ fn udp_send_and_recv_batches_replenish_complete_windows() {
 #[test]
 fn udp_import_buffer_admission_preserves_original_and_retries_without_poisoned_rq() {
     let mut configuration = config();
-    configuration.limits.pool.bytes = 4 * 1024;
+    let mut options = SocketOptions::udp();
+    options.receive_chunk = 2048;
+    let window_bytes = configuration
+        .limits
+        .windows_udp_receive_bytes(options.receive_chunk)
+        .unwrap();
+    configuration.limits.pool.bytes = window_bytes;
     let mut runtime = Runtime::new(configuration).unwrap();
     let pool = runtime.buffer_pool();
     let blocker = pool.try_acquire().unwrap();
     let original = registered_udp();
     let raw = original.as_raw_socket();
     let local = original.local_addr().unwrap().as_socket().unwrap();
-    let mut options = SocketOptions::udp();
-    options.receive_chunk = 1024;
     let retained = runtime.block_on(deadline(async {
         let error = UdpSocket::import(original.into(), options.clone()).unwrap_err();
         assert_eq!(error.error.kind(), std::io::ErrorKind::WouldBlock);
@@ -641,8 +943,8 @@ fn udp_import_buffer_admission_preserves_original_and_retries_without_poisoned_r
     assert_eq!(retained.as_slice(), b"same imported descriptor");
     drop(retained);
     assert_eq!(
-        pool.try_acquire_at_least(4 * 1024).unwrap().capacity(),
-        4 * 1024
+        pool.try_acquire_at_least(window_bytes).unwrap().capacity(),
+        window_bytes
     );
 }
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- 先补充系统架构与实现契约，再新增 `WriteBuf::as_mut_slice()`：只安全借出已初始化前缀，不扩大长度、不分配或复制；保留普通存储唯一拥有、外部区域不可恢复及内核 guard 阻止写入的约束。补强清空、切片恢复和空尾切片的可变视图回归。
+- 新增全平台可调用的纯算术 `Limits::windows_udp_receive_bytes(receive_chunk)`，计算单个 Windows UDP 接收窗口的初始 payload 需求并检查非法尺寸／乘法溢出。结果允许超过当前池，用于部署规划，不冒充资源预留或原生成功保证。
+- 明确每 socket 的接收窗口与每 worker 共享的 payload／lease／operation 预算，给出多 socket、旧租约及重投余量算例。现有 RIO 准入失败补充请求规模和预算类别，仅在失败路径格式化，保留错误类别、完整窗口回滚和接管所有权；默认槽数及正常 I/O 路径不变。
+- 明确空 `TaskGroup::join_next()` 返回 `None` 但不关闭准入、完成 Future 不可假设能重复 poll，以及取消请求／join 后任务析构／native retirement 的区别。`runtime_services` 展示有界动态准入、空组再次接纳和取消后 join；不增加兼容运行时、统一融合或每 I/O 装箱。
+- 增加 Windows 原生组合回归：观察 UDP waiter 被排队数据唤醒后再取消、跨窗口保留旧租约，以及真实 TCP 双向背压期间独立反向推进和半关闭。容量估计用于完整窗口接管准入的边界回归，保留失败后的原 descriptor 与重试能力。
+- 本轮 Windows IPv4 默认及全 feature／all-targets 回归各 135 项通过；`native_traits`、单／双 worker `runtime_services` 及临时外部消费者实跑通过。严格 Clippy／rustdoc、格式检查、Linux x86_64／Android ARM64 全 feature／all-targets 检查和独立 Android smoke 包编译检查通过。IPv6 未执行，未新增 Linux／Android 原生或物理 NIC／吞吐证据；索引见 `artifacts/rivet-contracts-20260928/verification-summary.json`。
+
 ## 0.2.0
 
 - 先更新系统架构与实现契约，再将 Linux 改为 6.18 LTS 主验证线及 6.6／6.12 兼容目标。删除全局版本／RC 准入门禁，以及 `KernelVersion::MINIMUM_LINUX`、`require_supported`；保留可解析的版本元数据，无法识别版本时保守选择能力，不伪造兼容证据、不回退到 epoll。

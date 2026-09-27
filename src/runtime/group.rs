@@ -12,8 +12,8 @@ use std::{
 /// Bounded ownership of child tasks, yielding results in completion order.
 ///
 /// Completed but unjoined children still consume capacity. Dropping the group
-/// requests cancellation; only joining or `shutdown().await` proves that child
-/// futures and their captured resources have actually been destroyed.
+/// requests cancellation; joining acknowledges destruction of child futures and
+/// their captures, not resources moved into results or native I/O retirement.
 /// Cancelling a `join_next` or `shutdown` wait never detaches children.
 pub struct TaskGroup<T> {
     tasks: FuturesUnordered<JoinHandle<T>>,
@@ -124,6 +124,24 @@ impl<T> TaskGroup<T> {
         result
     }
 
+    /// Wait for the next child result in completion order.
+    ///
+    /// An empty group returns `None` immediately, without waiting for future
+    /// children or closing admission. Unless [`Self::shutdown`] has closed the
+    /// group, callers may spawn again and create a new `join_next` future.
+    /// Dynamic owners should wait for external admission or stop notifications
+    /// while empty, rather than busy-looping on `None`.
+    ///
+    /// Each call creates a new wait. Once that future returns `Ready`, do not
+    /// poll it again. Ordinary futures do not promise post-completion polling;
+    /// explicitly fused or resettable types have their own contracts, and not
+    /// every future is required to panic when misused.
+    ///
+    /// Cancelling this wait leaves all unjoined children owned by the group.
+    /// [`Self::abort_all`] and dropping the group only request cancellation;
+    /// receiving a child result proves its future and captures have been
+    /// destroyed. Resources moved into the result remain owned by its receiver,
+    /// and native I/O references may retire later, independently of task joining.
     pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
         poll_fn(|cx| self.poll_join_next(cx)).await
     }

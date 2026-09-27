@@ -48,6 +48,8 @@ fn bounded_local_group_yields_completion_order_and_reuses_joined_slots() {
     runtime.block_on(deadline(async {
         assert!(TaskGroup::<()>::new(0).is_err());
         let mut group = TaskGroup::new(2).unwrap();
+        // A completed empty wait does not close admission.
+        assert!(matches!(poll_once(group.join_next()).await, Some(None)));
         let local = Rc::new(Cell::new(0));
         let value = local.clone();
         let (release, released) = oneshot::channel();
@@ -75,6 +77,7 @@ fn bounded_local_group_yields_completion_order_and_reuses_joined_slots() {
             &local
         ));
         assert_eq!(local.get(), 19);
+        assert!(matches!(poll_once(group.join_next()).await, Some(None)));
         group.spawn_local(async { Rc::new(Cell::new(23)) }).unwrap();
         assert_eq!(group.join_next().await.unwrap().unwrap().get(), 23);
         assert!(group.join_next().await.is_none());
@@ -193,6 +196,7 @@ fn cloned_abort_controls_and_group_drop_cancel_on_the_owner_thread() {
         assert_eq!(group.join_next().await, Some(Err(JoinError::Cancelled)));
         assert_eq!(drops.get(), 1);
         assert!(cloned.is_finished());
+        assert!(matches!(poll_once(group.join_next()).await, Some(None)));
 
         let (notify, notified) = oneshot::channel();
         let guard = LocalDrop {

@@ -305,8 +305,16 @@ impl Driver {
                     .max_operations
                     .saturating_sub(self.operations.len() + self.pending.len())
         {
-            return Err(sys::exhausted(
-                "Windows operation/completion budget exhausted; poll and retry",
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Windows operation/completion budget exhausted: requested {count} slots, \
+                     {} native slots and {} completion slots available; poll and retry",
+                    self.operations.available(),
+                    self.limits
+                        .max_operations
+                        .saturating_sub(self.operations.len() + self.pending.len()),
+                ),
             ));
         }
         Ok(())
@@ -435,8 +443,20 @@ impl Driver {
         let count = self.limits.max_pending_receives;
         self.room_for_operations(count)?;
         let chunk = self.socket(socket)?.options.receive_chunk;
-        for _ in 0..count {
-            let buffer = self.pool.try_acquire_at_least(chunk)?;
+        for lane in 0..count {
+            let buffer = self.pool.try_acquire_at_least(chunk).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Windows UDP receive window needs {count} leases with {} payload bytes \
+                         each; reserved {lane}/{count} lanes; configured worker pool has {} \
+                         payload bytes and {} lease slots ({error})",
+                        chunk.max(self.limits.pool.block_size),
+                        self.limits.pool.bytes,
+                        self.limits.pool.max_leases,
+                    ),
+                )
+            })?;
             let next = self.sockets.get(socket.0).unwrap().receive;
             let key = self.insert_operation(Operation::datagram(socket, next, buffer));
             let record = self.sockets.get_mut(socket.0).unwrap();

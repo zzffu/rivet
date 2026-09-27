@@ -77,19 +77,70 @@ impl std::fmt::Display for Optimization {
     }
 }
 
-/// Per-worker resource bounds. These limits do not preallocate network traffic.
+/// Resource bounds configured independently for each worker.
+///
+/// Socket/operation slots and the pool are shared by that worker's sockets;
+/// receive and accept queue bounds apply separately to each socket. Runtime
+/// construction does not reserve every possible socket's traffic buffers.
 #[derive(Clone, Debug)]
 pub struct Limits {
     pub max_tasks: usize,
     pub max_sockets: usize,
+    /// Capacity of each of the separate Core and native-driver operation arenas.
+    /// A Windows UDP socket uses one Core receive operation but
+    /// `max_pending_receives` native receive operations, before other I/O.
     pub max_operations: usize,
+    /// Per-socket queued receive results, not a worker-wide receive count.
+    ///
+    /// Windows UDP also reserves this many native receive lanes before
+    /// bind/import returns. Each lane initially needs one distinct lease and
+    /// `max(receive_chunk, pool.block_size)` payload bytes from the shared pool.
+    /// TCP does not post this many parallel native receives. See
+    /// [`Self::windows_udp_receive_bytes`] for Windows payload planning.
     pub max_pending_receives: usize,
+    /// Per-listener queued accepted connections.
     pub max_pending_accepts: usize,
     pub max_send_bytes: usize,
     pub max_iovecs: usize,
     pub task_budget: usize,
     pub completion_budget: usize,
+    /// Shared worker-local payload arena and distinct-lease budget.
+    ///
+    /// Immutable aliases share a lease slot but prevent writable reuse. Keeping
+    /// old receive allocations while rearming a full window requires additional
+    /// storage/leases. This budget excludes native metadata and is not process RSS.
     pub pool: PoolConfig,
+}
+
+impl Limits {
+    /// Initial payload bytes reserved by one Windows UDP receive window.
+    ///
+    /// Computes `max_pending_receives * max(receive_chunk, pool.block_size)`
+    /// without allocating or creating a runtime. Available on every platform
+    /// for offline Windows planning; other backends have different reservations.
+    ///
+    /// The result may exceed `pool.bytes`: this is an estimate, not admission.
+    /// For multiple sockets on one worker, sum their estimates with checked
+    /// arithmetic and separately budget one lease and native operation per lane,
+    /// one Core receive operation per socket, and all other I/O. Retained old
+    /// allocations need extra storage if the full window must remain armed.
+    /// Free bytes alone do not guarantee a sufficiently large contiguous extent.
+    ///
+    /// Returns `InvalidInput` for zero window/block sizes, a receive size outside
+    /// `1..=i32::MAX`, or multiplication overflow. It does not replace complete
+    /// configuration validation, current-resource admission or native OS checks.
+    pub fn windows_udp_receive_bytes(&self, receive_chunk: usize) -> io::Result<usize> {
+        if self.max_pending_receives == 0
+            || self.pool.block_size == 0
+            || receive_chunk == 0
+            || receive_chunk > i32::MAX as usize
+        {
+            return Err(invalid("invalid Windows UDP receive window or buffer size"));
+        }
+        self.max_pending_receives
+            .checked_mul(receive_chunk.max(self.pool.block_size))
+            .ok_or_else(|| invalid("Windows UDP receive window payload size overflow"))
+    }
 }
 
 impl Default for Limits {

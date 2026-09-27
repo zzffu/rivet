@@ -1,13 +1,17 @@
 use rivet::{Runtime, RuntimeConfig, SendPayload, TcpListener, TcpStream};
 use rivet::{
     net::ServeConfig,
-    runtime::TaskGroup,
+    runtime::{JoinError, TaskGroup},
     sync::{CancellationToken, mpsc, oneshot, watch},
 };
 use std::{
+    cell::Cell,
+    future::{Future, pending, poll_fn},
     io,
     net::{Ipv4Addr, Shutdown},
+    pin::pin,
     rc::Rc,
+    task::Poll,
     time::{Duration, Instant},
 };
 
@@ -167,11 +171,117 @@ async fn abortive_close() -> io::Result<()> {
     }
 }
 
+async fn dynamic_admission(tasks: &mut TaskGroup<usize>) -> io::Result<()> {
+    enum Command {
+        Complete(usize),
+        Wait(oneshot::Sender<()>),
+        Stop,
+    }
+    enum Event {
+        Command(Command),
+        Joined(Option<Result<usize, JoinError>>),
+    }
+    struct LocalCleanup(Rc<Cell<usize>>);
+    impl Drop for LocalCleanup {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    let (admit, commands) = mpsc::bounded(1);
+    let (idle, waiting) = mpsc::bounded(1);
+    let controller = rivet::spawn_local(async move {
+        // Admit each new job only after the owner has returned to its empty wait.
+        for value in [7, 11] {
+            waiting.recv().await.map_err(error)?;
+            admit.send(Command::Complete(value)).await.map_err(error)?;
+        }
+        waiting.recv().await.map_err(error)?;
+        let (started, ready) = oneshot::channel();
+        admit.send(Command::Wait(started)).await.map_err(error)?;
+        ready.await.map_err(error)?;
+        admit.send(Command::Stop).await.map_err(error)?;
+        Ok::<_, io::Error>(())
+    })
+    .map_err(error)?;
+
+    let drops = Rc::new(Cell::new(0));
+    let mut idle_waits = 0;
+    let mut total = 0;
+    loop {
+        let event = if tasks.is_empty() {
+            idle_waits += 1;
+            idle.send(()).await.map_err(error)?;
+            // An empty join would return None immediately, not wait for work.
+            Event::Command(commands.recv().await.map_err(error)?)
+        } else {
+            // Both waits are fresh each turn. The losing pending wait is dropped,
+            // not detached or fused; a cancelled join still leaves tasks owned.
+            let mut command = pin!(commands.recv());
+            let mut joined = pin!(tasks.join_next());
+            poll_fn(|cx| {
+                // Observe a queued stop before collecting another child result.
+                if let Poll::Ready(command) = command.as_mut().poll(cx) {
+                    return Poll::Ready(command.map(Event::Command).map_err(error));
+                }
+                joined
+                    .as_mut()
+                    .poll(cx)
+                    .map(|value| Ok(Event::Joined(value)))
+            })
+            .await?
+        };
+        match event {
+            Event::Command(Command::Complete(value)) => {
+                tasks.spawn_local(async move { value }).map_err(error)?;
+            }
+            Event::Command(Command::Wait(started)) => {
+                let cleanup = LocalCleanup(drops.clone());
+                tasks
+                    .spawn_local(async move {
+                        let _cleanup = cleanup;
+                        let _ = started.send(());
+                        pending::<usize>().await
+                    })
+                    .map_err(error)?;
+            }
+            Event::Command(Command::Stop) => break,
+            Event::Joined(Some(value)) => total += value.map_err(error)?,
+            Event::Joined(None) => {
+                return Err(io::Error::other("nonempty task group lost its child"));
+            }
+        }
+    }
+
+    // Abort is only a request. Join acknowledges destruction of the local
+    // future/captures; it says nothing about native I/O retirement.
+    tasks.abort_all();
+    let mut cancelled = 0;
+    while let Some(result) = tasks.join_next().await {
+        require(
+            matches!(result, Err(JoinError::Cancelled)),
+            "stopped task group did not report cancellation",
+        )?;
+        cancelled += 1;
+    }
+    controller.await.map_err(error)??;
+    require(
+        idle_waits == 3 && total == 18,
+        "task group did not return to idle and readmit work",
+    )?;
+    require(
+        cancelled == 1 && drops.get() == 1,
+        "joining cancellation did not finish local cleanup",
+    )
+}
+
 /// One bounded scenario shared by native desktop and the ordinary Android App.
 pub async fn exercise() -> io::Result<String> {
     let owner = std::thread::current().id();
     let (started, ready) = oneshot::channel();
     let (release, released) = std::sync::mpsc::sync_channel(1);
+    // Keep the only release sender here: error/cancellation drops it and unblocks
+    // the synchronous receive before Runtime destruction joins the blocking pool.
     let blocking = rivet::runtime::spawn_blocking(move || {
         let _ = started.send(std::thread::current().id());
         released.recv().map_err(error)
@@ -204,6 +314,7 @@ pub async fn exercise() -> io::Result<String> {
         total += value.map_err(error)?;
     }
     require(total == 42, "task group lost a result")?;
+    dynamic_admission(&mut tasks).await?;
 
     let mut sleep = rivet::time::sleep(Duration::from_secs(3600));
     sleep.reset(Instant::now())?;
@@ -241,7 +352,7 @@ pub async fn exercise() -> io::Result<String> {
         "blocking result was lost",
     )?;
     tasks.shutdown().await.map_err(error)?;
-    Ok("blocking isolation; native descriptor/wait object; local/automatic task groups; timer reset/interval; watch drain; supervised TCP echo/half-close/stop; peer-observed RST".to_owned())
+    Ok("blocking isolation; native descriptor/wait object; local/automatic task groups; dynamic task admission (3 idle waits, 2 results, cancel/join with local cleanup); timer reset/interval; watch drain; supervised TCP echo/half-close/stop; peer-observed RST".to_owned())
 }
 
 pub fn run(mut config: RuntimeConfig) -> io::Result<String> {

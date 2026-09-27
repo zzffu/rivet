@@ -357,6 +357,21 @@ impl WriteBuf {
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.initialized) }
     }
 
+    /// Mutably borrow only the already-initialized prefix.
+    ///
+    /// The view has the same length as [`Self::as_slice`]. Mutating it does not
+    /// change the initialized length or expose spare capacity. Use
+    /// [`Self::spare_capacity_mut`] to initialize additional bytes.
+    ///
+    /// A published buffer must first pass [`SendBuf::try_into_write`]; immutable
+    /// aliases, outstanding kernel guards and external memory cannot bypass
+    /// that ownership check.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // The exclusive guard owns this initialized prefix. Its mutable borrow
+        // prevents freezing or accessing the buffer while the view is live.
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.initialized) }
+    }
+
     pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         unsafe {
             slice::from_raw_parts_mut(
