@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- 补全宿主 hook 取消 waiter 后的 Waker 析构边界：bind／import／Connect 及 Driver poll（含 Windows AcceptEx 子 socket hook）先完成 Core 发布／token 交接再销毁 Waker；采用预分配、保留 source 身份的有界退休队列，支持析构中的原生 I/O、lane 替换和反复回滚，不累积历史注册。错误／unwind 也排空，正常首个 panic 仍传播。
+- 析构重入补全验证：Windows 三种构建各 173 项，Linux 6.18 全 feature／精简 195／159 项，Android API37 两种构建的相关套件各 50 项通过；三平台真实消费者各四种组合通过，严格 Clippy／格式／rustdoc 通过。补充建连握手修正既有 Linux RST 回归的时序假设；具体证据和未执行平台见 README。
+- 修复宿主 hook 内取消 accept/TCP/UDP/batch waiter 的借用 panic 与 lane 遗留：纯取消只触碰 Core；Connect 分离准入与原生提交，hook 不再跨 Core 借用，同步拒绝回收 token/Waker。
+- 修复 Runtime 关闭时 timer/socket/operation Waker 或 registration 析构 panic 中断后续 native drain；逐回调隔离并安全销毁 panic payload，普通运行期异常仍传播。
+- 修复 Windows 原生等待正常完成回调在捕获 panic 后，payload 析构再次 unwind 导致进程终止；复用已有异常隔离助手，保留完成缓存和取消后重试。
+- 修复 Android 导入 UDP 的 ancillary 截断丢包：按原生 socket/GRO 前缀边界配置并复用控制区，在确证数据报边界后忽略无关 IP 尾部截断；保留宿主选项、排队普通包／GRO、来源、空包和 payload 截断语义。
+- 修复 Linux direct accept 失败时重复注销固定槽、误关闭 SQPOLL 新连接的问题；补充真实槽复用、INSTALL／配置失败后回收回归。隔离负对照恢复旧清理顺序后准确失败于新连接的 `EBADF`，修复后同一原生路径通过。
+- 五项修复的本轮验证：Windows 三种构建各 169 项；Linux 6.18 全 feature／精简分别 192／156 项，6.6／6.12／7.2.7 兼容矩阵及实际消费者通过；Android API23／API37 两种构建各 166 项，普通 App 分别 19 项通过＋2 项不支持 offload 跳过／21 项通过。平台、负对照、旧内核退休断言修正及限制见 README 和 `artifacts/audit-fixes-20260930/verification-summary.json`。
+
 - 修复非 socket I/O 的 Runtime 关闭通知回归：Unix 在原生注销并释放 lifecycle 锁后先通知等待者，再 join helper，避免 helper 回调等待另一注册项关闭时互等；关闭广播逐个隔离 Waker 及 panic payload 的析构 panic，不遗漏同一对象或后续注册项的等待者。普通广播的 panic 传播不变；补充跨等待者关闭与多等待者 panic 隔离回归。
 
 - 修复全库审查复现的回调重入问题：Core 在完整完成批次和额度更新后通过有界、带代际身份的唤醒源交付通知；计时器释放节点后唤醒；Waker clone／wake／drop 不再跨内部借用。自有同步及非 socket 等待改用私有 pinned 通知 Module，移除直接 `event-listener` 依赖，保留公开 async-* 类型；注销在 lifecycle 锁外通知，原生 helper／threadpool 回调可关闭自身而不 self-join。

@@ -360,6 +360,22 @@ Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用
 
 ### 已执行的原生验证
 
+Waker 析构重入补全验证：
+
+- 修复前的安全 `Wake` 外部消费者中，accept／UDP recv 注册的最后一个 Waker 在 bind／Connect hook 内销毁并重新 bind，四种组合均触发 `RefCell already borrowed`；修复后四种组合在 Windows、Linux 和 Android 原生环境全部通过，并验证外层新连接、原 lane 的实际字节和 UDP 来源。修复前证据保留在 `artifacts/waker-hook-drop-probe/results.json`。
+- Windows x64 IPv4：默认、全 feature、精简构建的 all-targets 各 **173 通过、0 失败**；四项定向回归覆盖全部创建／导入入口、Windows AcceptEx 子 socket hook、错误／unwind 排空、析构 panic 后继续使用原 Connect token，以及有旧退休源时反复注册／取消新 I/O。三个双 worker 示例实跑通过。
+- 隔离 Linux x86_64 **6.18.54-1-lts** TCG guest：全 feature／精简完整套件分别 **195／159 通过**，`native_traits`、`runtime_services`、`loopback` 和独立消费者通过。全 feature 中六次能力分支跳过明确报告需要更新内核的 incremental-buffers／registered-buffers／sq-rewind，不计作这些优化的原生验证。首次运行发现既有 RST 回归可能在 peer 的 `connect` 返回前 abort；增加建连完成握手后仍严格断言读取端的 EOF／`ConnectionReset`，未修改生产关闭语义或延长超时。
+- Android x86_64 API37／16KiB、SELinux Enforcing、shell UID2000：全 feature／精简的 `runtime_behavior`、`io_behavior`、`resource_observation`、`tcp_abort_behavior` 各组 **50 通过**，独立消费者四种组合及 `native_traits` 实跑通过。本轮不是普通 App、API23 或 ARM64 原生验证，也未执行 Windows IPv6 或物理 NIC 场景。完整日志和补验索引：`artifacts/waker-hook-fix/verification-summary.json`。
+- Windows、Linux x86_64、Android 双 ABI 严格 Clippy、格式检查和严格 rustdoc 通过；最后一次测试夹具简化后，三平台重新执行定向 hook 回归。ARM64 仅交叉检查，临时消费者源码在验证后移除，保留原始失败、成功日志和冻结二进制。
+
+五项审核缺陷修复验证（2026-09-30）：
+
+- Windows x64 IPv4：默认、全 feature、精简构建的 all-targets 各 **169 通过、0 失败**；`native_traits`、`runtime_services`、`loopback` 双 worker 实跑及独立消费者通过。新回归覆盖 bind／Connect hook 取消各类 waiter、关闭阶段 Wake／Drop 与 payload 二次 panic、正常运行异常传播，以及原生等待回调异常后完成缓存和重投。
+- 隔离 Linux x86_64 TCG guest：**6.18.54-1-lts** 全 feature／精简分别 **192／156 通过**，三个实际消费者通过；**6.6.72、6.12.75、7.2.7** 的两种构建及相同消费者矩阵通过。6.6 缺少 direct-descriptor 所需能力时，三项专用测试明确报告未执行；不可用的高级优化不计作 native 通过。
+- Linux 固定槽回归真实进入 Rivet 接受失败路径，暂停 owner 后让 SQPOLL 将 A 的槽交给 B，核验 B／后续 C 收发和最终资源回收。保留 test-only 暂停点、仅恢复旧清理顺序的隔离负对照准确失败于 `A's cleanup closed B's reused slot: Bad file descriptor`；修复版通过。首次 6.12 验证暴露回归过早要求 peer EOF：该内核按 resource generation 延迟释放；回归改在真实 native barrier 后验证 EOF，并保留原先的错误、槽复用及字节断言，不改变生产语义或延长超时。
+- Android x86_64：API37／16KiB 与 API23／4KiB、SELinux Enforcing 下，全 feature／精简 shell 回归各 **166 通过**；普通 App 的 UID 分别为 10230／10055，界面及持久化结果分别为 **21 项通过**／**19 项通过、2 项不支持的 GSO/GRO 场景跳过**。两个 API 都执行了普通 IPv6 ancillary 及真实 IP 尾部截断场景；API37 另覆盖继承元数据与 GRO 共存。API23 shell 为该旧模拟器的 root 身份，不能替代独立普通 App 证据。
+- Windows、Linux x86_64、Android 双 ABI 的严格 Clippy，以及 Linux ARM64 全 feature／all-targets 编译检查通过；双 ABI APK 完成 API23 下限、v1 签名与 16KiB 对齐校验。ARM64 构建不冒充原生执行。未执行 Windows IPv6、ARM64 真机或物理 NIC／硬件零拷贝；未改变宿主内核、网络、安全策略。原始日志、负对照和 guest 报告索引：`artifacts/audit-fixes-20260930/verification-summary.json`。
+
 关闭通知回归修复验证（2026-09-30）：
 
 - Windows x64 IPv4：`cargo test --all-features --all-targets` **164 通过、0 失败**；新增回归同时覆盖一个对象上的多个等待者、后续注册项，以及 Waker／panic payload 析构 panic。`runtime_services -- --workers 2` 实跑通过。

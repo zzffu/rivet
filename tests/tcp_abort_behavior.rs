@@ -37,14 +37,19 @@ fn native_close_result(mut runtime: Runtime, abort: bool) -> io::Result<usize> {
         let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let address = listener.local_addr();
         let (send_result, receive_result) = oneshot::channel();
+        let (connected, established) = oneshot::channel();
         let peer = thread::spawn(move || {
             let mut stream = std::net::TcpStream::connect(address).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            connected.send(()).unwrap();
             send_result.send(stream.read(&mut [0; 1])).unwrap();
         });
         let stream = listener.accept().await.unwrap();
+        // accept can finish before the peer's connect syscall returns. Test
+        // read-side FIN/RST only after establishment, not a connect/reset race.
+        established.await.unwrap();
         if abort {
             stream.abort().unwrap();
         } else {

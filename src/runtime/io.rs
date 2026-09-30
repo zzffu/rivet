@@ -72,10 +72,12 @@ impl Callbacks {
         wake: bool,
         key: WakeKey,
         ready: &mut VecDeque<WakeKey>,
+        retired: &mut VecDeque<WakeKey>,
     ) {
         if let Some(mut waiter) = slot.take() {
-            remove_wake(ready, key, &mut waiter.wake_pending);
-            if wake {
+            let queue = if waiter.cancelled { retired } else { ready };
+            remove_wake(queue, key, &mut waiter.wake_pending);
+            if wake && !waiter.cancelled {
                 self.wake(&mut waiter.waker);
             } else {
                 self.discard(waiter.waker);
@@ -161,6 +163,7 @@ struct Waiter {
     id: u64,
     waker: Option<Waker>,
     wake_pending: bool,
+    cancelled: bool,
 }
 pub(crate) struct SocketState {
     pub info: SocketInfo,
@@ -236,6 +239,7 @@ pub(crate) struct IoState {
     dirty_credits: Vec<u64>,
     callbacks: Callbacks,
     ready: VecDeque<WakeKey>,
+    retired: VecDeque<WakeKey>,
 }
 impl IoState {
     pub fn new(limits: &Limits) -> Self {
@@ -253,10 +257,26 @@ impl IoState {
             ready: VecDeque::with_capacity(
                 wake_capacity(limits).expect("validated I/O wake capacity"),
             ),
+            // Cancelled waiters retain their source slot until destruction or
+            // replacement. Reentry cannot accumulate detached waker history.
+            retired: VecDeque::with_capacity(limits.max_sockets * 2),
         }
     }
     pub(super) fn take_callbacks(&mut self) -> [Option<Callback>; 2] {
         std::mem::take(&mut self.callbacks.0)
+    }
+    pub(super) fn take_deferred_callback(&mut self) -> Option<Callback> {
+        let key = self.retired.pop_front()?;
+        let slot = match key {
+            WakeKey::Receive(key) => &mut self.sockets.get_mut(key).unwrap().receive_waiter,
+            WakeKey::Accept(key) => &mut self.sockets.get_mut(key).unwrap().accept_waiter,
+            WakeKey::Operation(_) => unreachable!("only socket waiters are retired"),
+        };
+        let waiter = slot.take().expect("retired source retains its waiter");
+        debug_assert!(waiter.cancelled && waiter.wake_pending);
+        Some(Callback::Drop(
+            waiter.waker.expect("retired waiter owns its waker"),
+        ))
     }
     pub(super) fn take_ready_waker(&mut self) -> Option<Waker> {
         let key = self.ready.pop_front()?;
@@ -360,7 +380,10 @@ impl IoState {
             worker,
             queue_capacity: self.limits.max_pending_receives,
             queued_results: socket.receives.len(),
-            waiter_registered: socket.receive_waiter.is_some(),
+            waiter_registered: socket
+                .receive_waiter
+                .as_ref()
+                .is_some_and(|waiter| !waiter.cancelled),
             active: socket.receive_token.is_some(),
             credits_pending: socket.credits_dirty,
             backend_publication_credits: native.publication_credits,
@@ -467,12 +490,14 @@ impl IoState {
                 false,
                 WakeKey::Receive(key),
                 &mut self.ready,
+                &mut self.retired,
             );
             self.callbacks.waiter(
                 &mut socket.accept_waiter,
                 false,
                 WakeKey::Accept(key),
                 &mut self.ready,
+                &mut self.retired,
             );
         }
         if let Some(index) = self.dirty_credits.iter().position(|&dirty| dirty == key) {
@@ -506,14 +531,7 @@ impl IoState {
             .map(Token)
             .map_err(|_| capacity("operation admission limit reached"))
     }
-    pub fn connect(
-        &mut self,
-        driver: &mut Driver,
-        address: SocketAddr,
-        local: Option<SocketAddr>,
-        options: &crate::socket::SocketOptions,
-        waker: &mut Option<Waker>,
-    ) -> io::Result<Token> {
+    pub fn admit_connect(&mut self, waker: &mut Option<Waker>) -> io::Result<Token> {
         self.can_open()?;
         let token = self.allocate(Operation::Connect(Connect {
             result: None,
@@ -525,11 +543,15 @@ impl IoState {
             unreachable!()
         };
         operation.waker = waker.take();
-        if let Err(error) = driver.connect(token, address, local, options) {
-            self.remove_operation(token.0);
-            return Err(error);
-        }
         Ok(token)
+    }
+    pub(super) fn discard_connect(&mut self, token: Token) {
+        let Some(Operation::Connect(mut operation)) = self.operations.remove(token.0) else {
+            unreachable!("unsubmitted connect admission is live");
+        };
+        debug_assert!(operation.result.is_none());
+        debug_assert!(!operation.wake_pending);
+        self.callbacks.discard(operation.waker.take());
     }
     pub fn poll_connect(
         &mut self,
@@ -578,7 +600,13 @@ impl IoState {
         id: u64,
         waker: &mut Option<Waker>,
         callbacks: &mut Callbacks,
+        key: WakeKey,
+        ready: &mut VecDeque<WakeKey>,
+        retired: &mut VecDeque<WakeKey>,
     ) -> io::Result<()> {
+        if slot.as_ref().is_some_and(|waiter| waiter.cancelled) {
+            callbacks.waiter(slot, false, key, ready, retired);
+        }
         if let Some(waiter) = slot {
             if waiter.id != id {
                 return Err(capacity(
@@ -591,25 +619,39 @@ impl IoState {
                 id,
                 waker: waker.take(),
                 wake_pending: false,
+                cancelled: false,
             });
         }
         Ok(())
     }
-    pub fn cancel_waiter(&mut self, key: u64, id: u64, accept: bool) {
-        if let Some(socket) = self.sockets.get_mut(key) {
-            let slot = if accept {
-                &mut socket.accept_waiter
-            } else {
-                &mut socket.receive_waiter
-            };
-            if slot.as_ref().is_some_and(|w| w.id == id) {
-                let key = if accept {
-                    WakeKey::Accept(key)
-                } else {
-                    WakeKey::Receive(key)
-                };
-                self.callbacks.waiter(slot, false, key, &mut self.ready);
-            }
+    pub fn cancel_waiter(&mut self, key: u64, id: u64, accept: bool, defer: bool) -> Option<Waker> {
+        let socket = self.sockets.get_mut(key)?;
+        let slot = if accept {
+            &mut socket.accept_waiter
+        } else {
+            &mut socket.receive_waiter
+        };
+        let waiter = slot.as_mut()?;
+        if waiter.id != id || waiter.cancelled {
+            return None;
+        }
+        let key = if accept {
+            WakeKey::Accept(key)
+        } else {
+            WakeKey::Receive(key)
+        };
+        remove_wake(&mut self.ready, key, &mut waiter.wake_pending);
+        if defer && waiter.waker.is_some() {
+            waiter.cancelled = true;
+            queue_wake(
+                &mut self.retired,
+                key,
+                &mut waiter.wake_pending,
+                &waiter.waker,
+            );
+            None
+        } else {
+            slot.take().unwrap().waker
         }
     }
     pub fn poll_receive(
@@ -635,9 +677,15 @@ impl IoState {
         if socket.splice_read {
             return Poll::Ready(Err(capacity("receive lane belongs to splice")));
         }
-        if let Err(error) =
-            Self::install_waiter(&mut socket.receive_waiter, id, waker, &mut self.callbacks)
-        {
+        if let Err(error) = Self::install_waiter(
+            &mut socket.receive_waiter,
+            id,
+            waker,
+            &mut self.callbacks,
+            WakeKey::Receive(key),
+            &mut self.ready,
+            &mut self.retired,
+        ) {
             return Poll::Ready(Err(error));
         }
         if let Some(mut result) = socket.receives.pop_front() {
@@ -654,6 +702,7 @@ impl IoState {
                 false,
                 WakeKey::Receive(key),
                 &mut self.ready,
+                &mut self.retired,
             );
             *waiter = None;
             self.mark_credits(key);
@@ -666,6 +715,7 @@ impl IoState {
                 false,
                 WakeKey::Receive(key),
                 &mut self.ready,
+                &mut self.retired,
             );
             *waiter = None;
             return Poll::Ready(Err(error));
@@ -676,6 +726,7 @@ impl IoState {
                 false,
                 WakeKey::Receive(key),
                 &mut self.ready,
+                &mut self.retired,
             );
             *waiter = None;
             return Poll::Ready(Ok(None));
@@ -685,14 +736,16 @@ impl IoState {
             let token = match self.allocate(Operation::Receive(key)) {
                 Ok(token) => token,
                 Err(error) => {
-                    self.cancel_waiter(key, id, false);
+                    let waker = self.cancel_waiter(key, id, false, false);
+                    self.callbacks.discard(waker);
                     *waiter = None;
                     return Poll::Ready(Err(error));
                 }
             };
             if let Err(error) = driver.start_recv(native, token) {
                 self.remove_operation(token.0);
-                self.cancel_waiter(key, id, false);
+                let waker = self.cancel_waiter(key, id, false, false);
+                self.callbacks.discard(waker);
                 *waiter = None;
                 return Poll::Ready(Err(error));
             }
@@ -722,9 +775,15 @@ impl IoState {
         let Some(socket) = self.sockets.get_mut(key) else {
             return Poll::Ready(Err(closed()));
         };
-        if let Err(error) =
-            Self::install_waiter(&mut socket.accept_waiter, id, waker, &mut self.callbacks)
-        {
+        if let Err(error) = Self::install_waiter(
+            &mut socket.accept_waiter,
+            id,
+            waker,
+            &mut self.callbacks,
+            WakeKey::Accept(key),
+            &mut self.ready,
+            &mut self.retired,
+        ) {
             return Poll::Ready(Err(error));
         }
         if let Some(result) = socket.accepts.pop_front() {
@@ -733,6 +792,7 @@ impl IoState {
                 false,
                 WakeKey::Accept(key),
                 &mut self.ready,
+                &mut self.retired,
             );
             *waiter = None;
             self.mark_credits(key);
@@ -745,6 +805,7 @@ impl IoState {
                 false,
                 WakeKey::Accept(key),
                 &mut self.ready,
+                &mut self.retired,
             );
             *waiter = None;
             return Poll::Ready(Err(error));
@@ -754,14 +815,16 @@ impl IoState {
             let token = match self.allocate(Operation::Accept(key)) {
                 Ok(token) => token,
                 Err(error) => {
-                    self.cancel_waiter(key, id, true);
+                    let waker = self.cancel_waiter(key, id, true, false);
+                    self.callbacks.discard(waker);
                     *waiter = None;
                     return Poll::Ready(Err(error));
                 }
             };
             if let Err(error) = driver.start_accept(native, token) {
                 self.remove_operation(token.0);
-                self.cancel_waiter(key, id, true);
+                let waker = self.cancel_waiter(key, id, true, false);
+                self.callbacks.discard(waker);
                 *waiter = None;
                 return Poll::Ready(Err(error));
             }
@@ -1186,12 +1249,14 @@ impl IoState {
                 true,
                 WakeKey::Receive(key),
                 &mut self.ready,
+                &mut self.retired,
             );
             self.callbacks.waiter(
                 &mut socket.accept_waiter,
                 true,
                 WakeKey::Accept(key),
                 &mut self.ready,
+                &mut self.retired,
             );
         }
         if let Some(index) = self.dirty_credits.iter().position(|&dirty| dirty == key) {

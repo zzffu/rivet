@@ -384,7 +384,7 @@ impl Pool {
     }
 }
 
-pub(super) fn ignore_panic(action: impl FnOnce()) {
+pub(crate) fn ignore_panic(action: impl FnOnce()) {
     if let Err(panic) = catch_unwind(AssertUnwindSafe(action)) {
         discard_panic(panic);
     }

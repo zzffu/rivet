@@ -21,13 +21,32 @@ pub(super) enum Offload {
     Gro,
 }
 
-// cmsghdr must be naturally aligned, including on Android's 16 KiB-page builds.
-// Ancillary alignment is unrelated to the virtual-memory page size.
-pub(super) struct Control(pub [usize; 8]);
+// udp{,v6}_recvmsg emits socket cmsgs, then UDP_GRO, then IP/IPv6 cmsgs:
+// https://github.com/torvalds/linux/blob/v5.0/net/ipv6/udp.c
+// API23-era v3.18 net/{ipv4,ipv6}/udp.c has the same order without GRO.
+// Bound the prefix using __sock_recv_cmsgs / __sock_recv_timestamp:
+// https://github.com/torvalds/linux/blob/v6.18/net/socket.c
+// One timeval/timespec (old or time64), three timestamping timespecs, hardware
+// timestamp packet info, and wifi status / drops / mark / priority. Variable
+// timestamping OPT_STATS is error-queue-only; this backend never MSG_ERRQUEUEs.
+// Reserve a complete UDP_GRO int too. Without GRO, that space admits the first
+// IP header, proving that even a truncated IP tail cannot hide GRO. IPv6
+// extension cmsgs can each contain (hdrlen + 1) * 8 bytes (up to 2048), so trying
+// to receive all unrelated IP metadata is neither necessary nor a small bound.
+const CONTROL_BYTES: usize = cmsg_space(mem::size_of::<[i64; 2]>())
+    + cmsg_space(mem::size_of::<[i64; 6]>())
+    + cmsg_space(mem::size_of::<[u32; 4]>())
+    + 4 * cmsg_space(mem::size_of::<u32>())
+    + cmsg_space(mem::size_of::<i32>());
+const CONTROL_WORDS: usize = CONTROL_BYTES / mem::size_of::<usize>();
+
+// Naturally aligned, worker-reused scratch; never cleared per receive.
+// Ancillary alignment is unrelated to Android's virtual-memory page size.
+pub(super) struct Control([usize; CONTROL_WORDS]);
 
 impl Control {
     pub fn new() -> Self {
-        Self([0; 8])
+        Self([0; CONTROL_WORDS])
     }
     pub fn as_mut_ptr(&mut self) -> *mut libc::c_void {
         self.0.as_mut_ptr().cast()
@@ -38,7 +57,7 @@ impl Control {
 
     #[cfg(feature = "udp-gso")]
     pub fn segment(&mut self, size: u16, message: &mut libc::msghdr) {
-        self.0.fill(0);
+        self.0[..cmsg_space(mem::size_of::<u16>()) / mem::size_of::<usize>()].fill(0);
         let header = self.0.as_mut_ptr().cast::<libc::cmsghdr>();
         unsafe {
             (*header).cmsg_level = libc::IPPROTO_UDP;
@@ -50,7 +69,7 @@ impl Control {
         }
     }
 
-    pub fn gro_segment_size(&self, used: usize) -> io::Result<Option<u16>> {
+    pub fn gro_segment_size(&self, used: usize, flags: i32) -> io::Result<Option<u16>> {
         if used > self.capacity() {
             return Err(invalid_control());
         }
@@ -86,16 +105,31 @@ impl Control {
                     .filter(|size| *size != 0)
                     .map(Some)
                     .ok_or_else(invalid_control);
+            } else if header.cmsg_level == libc::IPPROTO_IP
+                || header.cmsg_level == libc::IPPROTO_IPV6
+            {
+                // We reached the IP tail after the complete socket/GRO prefix.
+                // The caller does not consume IP ancillary payload, so its
+                // truncation must not discard an otherwise valid datagram.
+                return Ok(None);
             }
             offset += aligned(length);
+        }
+        if flags & libc::MSG_CTRUNC != 0 {
+            // An incomplete/unknown prefix is not evidence that GRO is absent.
+            return Err(invalid_control());
         }
         Ok(None)
     }
 }
 
-fn aligned(value: usize) -> usize {
+const fn aligned(value: usize) -> usize {
     let alignment = mem::size_of::<usize>();
     (value + alignment - 1) & !(alignment - 1)
+}
+
+const fn cmsg_space(payload: usize) -> usize {
+    aligned(mem::size_of::<libc::cmsghdr>()) + aligned(payload)
 }
 
 fn invalid_control() -> io::Error {
@@ -199,7 +233,9 @@ fn probe_family(address: SocketAddr, offload: Offload) -> io::Result<()> {
             Offload::Gso => length == 4 && message.msg_controllen == 0,
             #[cfg(feature = "udp-gro")]
             Offload::Gro => {
-                length == 8 && control.gro_segment_size(message.msg_controllen)? == Some(4)
+                length == 8
+                    && control.gro_segment_size(message.msg_controllen, message.msg_flags)?
+                        == Some(4)
             }
         };
         if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
@@ -224,4 +260,41 @@ fn probe_family(address: SocketAddr, offload: Offload) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_socket_prefix_or_partial_gro_cannot_mean_an_ordinary_datagram() {
+        for (level, kind, payload_length) in [
+            (
+                libc::SOL_SOCKET,
+                libc::SO_TIMESTAMPNS,
+                mem::size_of::<[i64; 2]>(),
+            ),
+            (libc::IPPROTO_UDP, UDP_GRO, mem::size_of::<u16>()),
+        ] {
+            let mut control = Control::new();
+            let length = unsafe { libc::CMSG_LEN(payload_length as _) } as usize;
+            unsafe {
+                control
+                    .as_mut_ptr()
+                    .cast::<libc::cmsghdr>()
+                    .write(libc::cmsghdr {
+                        cmsg_len: length,
+                        cmsg_level: level,
+                        cmsg_type: kind,
+                    });
+            }
+            assert_eq!(
+                control
+                    .gro_segment_size(length, libc::MSG_CTRUNC)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+            );
+        }
+    }
 }

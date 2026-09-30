@@ -23,6 +23,7 @@ use crate::{
     config::RuntimeConfig,
     driver::{Driver, Event, Notifier, Shared},
 };
+pub(crate) use blocking::ignore_panic;
 pub use blocking::{BlockingJoinHandle, BlockingSpawnError};
 use crossbeam_queue::ArrayQueue;
 pub use group::TaskGroup;
@@ -655,6 +656,15 @@ pub(crate) struct Worker {
     events: RefCell<Vec<Event>>,
     shutting_down: std::cell::Cell<bool>,
     waking_io: std::cell::Cell<bool>,
+    deferring_io: std::cell::Cell<bool>,
+    dropping_io: std::cell::Cell<bool>,
+}
+pub(crate) struct IoCallbackScope<'a>(&'a Worker);
+impl Drop for IoCallbackScope<'_> {
+    fn drop(&mut self) {
+        self.0.deferring_io.set(false);
+        self.0.drop_io_registrations();
+    }
 }
 impl Worker {
     fn new(
@@ -685,6 +695,8 @@ impl Worker {
             shared,
             group: Arc::downgrade(group),
             events: RefCell::new(Vec::with_capacity(config.limits.completion_budget)),
+            deferring_io: std::cell::Cell::new(false),
+            dropping_io: std::cell::Cell::new(false),
             config,
             shutting_down: std::cell::Cell::new(false),
             waking_io: std::cell::Cell::new(false),
@@ -697,14 +709,81 @@ impl Worker {
                 .upgrade()
                 .is_none_or(|group| group.stopping.load(Ordering::Acquire))
     }
-    fn drop_io_registrations(&self) {
-        let callbacks = self.io.borrow_mut().take_callbacks();
-        for callback in callbacks.into_iter().flatten() {
+    /// Defer callbacks across a native call and its Core publication/token handoff.
+    /// Every Core/Driver borrow must end before the returned scope is dropped.
+    pub(crate) fn defer_io_callbacks(&self) -> IoCallbackScope<'_> {
+        // Hooks may cancel existing waiters, not start nested native setup.
+        // Reject before Connect can admit another operation or take its waker.
+        assert!(
+            !self.deferring_io.get(),
+            "native socket setup reentered a hook"
+        );
+        self.drop_io_registrations();
+        self.deferring_io.set(true);
+        IoCallbackScope(self)
+    }
+    fn run_io_callback(&self, callback: io::Callback) {
+        // A teardown callback must not skip later sockets or native memory
+        // release. Outside teardown, preserve ordinary panic propagation.
+        if self.shutting_down.get() {
+            ignore_panic(|| callback.run());
+        } else {
             callback.run();
         }
     }
+    pub(crate) fn cancel_io_waiter(&self, key: u64, id: u64, accept: bool) {
+        let waker = self
+            .io
+            .borrow_mut()
+            .cancel_waiter(key, id, accept, self.deferring_io.get());
+        // Release the logical lane now, but defer user Drop until the outer
+        // native setup has released Driver and published its resource.
+        if let Some(waker) = waker {
+            self.run_io_callback(io::Callback::Drop(waker));
+        }
+    }
+    fn drop_io_registrations(&self) {
+        if self.deferring_io.get() {
+            return;
+        }
+        let already_dropping = self.dropping_io.replace(true);
+        struct Reset<'a>(&'a std::cell::Cell<bool>, bool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _reset = Reset(&self.dropping_io, already_dropping);
+        // Call-local replacements/rollback cannot accumulate behind this guard.
+        // Only the source-retaining retirement queue suppresses recursive drains.
+        let mut callbacks = self.io.borrow_mut().take_callbacks().into_iter().flatten();
+        let unwinding = thread::panicking();
+        let mut first_panic = None;
+        loop {
+            let callback = callbacks.next().or_else(|| {
+                if already_dropping {
+                    None
+                } else {
+                    self.io.borrow_mut().take_deferred_callback()
+                }
+            });
+            let Some(callback) = callback else {
+                break;
+            };
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.run_io_callback(callback))) {
+                if !unwinding && first_panic.is_none() {
+                    first_panic = Some(panic);
+                } else {
+                    blocking::discard_panic(panic);
+                }
+            }
+        }
+        if let Some(panic) = first_panic {
+            resume_unwind(panic);
+        }
+    }
     fn drain_io_wakes(&self) {
-        if self.waking_io.replace(true) {
+        if self.deferring_io.get() || self.waking_io.replace(true) {
             return;
         }
         struct Reset<'a>(&'a std::cell::Cell<bool>);
@@ -721,8 +800,39 @@ impl Worker {
             };
             // Reentrant I/O may queue more live sources, but does not recurse
             // through this batch. No table/driver borrow crosses user code.
-            waker.wake();
+            self.run_io_callback(io::Callback::Wake(waker));
         }
+    }
+    pub(crate) fn submit_connect(
+        &self,
+        address: std::net::SocketAddr,
+        local: Option<std::net::SocketAddr>,
+        options: &crate::socket::SocketOptions,
+        waker: &mut Option<Waker>,
+    ) -> stdio::Result<crate::driver::Token> {
+        struct ConnectAdmission<'a> {
+            worker: &'a Worker,
+            token: Option<crate::driver::Token>,
+        }
+        impl Drop for ConnectAdmission<'_> {
+            fn drop(&mut self) {
+                let Some(token) = self.token else {
+                    return;
+                };
+                self.worker.io.borrow_mut().discard_connect(token);
+            }
+        }
+        self.drop_io_registrations();
+        let mut admission = ConnectAdmission {
+            worker: self,
+            token: Some(self.io.borrow_mut().admit_connect(waker)?),
+        };
+        // Hooks can cancel another logical waiter. Admission owns the token,
+        // but no Core borrow crosses the native call or the hook.
+        self.driver
+            .borrow_mut()
+            .connect(admission.token.unwrap(), address, local, options)?;
+        Ok(admission.token.take().unwrap())
     }
     pub(crate) fn with_io<T>(&self, action: impl FnOnce(&mut io::IoState, &mut Driver) -> T) -> T {
         self.drop_io_registrations();
@@ -730,12 +840,19 @@ impl Worker {
             let mut io = self.io.borrow_mut();
             let mut driver = self.driver.borrow_mut();
             let result = action(&mut io, &mut driver);
-            (result, io.take_callbacks())
+            let callbacks = if self.deferring_io.get() {
+                // Setup performs one publication action; retain its detached
+                // callbacks until the outer scope owns the resource/token.
+                [None, None]
+            } else {
+                io.take_callbacks()
+            };
+            (result, callbacks)
         };
-        // Detached registrations cannot accumulate behind the wake guard:
-        // this call owns at most two, and drops them outside all table borrows.
+        // No table borrow crosses dispatch. Native setup keeps detached
+        // callbacks deferred until its resource is fully published.
         for callback in callbacks.into_iter().flatten() {
-            callback.run();
+            self.run_io_callback(callback);
         }
         self.drain_io_wakes();
         result
@@ -835,20 +952,26 @@ impl Worker {
     fn poll_driver(&self, timeout: Option<Duration>) -> stdio::Result<()> {
         self.drop_io_registrations();
         self.drain_io_wakes();
-        // Own the reused event buffer while dispatching: discarding an event
-        // can release user-owned data, and must not hold the event-table borrow.
-        let mut events = self.events.take();
-        let result = self.driver.borrow_mut().poll(timeout, &mut events);
-        if result.is_ok() {
-            let mut io = self.io.borrow_mut();
-            let mut driver = self.driver.borrow_mut();
-            for event in events.drain(..) {
-                io.event(&mut driver, event);
+        let result = {
+            // Windows prepares AcceptEx children in poll and invokes their
+            // inherited host hooks. Publish the whole event batch before any
+            // registration cancelled by those hooks can run user destruction.
+            let _callbacks = self.defer_io_callbacks();
+            // Own the reused event buffer while dispatching: discarding an event
+            // can release user-owned data without an event-table borrow.
+            let mut events = self.events.take();
+            let result = self.driver.borrow_mut().poll(timeout, &mut events);
+            if result.is_ok() {
+                let mut io = self.io.borrow_mut();
+                let mut driver = self.driver.borrow_mut();
+                for event in events.drain(..) {
+                    io.event(&mut driver, event);
+                }
+                io.flush_capacities(&mut driver);
             }
-            io.flush_capacities(&mut driver);
-        }
-        self.events.replace(events);
-        self.drop_io_registrations();
+            self.events.replace(events);
+            result
+        };
         self.drain_io_wakes();
         result
     }
@@ -878,7 +1001,7 @@ impl Worker {
             let Some(waker) = waker else {
                 break;
             };
-            waker.wake();
+            ignore_panic(|| waker.wake());
         }
         self.io.borrow_mut().begin_shutdown();
         loop {

@@ -384,6 +384,9 @@ impl KernelFeatures {
     }
 }
 
+#[cfg(all(test, feature = "direct-descriptors"))]
+type DirectRejectionHook = Box<dyn FnOnce(&mut Driver, u32)>;
+
 pub struct Driver {
     // Ring closes before registrations' memory and before the normal pool clone.
     ring: Ring,
@@ -417,6 +420,8 @@ pub struct Driver {
     blocked_ingest: Option<Cqe>,
     #[cfg(feature = "direct-descriptors")]
     control_inflight: Option<u8>,
+    #[cfg(all(test, feature = "direct-descriptors"))]
+    after_direct_rejection: Option<DirectRejectionHook>,
     scratch: Vec<u64>,
     send_bytes: usize,
     stopping: bool,
@@ -1141,6 +1146,8 @@ impl Driver {
             blocked_ingest: None,
             #[cfg(feature = "direct-descriptors")]
             control_inflight: None,
+            #[cfg(all(test, feature = "direct-descriptors"))]
+            after_direct_rejection: None,
             scratch: Vec::with_capacity(max_operations),
             config,
             report,
@@ -1661,6 +1668,10 @@ impl Driver {
             #[cfg(feature = "direct-descriptors")]
             if let (Some(table), Some(index)) = (&mut self.fixed, _direct) {
                 let _ = table.remove(&self.ring, index);
+                #[cfg(test)]
+                if let Some(after_release) = self.after_direct_rejection.take() {
+                    after_release(self, index);
+                }
             }
             return Err(ImportError {
                 error: resource_error(),
@@ -3057,6 +3068,19 @@ impl Driver {
             // Inherited transport options are explicitly normalized; the host
             // hook is not rerun on an already-established accepted connection.
             net::configure(&fd, SocketKind::TcpStream, &options, false)?;
+            Ok(fd)
+        })();
+        // Until installation/configuration succeeds, this path owns the direct
+        // slot. add_socket takes cleanup ownership once preparation succeeds.
+        #[cfg(feature = "direct-descriptors")]
+        if result.is_err() && direct {
+            let _ = self
+                .fixed
+                .as_mut()
+                .unwrap()
+                .remove(&self.ring, cqe.res as u32);
+        }
+        let result = result.and_then(|fd| {
             self.add_socket(
                 fd,
                 SocketKind::TcpStream,
@@ -3064,19 +3088,7 @@ impl Driver {
                 direct.then_some(cqe.res as u32),
             )
             .map_err(|error| error.error)
-        })();
-        // add_socket owns cleanup once it is called. FIXED_FD_INSTALL/configure
-        // failures before that point need to release the direct table reference.
-        #[cfg(feature = "direct-descriptors")]
-        if result.is_err() && direct {
-            // A cleared slot returns EBADF on a second removal, with no fd reuse
-            // because this synchronous owner has not allocated another slot.
-            let _ = self
-                .fixed
-                .as_mut()
-                .unwrap()
-                .remove(&self.ring, cqe.res as u32);
-        }
+        });
         self.sockets.get_mut(socket.0).unwrap().accept_credits -= 1;
         events.push(Event::Accepted { token, result });
         self.schedule(key);
@@ -3863,7 +3875,7 @@ mod completion_tests {
         }
     }
 
-    fn driver(features: &[Optimization]) -> Driver {
+    fn driver_config(features: &[Optimization]) -> RuntimeConfig {
         let mut config = RuntimeConfig::single_thread();
         for &optimization in Optimization::ALL {
             config = config.with_policy(optimization, Policy::Off);
@@ -3882,6 +3894,10 @@ mod completion_tests {
         config.limits.pool.max_leases = 16;
         config.linux.sq_entries = 8;
         config.linux.cq_entries = 32;
+        config
+    }
+
+    fn native_driver(config: RuntimeConfig) -> io::Result<Driver> {
         let pool = BufferPool::new(config.limits.pool).unwrap();
         Driver::new(
             &config,
@@ -3890,7 +3906,10 @@ mod completion_tests {
             Arc::new(Notifier::new().unwrap()),
             Arc::new(Shared::new(1)),
         )
-        .unwrap()
+    }
+
+    fn driver(features: &[Optimization]) -> Driver {
+        native_driver(driver_config(features)).unwrap()
     }
 
     #[derive(Clone, Copy)]
@@ -4038,6 +4057,318 @@ mod completion_tests {
                 driver.free_operations.len(),
                 driver.config.limits.max_operations
             );
+        }
+    }
+
+    #[cfg(all(
+        feature = "direct-descriptors",
+        feature = "multishot-accept",
+        feature = "uring-sqpoll"
+    ))]
+    mod direct_accept {
+        use super::*;
+        use std::{
+            fs::File,
+            io::{Read, Write},
+            net::{TcpStream, UdpSocket},
+            sync::mpsc,
+        };
+
+        const TIMEOUT: Duration = Duration::from_secs(2);
+        const FEATURES: &[Optimization] = &[
+            Optimization::FixedFiles,
+            Optimization::DirectDescriptors,
+            Optimization::MultishotAccept,
+            Optimization::SqPoll,
+        ];
+
+        fn direct_driver() -> Option<Driver> {
+            let mut config = driver_config(FEATURES);
+            config.limits.max_sockets = 2;
+            match native_driver(config) {
+                Ok(driver) => {
+                    for &feature in FEATURES {
+                        assert!(driver.capabilities().enabled(feature), "{feature}");
+                    }
+                    Some(driver)
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+                    ) || error.raw_os_error() == Some(libc::ENOSYS) =>
+                {
+                    eprintln!("SKIP direct multishot accept/SQPOLL native path: {error}");
+                    None
+                }
+                Err(error) => panic!("native driver initialization failed: {error}"),
+            }
+        }
+
+        fn next_accept(driver: &mut Driver, key: u64) -> Cqe {
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                while let Some(cqe) = driver.ring.pop() {
+                    driver.enqueue_completion(cqe).unwrap();
+                    if cqe.user_data == key {
+                        assert!(
+                            cqe.res >= 0,
+                            "native accept failed: {}",
+                            io::Error::from_raw_os_error(-cqe.res)
+                        );
+                        assert_ne!(cqe.flags & IORING_CQE_F_MORE, 0);
+                        driver.ring.flush_completions();
+                        return cqe;
+                    }
+                }
+                assert!(Instant::now() < deadline, "native accept did not complete");
+                driver.ring.wait(Some(Duration::from_millis(10))).unwrap();
+            }
+        }
+
+        fn accept_result(events: &mut Vec<Event>, token: Token) -> io::Result<SocketInfo> {
+            match events.pop().expect("missing accepted event") {
+                Event::Accepted {
+                    token: actual,
+                    result,
+                } => {
+                    assert_eq!(actual, token);
+                    result
+                }
+                _ => panic!("expected accepted event"),
+            }
+        }
+
+        fn exchange(
+            driver: &mut Driver,
+            info: SocketInfo,
+            slot: i32,
+            mut peer: TcpStream,
+            payload: &[u8; 8],
+        ) {
+            assert_eq!(info.peer_addr, Some(peer.local_addr().unwrap()));
+            assert_eq!(
+                driver.sockets.get(info.id.0).unwrap().fixed,
+                Some(slot as u32)
+            );
+            // Consume the same idle-socket transfer used by listener services.
+            let mut accepted = TcpStream::from(driver.take_idle_socket(info.id).unwrap());
+            assert_eq!(driver.sockets.available(), 1);
+            accepted.set_nonblocking(false).unwrap();
+            for stream in [&accepted, &peer] {
+                stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+            }
+            peer.write_all(payload).unwrap();
+            let mut received = [0; 8];
+            accepted.read_exact(&mut received).unwrap();
+            assert_eq!(&received, payload);
+            accepted.write_all(&received).unwrap();
+            received.fill(0);
+            peer.read_exact(&mut received).unwrap();
+            assert_eq!(&received, payload);
+        }
+
+        fn finish(driver: &mut Driver, listener: SocketId) {
+            driver.close(listener).unwrap();
+            let deadline = Instant::now() + TIMEOUT;
+            let mut events = Vec::with_capacity(64);
+            while !driver.is_idle() {
+                assert!(Instant::now() < deadline, "accept did not retire");
+                events.clear();
+                driver
+                    .poll(Some(Duration::from_millis(10)), &mut events)
+                    .unwrap();
+            }
+            assert_eq!(driver.sockets.available(), driver.config.limits.max_sockets);
+            assert_eq!(
+                driver.free_operations.len(),
+                driver.config.limits.max_operations
+            );
+        }
+
+        #[test]
+        fn rejected_socket_does_not_close_reused_slot() {
+            if !isolated("direct_accept::rejected_socket_does_not_close_reused_slot") {
+                return;
+            }
+            let Some(mut driver) = direct_driver() else {
+                return;
+            };
+            let listener = driver
+                .listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default())
+                .unwrap();
+            // The listener occupies one direct slot. An ordinary import fills
+            // the owner arena without taking the only remaining direct slot.
+            let filler = driver
+                .import(
+                    UdpSocket::bind("127.0.0.1:0").unwrap().into(),
+                    SocketKind::Udp,
+                    &SocketOptions::udp(),
+                )
+                .unwrap();
+            assert_eq!(driver.sockets.available(), 0);
+            let token = Token(1);
+            driver.start_accept(listener.id, token).unwrap();
+            driver.accept_capacity(listener.id, 2).unwrap();
+            let key = driver.tokens[&token];
+            let mut events = Vec::with_capacity(64);
+            driver.drive_ready(&mut events, 64).unwrap();
+            let mut a = TcpStream::connect_timeout(&listener.local_addr, TIMEOUT).unwrap();
+            a.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let a_cqe = next_accept(&mut driver, key);
+
+            let (send, receive) = mpsc::sync_channel(1);
+            driver.after_direct_rejection = Some(Box::new(move |driver, released| {
+                assert_eq!(released, a_cqe.res as u32);
+                // Pause only the owner, after add_socket has released A. The
+                // real SQPOLL multishot accepts B into that now-free slot.
+                let b = TcpStream::connect_timeout(&listener.local_addr, TIMEOUT).unwrap();
+                let b_cqe = next_accept(driver, key);
+                assert_eq!(b_cqe.res, a_cqe.res);
+                send.send(b).unwrap();
+            }));
+            driver.drain_deferred(&mut events, 1).unwrap();
+            assert_eq!(
+                accept_result(&mut events, token).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            let b = receive.recv_timeout(TIMEOUT).unwrap();
+            driver.close(filler.id).unwrap();
+            driver.drain_deferred(&mut events, 1).unwrap();
+            let accepted = accept_result(&mut events, token)
+                .unwrap_or_else(|error| panic!("A's cleanup closed B's reused slot: {error}"));
+            exchange(&mut driver, accepted, a_cqe.res, b, b"reused-B");
+
+            // The persistent operation and its direct slot remain reusable.
+            driver.accept_capacity(listener.id, 1).unwrap();
+            driver.drive_ready(&mut events, 64).unwrap();
+            let c = TcpStream::connect_timeout(&listener.local_addr, TIMEOUT).unwrap();
+            let c_cqe = next_accept(&mut driver, key);
+            assert_eq!(c_cqe.res, a_cqe.res);
+            driver.drain_deferred(&mut events, 1).unwrap();
+            let accepted = accept_result(&mut events, token).unwrap();
+            exchange(&mut driver, accepted, c_cqe.res, c, b"follow-C");
+            finish(&mut driver, listener.id);
+            // Older kernels retire fixed resources by generation. The active
+            // multishot can retain A's native reference after its slot is reused.
+            assert_eq!(a.read_to_end(&mut Vec::new()).unwrap(), 0);
+        }
+
+        #[derive(Clone, Copy)]
+        enum PreparationFailure {
+            Install,
+            Configure,
+        }
+
+        fn exhaust_descriptors() -> Vec<File> {
+            let mut files = Vec::with_capacity(64);
+            for _ in 0..64 {
+                match File::open("/dev/null") {
+                    Ok(file) => files.push(file),
+                    Err(error) => {
+                        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                        return files;
+                    }
+                }
+            }
+            panic!("isolated descriptor limit was not exhausted");
+        }
+
+        fn preparation_failure(failure: PreparationFailure) {
+            if matches!(failure, PreparationFailure::Install) {
+                // These tests run in a dedicated child, never the concurrent
+                // libtest host. Set the limit before creating the SQPOLL task.
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                    0
+                );
+                limit.rlim_cur = limit.rlim_cur.min(64);
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+            }
+            let Some(mut driver) = direct_driver() else {
+                return;
+            };
+            let listener = driver
+                .listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default())
+                .unwrap();
+            let token = Token(1);
+            driver.start_accept(listener.id, token).unwrap();
+            let key = driver.tokens[&token];
+            let mut events = Vec::with_capacity(64);
+            let mut rejected = Vec::with_capacity(3);
+            for _ in 0..3 {
+                driver.accept_capacity(listener.id, 1).unwrap();
+                driver.drive_ready(&mut events, 64).unwrap();
+                let peer = TcpStream::connect_timeout(&listener.local_addr, TIMEOUT).unwrap();
+                peer.set_read_timeout(Some(TIMEOUT)).unwrap();
+                next_accept(&mut driver, key);
+                let expected = match failure {
+                    PreparationFailure::Install => libc::EMFILE,
+                    PreparationFailure::Configure => {
+                        // Querying an IPv6 option on this IPv4 socket produces
+                        // a real native error before owner-arena admission.
+                        driver
+                            .sockets
+                            .get_mut(listener.id.0)
+                            .unwrap()
+                            .options
+                            .only_v6 = Some(true);
+                        socket2::SockRef::from(&peer)
+                            .only_v6()
+                            .unwrap_err()
+                            .raw_os_error()
+                            .unwrap()
+                    }
+                };
+                let occupied =
+                    matches!(failure, PreparationFailure::Install).then(exhaust_descriptors);
+                driver.drain_deferred(&mut events, 1).unwrap();
+                drop(occupied);
+                let error = accept_result(&mut events, token).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(expected));
+                rejected.push(peer);
+                assert_eq!(driver.sockets.available(), 1);
+                driver
+                    .sockets
+                    .get_mut(listener.id.0)
+                    .unwrap()
+                    .options
+                    .only_v6 = None;
+            }
+
+            // More failures than direct capacity must not leak the slot.
+            driver.accept_capacity(listener.id, 1).unwrap();
+            driver.drive_ready(&mut events, 64).unwrap();
+            let peer = TcpStream::connect_timeout(&listener.local_addr, TIMEOUT).unwrap();
+            let cqe = next_accept(&mut driver, key);
+            driver.drain_deferred(&mut events, 1).unwrap();
+            let accepted = accept_result(&mut events, token).unwrap();
+            exchange(&mut driver, accepted, cqe.res, peer, b"recover!");
+            finish(&mut driver, listener.id);
+            for mut peer in rejected {
+                // Assert release after the native barrier, not merely removal
+                // of a fixed-table index; read_to_end also handles EINTR.
+                assert_eq!(peer.read_to_end(&mut Vec::new()).unwrap(), 0);
+            }
+        }
+
+        #[test]
+        fn install_failure_releases_accepted_slot() {
+            if isolated("direct_accept::install_failure_releases_accepted_slot") {
+                preparation_failure(PreparationFailure::Install);
+            }
+        }
+
+        #[test]
+        fn configure_failure_releases_accepted_slot() {
+            if isolated("direct_accept::configure_failure_releases_accepted_slot") {
+                preparation_failure(PreparationFailure::Configure);
+            }
         }
     }
 }

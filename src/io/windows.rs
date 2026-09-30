@@ -8,7 +8,6 @@ use std::{
     io,
     marker::PhantomData,
     os::windows::io::{AsRawHandle, OwnedHandle, RawHandle},
-    panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
     sync::Arc,
 };
@@ -165,8 +164,9 @@ unsafe extern "system" fn notified(
     // Keep only an owned Entry after publishing the native result. The callback
     // is disassociated before invoking arbitrary Waker code, which may close
     // this registration (or the whole Registry) on this very callback thread.
-    // A Waker panic must never unwind across the native callback boundary.
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    // Neither a Waker panic nor its payload's destructor may unwind across
+    // the native callback boundary.
+    crate::runtime::ignore_panic(|| {
         // SAFETY: Teardown joins callbacks before freeing this context. Clone
         // the Entry before disassociation and never access context again.
         let entry = unsafe { &*context.cast::<Callback>() }.entry.clone();
@@ -187,7 +187,7 @@ unsafe extern "system" fn notified(
         // Close can now join the native portion without self-joining user code.
         unsafe { DisassociateCurrentThreadFromCallback(instance) };
         entry.changed.notify_all();
-    }));
+    });
 }
 struct NativeWait {
     wait: PTP_WAIT,

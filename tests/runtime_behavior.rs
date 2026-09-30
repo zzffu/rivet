@@ -994,6 +994,98 @@ fn completion_wakers_can_destroy_pending_tcp_operations() {
     });
 }
 
+#[test]
+fn socket_hooks_can_cancel_pending_accept_and_receive_lanes() {
+    use std::io::Write;
+
+    async fn cancel_in_hook(future: impl Future<Output = ()> + 'static, via_connect: bool) {
+        let _notice = cancel_on_io_wake(future).await;
+        let options = SocketOptions {
+            hook: Some(Arc::new(|_: rivet::socket::BorrowedSocket<'_>| {
+                assert!(cancel_registered_io());
+                Ok(())
+            })),
+            ..SocketOptions::default()
+        };
+        if via_connect {
+            let target = std::net::TcpListener::bind(address(false)).unwrap();
+            let _trigger = TcpStream::connect_with_options(target.local_addr().unwrap(), options)
+                .await
+                .unwrap();
+        } else {
+            let _trigger = TcpListener::bind_with_options(address(false), options).unwrap();
+        }
+        assert!(!cancel_registered_io());
+    }
+
+    let mut owner = Runtime::new(config(1)).unwrap();
+    owner.block_on(async {
+        time::timeout(Duration::from_secs(10), async {
+            // Keep each original Rc alive: the hook cancels only the waiter,
+            // not the socket or its persistent native receive/accept operation.
+            let listener = Rc::new(TcpListener::bind(address(false)).unwrap());
+            for via_connect in [false, true] {
+                let accepting = listener.clone();
+                cancel_in_hook(
+                    async move {
+                        let _ = accepting.accept().await;
+                    },
+                    via_connect,
+                )
+                .await;
+            }
+            let mut peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let stream = Rc::new(listener.accept().await.unwrap());
+            for via_connect in [false, true] {
+                let receiving = stream.clone();
+                cancel_in_hook(
+                    async move {
+                        let _ = receiving.recv().await;
+                    },
+                    via_connect,
+                )
+                .await;
+            }
+            peer.write_all(b"TCP after hook cancellation").unwrap();
+            assert_eq!(
+                flatten(&blocks_exactly(&stream, b"TCP after hook cancellation".len()).await),
+                b"TCP after hook cancellation"
+            );
+
+            let socket = Rc::new(UdpSocket::bind(address(false)).unwrap());
+            let sender = std::net::UdpSocket::bind(address(false)).unwrap();
+            for batch in [false, true] {
+                for via_connect in [false, true] {
+                    let receiving = socket.clone();
+                    cancel_in_hook(
+                        async move {
+                            if batch {
+                                let mut output = [None, None];
+                                let _ = receiving.recv_batch(&mut output).await;
+                            } else {
+                                let _ = receiving.recv().await;
+                            }
+                        },
+                        via_connect,
+                    )
+                    .await;
+                }
+                assert!(!socket.receive_snapshot().unwrap().waiter_registered());
+                sender
+                    .send_to(b"UDP after hook cancellation", socket.local_addr())
+                    .unwrap();
+                let received = socket.recv().await.unwrap();
+                assert_eq!(received.data.as_slice(), b"UDP after hook cancellation");
+                assert_eq!(received.peer, Some(sender.local_addr().unwrap()));
+            }
+        })
+        .await
+        .unwrap();
+    });
+}
+
 struct CancelIoOnDrop(Arc<AtomicBool>);
 impl std::task::Wake for CancelIoOnDrop {
     fn wake(self: Arc<Self>) {
@@ -1238,4 +1330,882 @@ fn cloning_an_io_waker_can_cancel_another_waiter() {
         let mut replacement = victim.recv();
         assert!(poll_once(&mut replacement).await.is_none());
     });
+}
+
+#[test]
+fn shutdown_callback_panics_still_close_waiters_and_native_resources() {
+    use std::process::{Child, Command};
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Guard(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "shutdown_callback_panic_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RIVET_SHUTDOWN_CALLBACK_PANIC_CHILD", "1")
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "shutdown-callback child failed: {status}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shutdown-callback child did not finish"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn shutdown_callback_panic_child() {
+    use std::{
+        io::Read,
+        pin::Pin,
+        sync::atomic::AtomicUsize,
+        task::{Context, Wake, Waker},
+    };
+    if std::env::var_os("RIVET_SHUTDOWN_CALLBACK_PANIC_CHILD").is_none() {
+        return;
+    }
+    struct Payload(Arc<AtomicUsize>);
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            panic!("intentional shutdown panic-payload destructor panic");
+        }
+    }
+    struct CallbackWake {
+        called: Arc<AtomicUsize>,
+        payload_drops: Arc<AtomicUsize>,
+        panics: bool,
+        on_drop: bool,
+        payload_panics: bool,
+    }
+    impl CallbackWake {
+        fn call(&self) {
+            self.called.fetch_add(1, Ordering::AcqRel);
+            if self.panics {
+                if self.payload_panics {
+                    std::panic::panic_any(Payload(self.payload_drops.clone()));
+                }
+                panic!("intentional shutdown callback panic");
+            }
+        }
+    }
+    impl Wake for CallbackWake {
+        fn wake(self: Arc<Self>) {
+            if !self.on_drop {
+                self.call();
+            }
+        }
+    }
+    impl Drop for CallbackWake {
+        fn drop(&mut self) {
+            if self.on_drop {
+                self.call();
+            }
+        }
+    }
+    fn closed<T>(result: Poll<io::Result<T>>) {
+        match result {
+            Poll::Ready(Err(error)) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
+            _ => panic!("retained operation did not reach its shutdown error"),
+        }
+    }
+
+    // Timer callbacks, socket-close callbacks, operation-completion callbacks
+    // and detached registration destruction must each leave shutdown running.
+    for source in 0..4 {
+        for payload_panics in [false, true] {
+            let mut owner = Runtime::new(config(1)).unwrap();
+            let pool = owner.buffer_pool();
+            let baseline = pool.usage();
+            let (listener, stream, mut peer, udp) = owner.block_on(async {
+                let listener = TcpListener::bind(address(false)).unwrap();
+                let peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+                let stream = listener.accept().await.unwrap();
+                let udp = Rc::new(
+                    UdpSocket::bind_with_options(
+                        address(false),
+                        SocketOptions {
+                            reuse_address: false,
+                            ..SocketOptions::default()
+                        },
+                    )
+                    .unwrap(),
+                );
+                (listener, stream, peer, udp)
+            });
+            let target = std::net::TcpListener::bind(address(false)).unwrap();
+            let mut connects = [
+                TcpStream::connect(target.local_addr().unwrap()),
+                TcpStream::connect(target.local_addr().unwrap()),
+            ];
+            let mut sleeps = [
+                time::sleep(Duration::from_secs(3600)),
+                time::sleep(Duration::from_secs(3600)),
+            ];
+            let mut accepting = pin!(listener.accept());
+            let mut receiving = pin!(stream.recv());
+            let mut cancellation_sleep = None;
+            let mut cancellation = None;
+            let mut callbacks = Vec::new();
+            let payload_drops = Arc::new(AtomicUsize::new(0));
+            let mut waker = |panics, on_drop| {
+                let called = Arc::new(AtomicUsize::new(0));
+                callbacks.push(called.clone());
+                Waker::from(Arc::new(CallbackWake {
+                    called,
+                    payload_drops: payload_drops.clone(),
+                    panics,
+                    on_drop,
+                    payload_panics,
+                }))
+            };
+            owner.block_on(std::future::poll_fn(|_| {
+                for sleep in &mut sleeps {
+                    let wake = waker(source == 0, false);
+                    assert!(
+                        Pin::new(sleep)
+                            .poll(&mut Context::from_waker(&wake))
+                            .is_pending()
+                    );
+                }
+                let wake = waker(source == 1, false);
+                assert!(
+                    accepting
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&wake))
+                        .is_pending()
+                );
+                drop(wake);
+                let wake = waker(source == 1, false);
+                assert!(
+                    receiving
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&wake))
+                        .is_pending()
+                );
+                drop(wake);
+                // Return Ready without a worker turn: these Connects retain
+                // the Worker after Runtime drop, exposing skipped native drain.
+                for connect in &mut connects {
+                    let wake = waker(source == 2, false);
+                    assert!(
+                        Pin::new(connect)
+                            .poll(&mut Context::from_waker(&wake))
+                            .is_pending()
+                    );
+                }
+                if source == 3 {
+                    let socket = udp.clone();
+                    let mut future = Box::pin(async move {
+                        let _ = socket.recv().await;
+                    });
+                    let wake = waker(true, true);
+                    assert!(
+                        future
+                            .as_mut()
+                            .poll(&mut Context::from_waker(&wake))
+                            .is_pending()
+                    );
+                    drop(wake);
+                    CANCELLED_IO.with(|slot| *slot.borrow_mut() = Some(future));
+                    let notice = Arc::new(CancelIoWake {
+                        cancelled: AtomicBool::new(false),
+                        root: Waker::noop().clone(),
+                    });
+                    let wake = Waker::from(notice.clone());
+                    let mut sleep = time::sleep(Duration::from_secs(3600));
+                    assert!(
+                        Pin::new(&mut sleep)
+                            .poll(&mut Context::from_waker(&wake))
+                            .is_pending()
+                    );
+                    cancellation_sleep = Some(sleep);
+                    cancellation = Some(notice);
+                }
+                Poll::Ready(())
+            }));
+            drop(owner);
+
+            for called in callbacks {
+                assert_eq!(called.load(Ordering::Acquire), 1);
+            }
+            assert_eq!(
+                payload_drops.load(Ordering::Acquire),
+                if payload_panics {
+                    if source == 3 { 1 } else { 2 }
+                } else {
+                    0
+                }
+            );
+            if let Some(notice) = cancellation {
+                // This statement follows the throwing registration destructor
+                // inside the timer callback, not merely an outer panic catch.
+                assert!(notice.cancelled.load(Ordering::Acquire));
+                assert!(!cancel_registered_io());
+            }
+            let mut cx = Context::from_waker(Waker::noop());
+            for sleep in &mut sleeps {
+                closed(Pin::new(sleep).poll(&mut cx));
+            }
+            if let Some(sleep) = &mut cancellation_sleep {
+                closed(Pin::new(sleep).poll(&mut cx));
+            }
+            closed(accepting.as_mut().poll(&mut cx));
+            closed(receiving.as_mut().poll(&mut cx));
+            for connect in &mut connects {
+                closed(Pin::new(connect).poll(&mut cx));
+            }
+            assert!(pool.usage().leases_in_use() <= baseline.leases_in_use());
+            assert!(pool.usage().payload_in_use() <= baseline.payload_in_use());
+            // Socket wrappers and completed Connects are still retained. Their
+            // native resources must nevertheless already have been released.
+            let _rebound = std::net::UdpSocket::bind(udp.local_addr()).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            match peer.read(&mut [0; 1]) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                    ) => {}
+                result => panic!("native TCP peer remained open after shutdown: {result:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn running_io_callbacks_still_propagate_panics_without_losing_the_receive_lane() {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind, panic_any},
+        pin::Pin,
+        task::{Context, Wake, Waker},
+    };
+    struct CallbackPanic;
+    struct Panics {
+        on_drop: bool,
+    }
+    impl Wake for Panics {
+        fn wake(self: Arc<Self>) {
+            if !self.on_drop {
+                panic_any(CallbackPanic);
+            }
+        }
+    }
+    impl Drop for Panics {
+        fn drop(&mut self) {
+            if self.on_drop {
+                panic_any(CallbackPanic);
+            }
+        }
+    }
+    for on_drop in [false, true] {
+        let mut owner = Runtime::new(config(1)).unwrap();
+        let socket = owner.block_on(async { UdpSocket::bind(address(false)).unwrap() });
+        let mut receiving = socket.recv();
+        owner.block_on(std::future::poll_fn(|_| {
+            let waker = Waker::from(Arc::new(Panics { on_drop }));
+            assert!(
+                Pin::new(&mut receiving)
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            Poll::Ready(())
+        }));
+        let sender = std::net::UdpSocket::bind(address(false)).unwrap();
+        sender
+            .send_to(b"survives a running callback panic", socket.local_addr())
+            .unwrap();
+        if on_drop {
+            let panic = catch_unwind(AssertUnwindSafe(|| drop(receiving))).unwrap_err();
+            assert!(panic.is::<CallbackPanic>());
+        } else {
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                owner.block_on(time::timeout(Duration::from_secs(5), pending::<()>()))
+            }))
+            .unwrap_err();
+            assert!(panic.is::<CallbackPanic>());
+            drop(receiving);
+        }
+        owner.block_on(async {
+            let received = time::timeout(Duration::from_secs(5), socket.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                received.data.as_slice(),
+                b"survives a running callback panic"
+            );
+        });
+    }
+}
+
+#[test]
+fn rejected_connect_hooks_release_unsubmitted_admission_and_wakers() {
+    use std::{
+        io::Read,
+        panic::{AssertUnwindSafe, catch_unwind, panic_any},
+        pin::Pin,
+        sync::atomic::AtomicUsize,
+        task::{Context, Wake, Waker},
+    };
+    struct HookPanic;
+    struct Registration(Arc<AtomicUsize>);
+    impl Wake for Registration {
+        fn wake(self: Arc<Self>) {
+            drop(self);
+        }
+    }
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    for panics in [false, true] {
+        let mut limits = config(1);
+        limits.limits.max_operations = 1;
+        // Exercise Core admission rollback, independently of optional native
+        // direct-descriptor creation and its separate unwind ownership.
+        #[cfg(target_os = "linux")]
+        let limits = limits.with_policy(rivet::Optimization::DirectDescriptors, rivet::Policy::Off);
+        let mut owner = Runtime::new(limits).unwrap();
+        let target = std::net::TcpListener::bind(address(false)).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        for attempt in 1..=3 {
+            let mut connect = TcpStream::connect_with_options(
+                target.local_addr().unwrap(),
+                SocketOptions {
+                    hook: Some(Arc::new(move |_: rivet::socket::BorrowedSocket<'_>| {
+                        if panics {
+                            panic_any(HookPanic);
+                        }
+                        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                    })),
+                    ..SocketOptions::default()
+                },
+            );
+            let waker = Waker::from(Arc::new(Registration(drops.clone())));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                owner.block_on(std::future::poll_fn(|_| {
+                    Poll::Ready(Pin::new(&mut connect).poll(&mut Context::from_waker(&waker)))
+                }))
+            }));
+            if panics {
+                assert!(result.unwrap_err().is::<HookPanic>());
+            } else {
+                match result.unwrap() {
+                    Poll::Ready(Err(error)) => {
+                        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                    }
+                    result => panic!("hook rejection was not preserved: {result:?}"),
+                }
+            }
+            drop(waker);
+            assert_eq!(drops.load(Ordering::Acquire), attempt);
+            drop(connect);
+        }
+        owner.block_on(async {
+            time::timeout(Duration::from_secs(5), async {
+                let stream = TcpStream::connect(target.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (mut peer, _) = target.accept().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream
+                    .send_all(payload(b"after rejected hooks"))
+                    .await
+                    .result
+                    .unwrap();
+                let mut bytes = [0; 20];
+                peer.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, b"after rejected hooks");
+            })
+            .await
+            .unwrap();
+        });
+    }
+}
+
+mod hook_waker_destruction {
+    use super::*;
+    use std::{
+        cell::RefCell,
+        io::{Read, Write},
+        panic::{AssertUnwindSafe, catch_unwind, panic_any},
+        pin::Pin,
+        sync::atomic::AtomicUsize,
+        task::{Context, Wake, Waker},
+    };
+
+    thread_local! {
+        static WAITERS: RefCell<Vec<Pin<Box<dyn Future<Output = ()>>>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct Stats {
+        drops: AtomicUsize,
+        depth: AtomicUsize,
+        maximum_depth: AtomicUsize,
+        in_hook: AtomicBool,
+        sockets: usize,
+    }
+    impl Stats {
+        fn new(sockets: usize) -> Arc<Self> {
+            Arc::new(Self {
+                drops: AtomicUsize::new(0),
+                depth: AtomicUsize::new(0),
+                maximum_depth: AtomicUsize::new(0),
+                in_hook: AtomicBool::new(false),
+                sockets,
+            })
+        }
+    }
+    struct HookPanic;
+    struct CallbackPanic;
+    struct BadPayload;
+    impl Drop for BadPayload {
+        fn drop(&mut self) {
+            panic!("intentional deferred panic-payload destructor");
+        }
+    }
+    struct NativeOnDrop {
+        stats: Arc<Stats>,
+        panic: u8,
+        reenter: bool,
+    }
+    impl Wake for NativeOnDrop {
+        fn wake(self: Arc<Self>) {
+            panic!("a cancelled waiter must be dropped, not woken");
+        }
+    }
+    impl Drop for NativeOnDrop {
+        fn drop(&mut self) {
+            assert!(!self.stats.in_hook.load(Ordering::Acquire));
+            let depth = self.stats.depth.fetch_add(1, Ordering::AcqRel) + 1;
+            self.stats.maximum_depth.fetch_max(depth, Ordering::AcqRel);
+            struct Reset<'a>(&'a AtomicUsize);
+            impl Drop for Reset<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _reset = Reset(&self.stats.depth);
+            let resources = runtime::resource_snapshot().unwrap();
+            assert_eq!(resources.sockets(), self.stats.sockets);
+            // Exercise Driver on both creation and close, not only Core reentry.
+            drop(TcpListener::bind(address(false)).unwrap());
+            self.stats.drops.fetch_add(1, Ordering::AcqRel);
+            if self.reenter {
+                replace_retired_lane_repeatedly();
+                // The other retired source must stay queued while this
+                // destructor registers/cancels new I/O, not run recursively.
+                assert_eq!(self.stats.drops.load(Ordering::Acquire), 1);
+            }
+            match self.panic {
+                0 => {}
+                1 => panic_any(CallbackPanic),
+                2 => panic_any(BadPayload),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn register(
+        future: impl Future<Output = ()> + 'static,
+        stats: &Arc<Stats>,
+        panic: u8,
+        reenter: bool,
+    ) {
+        let mut future = Box::pin(future);
+        let waker = Waker::from(Arc::new(NativeOnDrop {
+            stats: stats.clone(),
+            panic,
+            reenter,
+        }));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        WAITERS.with(|slot| slot.borrow_mut().push(future));
+        // The Core registration is now the sole owner of this Wake object.
+    }
+    fn options(stats: &Arc<Stats>, exit: u8) -> SocketOptions {
+        let stats = stats.clone();
+        SocketOptions {
+            hook: Some(Arc::new(move |_: rivet::socket::BorrowedSocket<'_>| {
+                assert!(!stats.in_hook.swap(true, Ordering::AcqRel));
+                struct Reset<'a>(&'a AtomicBool);
+                impl Drop for Reset<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _reset = Reset(&stats.in_hook);
+                let waiters = WAITERS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+                drop(waiters);
+                assert_eq!(stats.drops.load(Ordering::Acquire), 0);
+                match exit {
+                    0 => Ok(()),
+                    1 => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+                    2 => panic_any(HookPanic),
+                    _ => unreachable!(),
+                }
+            })),
+            ..SocketOptions::default()
+        }
+    }
+
+    struct Lanes {
+        listener: Rc<TcpListener>,
+        stream: Rc<TcpStream>,
+        peer: std::net::TcpStream,
+        udp: [Rc<UdpSocket>; 2],
+    }
+    impl Lanes {
+        async fn new() -> Self {
+            let listener = Rc::new(TcpListener::bind(address(false)).unwrap());
+            let peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let stream = Rc::new(listener.accept().await.unwrap());
+            let udp = std::array::from_fn(|_| Rc::new(UdpSocket::bind(address(false)).unwrap()));
+            Self {
+                listener,
+                stream,
+                peer,
+                udp,
+            }
+        }
+        fn register(&self, stats: &Arc<Stats>, panic_callbacks: bool) {
+            let listener = self.listener.clone();
+            register(
+                async move {
+                    let _ = listener.accept().await;
+                },
+                stats,
+                u8::from(panic_callbacks),
+                false,
+            );
+            let stream = self.stream.clone();
+            register(
+                async move {
+                    let _ = stream.recv().await;
+                },
+                stats,
+                if panic_callbacks { 2 } else { 0 },
+                false,
+            );
+            let udp = self.udp[0].clone();
+            register(
+                async move {
+                    let _ = udp.recv().await;
+                },
+                stats,
+                0,
+                false,
+            );
+            let udp = self.udp[1].clone();
+            register(
+                async move {
+                    let mut output = [None, None];
+                    let _ = udp.recv_batch(&mut output).await;
+                },
+                stats,
+                0,
+                false,
+            );
+        }
+        async fn prove_reusable(&mut self) {
+            let mut peer = std::net::TcpStream::connect(self.listener.local_addr()).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let accepted = self.listener.accept().await.unwrap();
+            peer.write_all(b"accept").unwrap();
+            assert_eq!(flatten(&blocks_exactly(&accepted, 6).await), b"accept");
+            self.peer.write_all(b"stream").unwrap();
+            assert_eq!(flatten(&blocks_exactly(&self.stream, 6).await), b"stream");
+            let sender = std::net::UdpSocket::bind(address(false)).unwrap();
+            for udp in &self.udp {
+                assert!(!udp.receive_snapshot().unwrap().waiter_registered());
+                sender.send_to(b"datagram", udp.local_addr()).unwrap();
+                let received = udp.recv().await.unwrap();
+                assert_eq!(received.data.as_slice(), b"datagram");
+                assert_eq!(received.peer, Some(sender.local_addr().unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn every_native_hook_releases_cancelled_wakers_after_publication_or_rollback() {
+        for entry in 0..4 {
+            for exit in 0..3 {
+                let limits = config(1);
+                // Hook unwinding is independent of optional direct-create ownership.
+                #[cfg(target_os = "linux")]
+                let limits = if exit == 2 {
+                    limits.with_policy(rivet::Optimization::DirectDescriptors, rivet::Policy::Off)
+                } else {
+                    limits
+                };
+                let mut owner = Runtime::new(limits).unwrap();
+                owner.block_on(async {
+                    time::timeout(Duration::from_secs(10), async {
+                        let mut lanes = Lanes::new().await;
+                        let stats = Stats::new(4 + usize::from(exit == 0 && entry != 3));
+                        lanes.register(&stats, exit == 2);
+                        let options = options(&stats, exit);
+                        let target = std::net::TcpListener::bind(address(false)).unwrap();
+                        let result = catch_unwind(AssertUnwindSafe(|| match entry {
+                            0 => TcpListener::bind_with_options(address(false), options).map(drop),
+                            1 => UdpSocket::bind_with_options(address(false), options).map(drop),
+                            2 => {
+                                #[cfg(windows)]
+                                let socket = support::registered_udp().into();
+                                #[cfg(unix)]
+                                let socket =
+                                    std::net::UdpSocket::bind(address(false)).unwrap().into();
+                                UdpSocket::import(socket, options)
+                                    .map(drop)
+                                    .map_err(|error| error.error)
+                            }
+                            3 => {
+                                let mut connect = TcpStream::connect_with_options(
+                                    target.local_addr().unwrap(),
+                                    options,
+                                );
+                                match Pin::new(&mut connect)
+                                    .poll(&mut Context::from_waker(Waker::noop()))
+                                {
+                                    Poll::Pending => Ok(()),
+                                    Poll::Ready(result) => result.map(drop),
+                                }
+                            }
+                            _ => unreachable!(),
+                        }));
+                        match exit {
+                            0 => result.unwrap().unwrap(),
+                            1 => assert_eq!(
+                                result.unwrap().unwrap_err().kind(),
+                                io::ErrorKind::PermissionDenied
+                            ),
+                            2 => assert!(result.unwrap_err().is::<HookPanic>()),
+                            _ => unreachable!(),
+                        }
+                        assert_eq!(stats.drops.load(Ordering::Acquire), 4);
+                        assert_eq!(stats.maximum_depth.load(Ordering::Acquire), 1);
+                        lanes.prove_reusable().await;
+                    })
+                    .await
+                    .unwrap();
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn callback_panics_preserve_the_connect_token_and_drain_other_retirements() {
+        let mut owner = Runtime::new(config(1)).unwrap();
+        owner.block_on(async {
+            time::timeout(Duration::from_secs(10), async {
+                let mut lanes = Lanes::new().await;
+                let stats = Stats::new(4);
+                lanes.register(&stats, true);
+                let target = std::net::TcpListener::bind(address(false)).unwrap();
+                let mut connect = TcpStream::connect_with_options(
+                    target.local_addr().unwrap(),
+                    options(&stats, 0),
+                );
+                let panic = catch_unwind(AssertUnwindSafe(|| {
+                    Pin::new(&mut connect).poll(&mut Context::from_waker(Waker::noop()))
+                }))
+                .unwrap_err();
+                assert!(panic.is::<CallbackPanic>());
+                assert_eq!(stats.drops.load(Ordering::Acquire), 4);
+                assert_eq!(stats.maximum_depth.load(Ordering::Acquire), 1);
+                // Continue the same future: a lost handoff would admit a second
+                // connection and leave the first accepted peer without these bytes.
+                let stream = connect.await.unwrap();
+                let (mut peer, _) = target.accept().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream
+                    .send_all(payload(b"original token"))
+                    .await
+                    .result
+                    .unwrap();
+                let mut bytes = [0; 14];
+                peer.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, b"original token");
+                lanes.prove_reusable().await;
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accept_preparation_hooks_defer_destruction_until_after_event_dispatch() {
+        let mut owner = Runtime::new(config(1)).unwrap();
+        owner.block_on(async {
+            time::timeout(Duration::from_secs(10), async {
+                let udp = Rc::new(UdpSocket::bind(address(false)).unwrap());
+                let stats = Stats::new(2);
+                let armed = Arc::new(AtomicBool::new(false));
+                let trigger = armed.clone();
+                let cancel = options(&stats, 0).hook.unwrap();
+                let listener = TcpListener::bind_with_options(
+                    address(false),
+                    SocketOptions {
+                        hook: Some(Arc::new(
+                            move |socket: rivet::socket::BorrowedSocket<'_>| {
+                                if trigger.swap(false, Ordering::AcqRel) {
+                                    cancel.configure(socket)?;
+                                }
+                                Ok(())
+                            },
+                        )),
+                        ..SocketOptions::default()
+                    },
+                )
+                .unwrap();
+                let receiving = udp.clone();
+                register(
+                    async move {
+                        let _ = receiving.recv().await;
+                    },
+                    &stats,
+                    0,
+                    false,
+                );
+                let sender = std::net::UdpSocket::bind(address(false)).unwrap();
+                sender
+                    .send_to(b"queued during accept", udp.local_addr())
+                    .unwrap();
+                armed.store(true, Ordering::Release);
+                let mut peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let stream = listener.accept().await.unwrap();
+                assert!(!armed.load(Ordering::Acquire));
+                assert_eq!(stats.drops.load(Ordering::Acquire), 1);
+                assert_eq!(stats.maximum_depth.load(Ordering::Acquire), 1);
+                let received = udp.recv().await.unwrap();
+                assert_eq!(received.data.as_slice(), b"queued during accept");
+                assert_eq!(received.peer, Some(sender.local_addr().unwrap()));
+                stream.send_all(payload(b"accepted")).await.result.unwrap();
+                let mut bytes = [0; 8];
+                peer.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, b"accepted");
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    fn replace_retired_lane_repeatedly() {
+        struct Registration(Arc<AtomicUsize>);
+        impl Wake for Registration {
+            fn wake(self: Arc<Self>) {
+                panic!("a rejected connect registration must not be woken");
+            }
+        }
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let lane = Rc::new(UdpSocket::bind(address(false)).unwrap());
+        let target = std::net::TcpListener::bind(address(false)).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        for attempt in 1..=136 {
+            let receiving = lane.clone();
+            let mut waiter = Box::pin(async move {
+                let _ = receiving.recv().await;
+            });
+            assert!(
+                waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            CANCELLED_IO.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(waiter);
+            });
+            let mut connect = TcpStream::connect_with_options(
+                target.local_addr().unwrap(),
+                SocketOptions {
+                    hook: Some(Arc::new(|_: rivet::socket::BorrowedSocket<'_>| {
+                        assert!(cancel_registered_io());
+                        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                    })),
+                    ..SocketOptions::default()
+                },
+            );
+            let waker = Waker::from(Arc::new(Registration(drops.clone())));
+            let Poll::Ready(Err(error)) =
+                Pin::new(&mut connect).poll(&mut Context::from_waker(&waker))
+            else {
+                panic!("hook rejection must finish before leaving nested setup");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            drop(waker);
+            assert_eq!(drops.load(Ordering::Acquire), attempt);
+            assert!(!lane.receive_snapshot().unwrap().waiter_registered());
+        }
+    }
+
+    #[test]
+    fn reentry_can_replace_retired_sources_without_accumulating_callback_history() {
+        let limits = config(1);
+        #[cfg(target_os = "linux")]
+        let limits = limits.with_policy(rivet::Optimization::DirectDescriptors, rivet::Policy::Off);
+        let mut owner = Runtime::new(limits).unwrap();
+        owner.block_on(async {
+            time::timeout(Duration::from_secs(10), async {
+                let sockets: [Rc<UdpSocket>; 2] =
+                    std::array::from_fn(|_| Rc::new(UdpSocket::bind(address(false)).unwrap()));
+                let stats = Stats::new(3);
+                for (index, socket) in sockets.iter().enumerate() {
+                    let receiving = socket.clone();
+                    register(
+                        async move {
+                            let _ = receiving.recv().await;
+                        },
+                        &stats,
+                        0,
+                        index == 0,
+                    );
+                }
+                drop(TcpListener::bind_with_options(address(false), options(&stats, 0)).unwrap());
+                assert_eq!(stats.drops.load(Ordering::Acquire), 2);
+                assert_eq!(stats.maximum_depth.load(Ordering::Acquire), 1);
+                let sender = std::net::UdpSocket::bind(address(false)).unwrap();
+                for socket in sockets {
+                    sender.send_to(b"reused", socket.local_addr()).unwrap();
+                    let received = socket.recv().await.unwrap();
+                    assert_eq!(received.data.as_slice(), b"reused");
+                    assert_eq!(received.peer, Some(sender.local_addr().unwrap()));
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
 }

@@ -935,11 +935,11 @@ pub fn capability_policy() -> io::Result<String> {
     Ok(detail)
 }
 
-fn set_udp_option(fd: i32, option: i32, value: i32) -> io::Result<()> {
+fn set_socket_option(fd: i32, level: i32, option: i32, value: i32) -> io::Result<()> {
     if unsafe {
         libc::setsockopt(
             fd,
-            libc::IPPROTO_UDP,
+            level,
             option,
             (&value as *const i32).cast(),
             std::mem::size_of_val(&value) as libc::socklen_t,
@@ -949,6 +949,204 @@ fn set_udp_option(fd: i32, option: i32, value: i32) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn socket_option(fd: i32, level: i32, option: i32) -> io::Result<i32> {
+    let mut value = 0i32;
+    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            option,
+            (&mut value as *mut i32).cast(),
+            &mut length,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    check(
+        length as usize == std::mem::size_of_val(&value),
+        "native integer socket option returned an unexpected size",
+    )?;
+    Ok(value)
+}
+
+fn udp_ancillary_options(ip: IpAddr, extended: bool) -> impl Iterator<Item = (i32, i32, i32)> {
+    const IPV4: &[(i32, i32, i32)] = &[
+        (libc::IPPROTO_IP, libc::IP_PKTINFO, 1),
+        (libc::IPPROTO_IP, libc::IP_RECVTTL, 1),
+        (libc::IPPROTO_IP, libc::IP_RECVTOS, 1),
+    ];
+    const IPV6: &[(i32, i32, i32)] = &[
+        (libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1),
+        (libc::IPPROTO_IPV6, libc::IPV6_RECVHOPLIMIT, 1),
+        (libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, 1),
+    ];
+    const TIMESTAMPS: &[(i32, i32, i32)] = &[
+        (libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, 1),
+        (
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPING,
+            (libc::SOF_TIMESTAMPING_RX_SOFTWARE | libc::SOF_TIMESTAMPING_SOFTWARE) as i32,
+        ),
+    ];
+    const IPV6_EXTRA: &[(i32, i32, i32)] = &[
+        (libc::IPPROTO_IPV6, libc::IPV6_2292PKTINFO, 1),
+        (libc::IPPROTO_IPV6, libc::IPV6_2292HOPLIMIT, 1),
+        (libc::IPPROTO_IPV6, libc::IPV6_RECVORIGDSTADDR, 1),
+    ];
+    let ip_options = if ip.is_ipv6() { IPV6 } else { IPV4 };
+    let timestamps = if extended { TIMESTAMPS } else { &[] };
+    let extra = if extended && ip.is_ipv6() {
+        IPV6_EXTRA
+    } else {
+        &[]
+    };
+    ip_options.iter().chain(timestamps).chain(extra).copied()
+}
+
+fn check_udp_ancillary(fd: i32, ip: IpAddr, extended: bool) -> io::Result<()> {
+    for (level, option, value) in udp_ancillary_options(ip, extended) {
+        check(
+            socket_option(fd, level, option)? == value,
+            "import changed the host's UDP ancillary receive settings",
+        )?;
+    }
+    Ok(())
+}
+
+fn peek_udp_ancillary(
+    socket: &std::net::UdpSocket,
+    expected: &[u8],
+    control_truncated: bool,
+) -> io::Result<()> {
+    let mut bytes = [0u8; 16];
+    let mut control = [0usize; 32];
+    let mut iovec = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iovec;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = std::mem::size_of_val(&control);
+    let received = unsafe {
+        libc::recvmsg(
+            socket.as_raw_fd(),
+            &mut message,
+            libc::MSG_PEEK | libc::MSG_TRUNC,
+        )
+    };
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    check(
+        received as usize == expected.len()
+            && &bytes[..expected.len()] == expected
+            && message.msg_flags & libc::MSG_TRUNC == 0,
+        "native peek did not preserve the complete prequeued UDP payload",
+    )?;
+    check(
+        (message.msg_flags & libc::MSG_CTRUNC != 0) == control_truncated,
+        "native peek did not exercise the expected ancillary truncation",
+    )
+}
+
+pub fn imported_udp_ancillary() -> io::Result<String> {
+    let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let bytes = b"native-metadata!";
+    let mut extended_unavailable = None;
+    for requested in [
+        config(),
+        config().with_policy(Optimization::UdpGro, Policy::Off),
+    ] {
+        let mut runtime = Runtime::new(requested)?;
+        for extended in [false, true] {
+            if extended && extended_unavailable.is_some() {
+                continue;
+            }
+            for chunk in [16, 6] {
+                let receiver = std::net::UdpSocket::bind(SocketAddr::new(ip, 0))?;
+                let sender = std::net::UdpSocket::bind(SocketAddr::new(ip, 0))?;
+                let prepare =
+                    udp_ancillary_options(ip, extended).try_for_each(|(level, option, value)| {
+                        set_socket_option(receiver.as_raw_fd(), level, option, value)
+                    });
+                if let Err(error) = prepare {
+                    if extended
+                        && matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+                        )
+                    {
+                        // Keep the three-option baseline mandatory even on a
+                        // vendor kernel missing an optional timestamp/IP option.
+                        // No packet has been queued on this discarded fixture.
+                        extended_unavailable = Some(error);
+                        break;
+                    }
+                    return Err(error);
+                }
+                receiver.set_read_timeout(Some(Duration::from_secs(1)))?;
+                let alias = receiver.try_clone()?;
+                let local = receiver.local_addr()?;
+                let peer = sender.local_addr()?;
+                check(
+                    sender.send_to(bytes, local)? == bytes.len(),
+                    "native ordinary datagram send was incomplete",
+                )?;
+                // The basic IPv6 cmsgs already exceed the former 64B receive
+                // area. Timestamps plus old/new IP metadata also truncate this
+                // larger native peek area, without truncating its payload.
+                peek_udp_ancillary(&receiver, bytes, extended)?;
+                runtime
+                    .block_on(rivet::time::timeout(Duration::from_secs(8), async {
+                        let mut options = SocketOptions::udp();
+                        options.receive_chunk = chunk;
+                        let receiver = UdpSocket::import(receiver.into(), options)
+                            .map_err(|error| error.error)?;
+                        check_udp_ancillary(alias.as_raw_fd(), ip, extended)?;
+                        let received = receiver.recv().await?;
+                        check(
+                            received.data.as_slice() == &bytes[..chunk]
+                                && received.peer == Some(peer)
+                                && received.original_len == Some(bytes.len())
+                                && received.truncated == (chunk < bytes.len())
+                                && received.gro_segment_size.is_none(),
+                            "import discarded an ordinary datagram with inherited ancillary data",
+                        )?;
+                        check(
+                            sender.send_to(&[], local)? == 0,
+                            "native empty datagram send was incomplete",
+                        )?;
+                        let empty = receiver.recv().await?;
+                        check(
+                            empty.data.is_empty()
+                                && empty.peer == Some(peer)
+                                && empty.original_len == Some(0)
+                                && !empty.truncated
+                                && empty.gro_segment_size.is_none(),
+                            "inherited ancillary data changed empty UDP semantics",
+                        )?;
+                        check_udp_ancillary(alias.as_raw_fd(), ip, extended)?;
+                        Ok::<_, io::Error>(())
+                    }))
+                    .map_err(|error| io::Error::other(error.to_string()))??;
+            }
+        }
+    }
+    let extended = match extended_unavailable {
+        Some(error) => format!(
+            "extended timestamp/IPv6 ancillary subcase skipped: native option unsupported ({error}); MSG_CTRUNC was not exercised"
+        ),
+        None => "timestamp and duplicate IPv6 metadata exercised native MSG_CTRUNC without resetting host options".to_owned(),
+    };
+    Ok(format!(
+        "default/explicit Off preserved prequeued IPv6 payload, source, empty and truncated datagrams with RECVPKTINFO/RECVHOPLIMIT/RECVTCLASS; {extended}"
+    ))
 }
 
 pub fn imported_udp_gro() -> io::Result<Option<String>> {
@@ -976,7 +1174,7 @@ pub fn imported_udp_gro() -> io::Result<Option<String>> {
                     (receiver.as_raw_fd(), UDP_SEGMENT, 4),
                     (sender.as_raw_fd(), UDP_SEGMENT, 4),
                 ] {
-                    if let Err(error) = set_udp_option(fd, option, value) {
+                    if let Err(error) = set_socket_option(fd, libc::IPPROTO_UDP, option, value) {
                         if matches!(
                             error.raw_os_error(),
                             Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP)
@@ -986,29 +1184,34 @@ pub fn imported_udp_gro() -> io::Result<Option<String>> {
                         return Err(error);
                     }
                 }
+                for (level, option, value) in udp_ancillary_options(ip, true) {
+                    set_socket_option(receiver.as_raw_fd(), level, option, value)?;
+                }
                 receiver.set_read_timeout(Some(Duration::from_secs(1)))?;
                 sender.set_read_timeout(Some(Duration::from_secs(1)))?;
+                let alias = receiver.try_clone()?;
                 let local = receiver.local_addr()?;
                 let peer = sender.local_addr()?;
                 check(
                     sender.send_to(bytes, local)? == bytes.len(),
                     "native segmented datagram send was incomplete",
                 )?;
-                // MSG_PEEK proves a real aggregate exists before import. Two
-                // ordinary datagrams must not make this regression pass.
-                let mut aggregate = [0; 16];
-                check(
-                    receiver.peek(&mut aggregate)? == bytes.len()
-                        && &aggregate[..bytes.len()] == bytes,
-                    "native receiver did not queue the expected GRO aggregate",
-                )?;
-                set_udp_option(sender.as_raw_fd(), UDP_SEGMENT, 0)?;
+                // MSG_PEEK proves an aggregate was already queued, not two
+                // ordinary datagrams. IPv6 also proves the ancillary IP tail
+                // really exceeds the native control area with no payload loss.
+                peek_udp_ancillary(&receiver, bytes, ip.is_ipv6())?;
+                set_socket_option(sender.as_raw_fd(), libc::IPPROTO_UDP, UDP_SEGMENT, 0)?;
                 runtime
                     .block_on(rivet::time::timeout(Duration::from_secs(8), async {
                         let mut options = SocketOptions::udp();
                         options.receive_chunk = chunk;
                         let receiver = UdpSocket::import(receiver.into(), options)
                             .map_err(|error| error.error)?;
+                        check_udp_ancillary(alias.as_raw_fd(), ip, true)?;
+                        check(
+                            socket_option(alias.as_raw_fd(), libc::IPPROTO_UDP, UDP_GRO)? == 1,
+                            "import disabled inherited UDP_GRO",
+                        )?;
                         let first = receiver.recv().await?;
                         check(
                             first.data.as_slice() == &bytes[..chunk.min(4)]
@@ -1060,7 +1263,7 @@ pub fn imported_udp_gro() -> io::Result<Option<String>> {
             }
         }
     }
-    Ok(Some("default/explicit Off preserved prequeued IPv4/IPv6 GRO at four-byte boundaries with receive_chunk 8/6/2, truncation, empty datagrams and retained leases; inherited UDP_SEGMENT was cleared for plain sends".to_owned()))
+    Ok(Some("default/explicit Off preserved prequeued IPv4/IPv6 GRO with inherited timestamps/IP metadata at four-byte boundaries with receive_chunk 8/6/2, truncation, empty datagrams and retained leases; IPv6 MSG_CTRUNC did not lose boundaries, host receive settings stayed enabled and inherited UDP_SEGMENT was cleared for plain sends".to_owned()))
 }
 
 pub fn udp_offload() -> io::Result<Option<String>> {
@@ -1205,6 +1408,11 @@ pub fn suite(network: u64) -> Vec<CaseResult> {
     record_async(
         "network_and_host_protection_errors",
         network_and_protection_errors(),
+        &mut cases,
+    );
+    record(
+        "imported_udp_ipv6_ancillary_preserves_payload",
+        imported_udp_ancillary(),
         &mut cases,
     );
     match imported_udp_gro() {

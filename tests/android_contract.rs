@@ -104,7 +104,14 @@ fn udp_offload_preserves_boundaries_when_the_real_probe_succeeds() {
 }
 
 #[test]
-fn imported_udp_gro_preserves_prequeued_boundaries_with_off_policy() {
+fn imported_ipv6_udp_preserves_prequeued_datagrams_with_ancillary_options() {
+    let detail =
+        smoke::imported_udp_ancillary().expect("inherited Android IPv6 ancillary semantics");
+    eprintln!("{detail}");
+}
+
+#[test]
+fn imported_udp_gro_preserves_prequeued_boundaries_with_ancillary_and_off_policy() {
     if smoke::imported_udp_gro()
         .expect("inherited Android GRO semantics with Off policy")
         .is_none()

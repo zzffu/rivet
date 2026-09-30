@@ -89,6 +89,7 @@ pub(crate) struct Driver {
     blocked: Vec<u64>,
     kernel_events: Box<[libc::epoll_event]>,
     iovecs: Vec<libc::iovec>,
+    control: udp::Control,
     ready_first: Option<u64>,
     ready_last: Option<u64>,
     operations: usize,
@@ -168,6 +169,7 @@ impl Driver {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             iovecs: Vec::with_capacity(limits.max_iovecs),
+            control: udp::Control::new(),
             ready_first: None,
             ready_last: None,
             operations: 0,
@@ -1148,15 +1150,14 @@ impl Driver {
             iov_base: buffer.as_mut_ptr().cast(),
             iov_len: chunk.min(buffer.capacity()),
         };
-        let mut control = udp::Control::new();
         let mut message: libc::msghdr = unsafe { mem::zeroed() };
         message.msg_iov = &mut iovec;
         message.msg_iovlen = 1;
         if kind == SocketKind::Udp {
             message.msg_name = (&mut source as *mut libc::sockaddr_storage).cast();
             message.msg_namelen = mem::size_of_val(&source) as _;
-            message.msg_control = control.as_mut_ptr();
-            message.msg_controllen = control.capacity();
+            message.msg_control = self.control.as_mut_ptr();
+            message.msg_controllen = self.control.capacity();
         }
         let flags = libc::MSG_DONTWAIT
             | if kind == SocketKind::Udp {
@@ -1188,18 +1189,11 @@ impl Driver {
             buffer.set_initialized_len(length.min(iovec.iov_len));
         }
         let metadata = if kind == SocketKind::Udp {
-            if message.msg_flags & libc::MSG_CTRUNC != 0 {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated ancillary data cannot preserve UDP GRO boundaries",
-                ))
-            } else {
-                socket::decode(&source, message.msg_namelen).and_then(|peer| {
-                    control
-                        .gro_segment_size(message.msg_controllen)
-                        .map(|segment| (Some(peer), segment))
-                })
-            }
+            socket::decode(&source, message.msg_namelen).and_then(|peer| {
+                self.control
+                    .gro_segment_size(message.msg_controllen, message.msg_flags)
+                    .map(|segment| (Some(peer), segment))
+            })
         } else {
             Ok((None, None))
         };
@@ -1313,10 +1307,8 @@ impl Driver {
             message.msg_namelen = destination.len();
         }
         #[cfg(feature = "udp-gso")]
-        let mut control = udp::Control::new();
-        #[cfg(feature = "udp-gso")]
         if let Some(segment) = operation.segment_size {
-            control.segment(segment, &mut message);
+            self.control.segment(segment, &mut message);
         }
         let sent = unsafe { libc::sendmsg(fd, &message, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
         if sent < 0 {

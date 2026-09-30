@@ -134,6 +134,8 @@ fn native_callbacks_and_close_allow_synchronous_waker_reentry() {
         "shutdown",
         #[cfg(unix)]
         "shutdown-waits-for-helper",
+        #[cfg(windows)]
+        "callback-panic-payload",
     ];
     for case in cases {
         let mut child = ChildGuard(
@@ -816,7 +818,62 @@ mod windows {
         AsyncHandle::import(handle).unwrap().close().unwrap();
     }
 
+    fn callback_panic_payload_preserves_completion() {
+        struct PanicPayload(mpsc::SyncSender<()>);
+        impl Drop for PanicPayload {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+                panic!("intentional native callback panic-payload destructor panic");
+            }
+        }
+        struct PanicWake(mpsc::SyncSender<()>);
+        impl Wake for PanicWake {
+            fn wake(self: Arc<Self>) {
+                std::panic::panic_any(PanicPayload(self.0.clone()));
+            }
+        }
+
+        let mut runtime = runtime(1);
+        runtime.block_on(async {
+            let (handle, control) = event(false, false);
+            let object = AsyncHandle::import(handle).unwrap();
+            let (destroyed, receive_destroyed) = mpsc::sync_channel(1);
+            let waker = Waker::from(Arc::new(PanicWake(destroyed)));
+            let mut waiting = Box::pin(object.wait());
+            assert!(
+                waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            signal(&control);
+            receive_destroyed
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            // The callback's panic abandons scheduling, not the consumed native
+            // completion. Cancelling this waiter must preserve that completion.
+            drop(waiting);
+            ready(object.wait()).await;
+            let (waker, notified) = notice();
+            let mut next = pin!(object.wait());
+            assert!(
+                next.as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            signal(&control);
+            notified.recv_timeout(Duration::from_secs(5)).unwrap();
+            ready(next).await;
+            assert!(poll_once(object.wait()).await.is_none());
+            object.close().unwrap();
+        });
+    }
+
     pub(super) fn exercise_reentry(case: &str) {
+        if case == "callback-panic-payload" {
+            callback_panic_payload_preserves_completion();
+            return;
+        }
         let mut runtime = runtime(2);
         if case == "callback" {
             runtime.block_on(async {

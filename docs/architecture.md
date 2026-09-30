@@ -72,9 +72,15 @@ Driver 是内部 Interface；公开 Interface 不暴露内核队列、buffer ID 
 
 Core 先处理完整完成批次并更新绝对发布额度，再释放 Core／driver／事件表借用并分发有界、带代际身份的唤醒。取消和消费会移除旧唤醒源；回调内的 I/O 不递归展开剩余批次。计时器先移除节点和归还额度，再在借用外唤醒。Waker 的 clone／wake／drop 均可能运行用户代码，不能跨这些调用持有上述借用或等待者锁。
 
+接收／接受 waiter 的取消只触碰 Core，立即释放逻辑 lane 并摘除旧唤醒源，不借用 Driver，也不顺带分发其他就绪源。若外层仍在执行原生 setup／poll，则将 waiter 标记为已取消，由预分配、至多 `2 * max_sockets` 个带代际 source 的退休队列保留 Waker；新 waiter 可替换该记录，快照不把它算作已注册 waiter。替换／关闭先移除退休 key，再在借用外销毁 Waker，因此重入不能累积历史注册，也不递归清空整个退休批次。
+
+bind/listen/import/Connect 和 Driver 轮询使用同一回调边界，覆盖 Windows AcceptEx 子 socket 的宿主 hook。成功时先完成 Core 发布／事件批次与额度更新，或把 Connect token 交给 Future，再销毁延期 Waker；同步拒绝和 hook unwind 同样排空。延期析构可重新进行原生 I/O；其正常运行期首个 panic 在其余清理完成后传播，已有 hook panic 不被析构／payload 的二次 panic 覆盖。hook 本身只承诺可取消保持 socket 存活的纯 waiter，不承诺任意原生 I/O 重入。
+
 任务放置的负载快照只是候选提示。候选 worker 的活跃状态复核、资源准入和工厂入队使用同一 inbox 锁，与 worker 0 退出 `block_on` 的失活转换串行化；候选失活或满额时，在一次有界扫描内尝试其他 worker。不能因一个候选失活而忽略仍可用的后台 worker，也不能在锁内销毁用户工厂。
 
 任务生命周期从尚未调用的工厂开始。取消和 Runtime shutdown 均在所属线程销毁捕获值，并隔离其析构 panic；一个工厂清理失败不能阻断后续任务清理或泄漏准入额度。panic payload 自身的析构再次 panic，也不得绕过任务回执、任务组结果排空或准入回收。
+
+worker 关闭对 timer、socket、operation 唤醒及 registration 析构逐个隔离 panic，包括 panic payload 的析构；单个回调不能跳过剩余 socket／operation 收敛和真实内存释放。普通运行期的回调 panic 仍传播。Windows 原生等待回调还保护捕获 payload 的销毁，禁止第二次 unwind 越过系统 ABI。
 
 Linux Driver 区分“等待完成或资源”和“SQ 满导致尚欠提交”。只有后者要求继续非阻塞推进，包括数据操作、取消和唤醒请求；额度不足、缓冲区不足和未到重试期限不能因此变成无限自旋。
 
@@ -116,6 +122,8 @@ Drop Future 不保证撤回网络效果。未提交操作可撤销；已提交�
 普通 TCP 句柄关闭不默认设置 abortive linger：先发起写半关闭，异步收敛请求和发送释放通知，不阻塞 worker 等待对端 ACK。销毁整个 Runtime 则取消尚未结束的业务；Linux 必要时以 socket 级 `SO_LINGER(1,0)` 中止剩余连接，释放 native/fixed 引用，再等待真实内核释放。不得伪造通知或提前释放内存。需要保证业务完整交付时，应用应在销毁 Runtime 前完成 `shutdown(Write)` 与对端协议确认；发送结果本身不是远端交付确认。
 
 操作/连接使用代际 token，且内核仍可引用的槽位绝不复用。所有内核使用的控制结构必须放在稳定存储中。
+
+Linux direct accept 的 fixed slot 清理责任只转移一次：INSTALL／配置失败由接受路径回收，调用 `add_socket` 后则由后者独占回收。SQPOLL multishot 可以在错误返回前复用已释放索引，不能重复 `FILES_UPDATE(-1)`；槽可复用与旧内核 resource generation 的最终释放是两个事实，peer EOF 应在 native barrier 后核验。
 
 ### 5.4 Windows UDP 容量规划
 
@@ -217,6 +225,8 @@ Linux 的配置表保存调用者覆盖：未指定项继承均衡、空闲可�
 外部 socket 使用拥有型平台句柄传入。成功后由运行时负责关闭；失败返回原句柄和错误。导入时验证类型、状态和后端约束，不偷偷重建连接。内部用于新连接初始分配的 idle socket 移交与任意运行中迁移不同；有数据 I/O 的对象不得未经完整收敛就迁移。
 
 Linux／Android 的 UDP 分段元数据解析属于数据报语义，不属于可选的优化启用策略。接管时保留已有 GRO 设置及队列，所有构建均解析内核返回的 `UDP_GRO` 元数据并还原数据报；`udp-gro` feature 与策略只控制运行时主动启用该优化。不能通过关闭 GRO 假定既有队列已重新分段，也不承诺不同发送 socket 之间的 UDP 全局到达顺序。
+
+Android 以每 worker 复用的 aligned scratch 保存有界 socket ancillary 前缀及完整 GRO 信息，不为每包扩大分配、复制或增加系统调用。解析遵循原生 socket→GRO→IP/IPv6 顺序；只有完整 GRO 或首个 IP 级头已证明边界时，才允许忽略无关 IP 尾部的 `MSG_CTRUNC`。前缀不完整仍明确报错，不能猜测普通包，也不清除宿主元数据选项或既有队列。
 
 Android 允许指定 Network，并提供连接/首次发送前的宿主保护钩子。宿主负责 Android 权限和 Java/JNI 对象生命周期。保护或绑定失败必须阻止继续连接。核心不附带 Kotlin SDK、VPN 应用、TUN 或后台保活机制。
 

@@ -192,6 +192,7 @@ impl Socket {
             Ok(owner) => owner,
             Err(error) => return Err(ImportError { error, socket }),
         };
+        let _callbacks = owner.defer_io_callbacks();
         if let Err(error) = options
             .validate()
             .and_then(|_| owner.io.borrow().can_open_kind(kind))
@@ -399,10 +400,12 @@ impl Future for Connect {
         }
         let owner = self.owner.as_ref().unwrap().clone();
         let mut waker = Some(cx.waker().clone());
-        if self.token.is_none() {
-            match owner.with_io(|io, driver| {
-                io.connect(driver, self.address, self.local, &self.options, &mut waker)
-            }) {
+        let initiating = self.token.is_none();
+        // A destructor may reenter or panic: publish the admitted token to this
+        // future before releasing callbacks captured by its native hook.
+        let _callbacks = initiating.then(|| owner.defer_io_callbacks());
+        if initiating {
+            match owner.submit_connect(self.address, self.local, &self.options, &mut waker) {
                 Ok(token) => self.token = Some(token),
                 Err(error) => {
                     self.done = true;
@@ -462,6 +465,7 @@ impl TcpListener {
     pub fn bind_with_options(address: SocketAddr, options: SocketOptions) -> io::Result<Self> {
         options.validate()?;
         let owner = runtime::current()?;
+        let _callbacks = owner.defer_io_callbacks();
         owner.io.borrow().can_open()?;
         let info = owner.driver.borrow_mut().listen(address, &options)?;
         Ok(Self {
@@ -649,7 +653,7 @@ impl Drop for Accept<'_> {
         if let (Some(owner), Some(waiter)) =
             (self.listener.socket.owner.upgrade(), self.waiter.take())
         {
-            owner.with_io(|io, _| io.cancel_waiter(self.listener.socket.key(), waiter, true));
+            owner.cancel_io_waiter(self.listener.socket.key(), waiter, true);
         }
     }
 }
@@ -687,7 +691,7 @@ impl Future for Recv<'_> {
 impl Drop for Recv<'_> {
     fn drop(&mut self) {
         if let (Some(owner), Some(waiter)) = (self.socket.owner.upgrade(), self.waiter.take()) {
-            owner.with_io(|io, _| io.cancel_waiter(self.socket.key(), waiter, false));
+            owner.cancel_io_waiter(self.socket.key(), waiter, false);
         }
     }
 }
@@ -916,6 +920,7 @@ impl UdpSocket {
             ));
         }
         let owner = runtime::current()?;
+        let _callbacks = owner.defer_io_callbacks();
         owner.io.borrow().can_open_kind(SocketKind::Udp)?;
         let info = owner
             .driver
@@ -1060,7 +1065,7 @@ impl Future for RecvDatagram<'_> {
 impl Drop for RecvDatagram<'_> {
     fn drop(&mut self) {
         if let (Some(owner), Some(waiter)) = (self.socket.owner.upgrade(), self.waiter.take()) {
-            owner.with_io(|io, _| io.cancel_waiter(self.socket.key(), waiter, false));
+            owner.cancel_io_waiter(self.socket.key(), waiter, false);
         }
     }
 }
@@ -1126,7 +1131,7 @@ impl Future for RecvBatch<'_> {
             }
         }
         if let Some(waiter) = self.waiter.take() {
-            owner.with_io(|io, _| io.cancel_waiter(key, waiter, false));
+            owner.cancel_io_waiter(key, waiter, false);
         }
         self.done = true;
         Poll::Ready(Ok(count))
@@ -1135,7 +1140,7 @@ impl Future for RecvBatch<'_> {
 impl Drop for RecvBatch<'_> {
     fn drop(&mut self) {
         if let (Some(owner), Some(waiter)) = (self.socket.owner.upgrade(), self.waiter.take()) {
-            owner.with_io(|io, _| io.cancel_waiter(self.socket.key(), waiter, false));
+            owner.cancel_io_waiter(self.socket.key(), waiter, false);
         }
     }
 }
