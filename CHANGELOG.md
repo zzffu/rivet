@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 修复非 socket I/O 的 Runtime 关闭通知回归：Unix 在原生注销并释放 lifecycle 锁后先通知等待者，再 join helper，避免 helper 回调等待另一注册项关闭时互等；关闭广播逐个隔离 Waker 及 panic payload 的析构 panic，不遗漏同一对象或后续注册项的等待者。普通广播的 panic 传播不变；补充跨等待者关闭与多等待者 panic 隔离回归。
+
 - 修复全库审查复现的回调重入问题：Core 在完整完成批次和额度更新后通过有界、带代际身份的唤醒源交付通知；计时器释放节点后唤醒；Waker clone／wake／drop 不再跨内部借用。自有同步及非 socket 等待改用私有 pinned 通知 Module，移除直接 `event-listener` 依赖，保留公开 async-* 类型；注销在 lifecycle 锁外通知，原生 helper／threadpool 回调可关闭自身而不 self-join。
 - 修复执行／工厂／析构 panic 的 payload 再次 panic 时绕过完成发布的问题；任务组继续排空失败结果，取消分类和准入回收不变。socket 根据实际停止状态返回 `BrokenPipe`，不再由保留的完成 Future 是否持有 Worker 强引用决定错误类别。
 - Linux 接收／接受错误同样消耗发布额度；零额度保留终态错误及其 selected-buffer 所有权，停止时仍可退役，避免远端 RST 触发 Core 队列断言或重放时重复回收。UDP 元数据回归移除已由原生 socket 反证的跨发送者全局到达顺序假设，继续逐包检查内容、来源、原长、截断、唯一性和保留租约。

@@ -4,6 +4,7 @@ use std::{
     fmt,
     future::Future,
     marker::PhantomPinned,
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll, Waker},
@@ -138,6 +139,22 @@ impl Event {
     }
 
     pub(crate) fn notify_all(&self) {
+        self.notify_all_with(Waker::wake);
+    }
+
+    /// Shutdown must notify every waiter, even if a callback or its panic
+    /// payload's destructor panics. Normal broadcasts keep propagating panics.
+    pub(crate) fn notify_all_safely(&self) {
+        self.notify_all_with(|waker| {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| waker.wake()))
+                && let Err(nested) = catch_unwind(AssertUnwindSafe(|| drop(panic)))
+            {
+                std::mem::forget(nested);
+            }
+        });
+    }
+
+    fn notify_all_with(&self, wake: impl Fn(Waker)) {
         let generation = {
             let mut list = self.list.lock();
             list.generation = list
@@ -167,7 +184,7 @@ impl Event {
                 }
             };
             if let Some(waker) = waker {
-                waker.wake();
+                wake(waker);
             }
         }
     }

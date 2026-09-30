@@ -304,17 +304,21 @@ impl Registry {
             }
             (table, poller, helper)
         };
+        // A running helper callback may itself await another registration's
+        // closure. Deliver those notifications before waiting for it to exit.
+        if let Some(table) = table {
+            for registration in table.into_values() {
+                for changed in &registration.entry.changed {
+                    changed.notify_all_safely();
+                }
+            }
+        }
         if let Some(helper) = helper
             && helper.thread().id() != thread::current().id()
         {
             let _ = helper.join();
         }
         drop(poller);
-        if let Some(table) = table {
-            for registration in table.into_values() {
-                registration.entry.notify_waiters();
-            }
-        }
     }
 }
 impl Drop for Registry {

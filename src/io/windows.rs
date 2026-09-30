@@ -317,7 +317,7 @@ impl Registry {
         // All native waits have stopped before any application callback runs.
         if let Some(table) = table {
             for wait in table.into_values() {
-                wait.callback.entry.changed.notify_all();
+                wait.callback.entry.changed.notify_all_safely();
             }
         }
     }

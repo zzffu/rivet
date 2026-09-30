@@ -142,6 +142,7 @@ where
 - Windows：`io::AsyncHandle::import(OwnedHandle)` 支持具有 `SYNCHRONIZE` 权限的 Event、Semaphore、Timer、Process、Thread、Job。`wait` 缓存自动复位对象已经取得的通知，取消等待不会丢掉该通知；持续 signaled 不导致后台自旋。不接受普通文件和拥有线程归属的 mutex。
 - 对象保持 `!Send/!Sync`。等待 Future 不借用对象；`close`／Runtime 停止会唤醒它并返回 `BrokenPipe`。取消等待不关闭对象。Runtime 停止注销等待；外部对象仍拥有的句柄在该对象析构时释放。
 - 注销／关闭不会在注册表 lifecycle 锁内唤醒用户。Windows close 等待原生访问结束；已 disassociate、仅持有独立等待状态的用户 Waker 可以稍后返回，不再访问已关闭的 HANDLE。
+- Runtime 关闭在原生注销及关闭状态发布后，先在锁外通知等待者，再 join Unix helper，避免 helper 回调等待另一注册项关闭时互等。关闭通知逐个隔离 Waker 及 panic payload 的析构 panic，同一对象和其他注册项的等待者均继续收到通知；普通广播的 panic 传播不变。
 
 ### 协调、计时与退出事件
 
@@ -358,6 +359,13 @@ cargo run --release --all-features --example loopback -- --enable zc-rx-nodev --
 Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用普通 App，支持 `-Abi x86_64` 和 `-Abi arm64-v8a`，不依赖 Gradle。NDK 目标和 APK 最低版本为 API23，JNI 库采用 16KiB ELF／APK 对齐和真正未压缩的 ZIP 条目，并保留 API23 所需的 v1 签名。界面、`RivetSmoke` logcat 标签和私有 `files/smoke-result.json` 给出结构化结果；每次进程运行先清除旧成功状态，JNI 初始化失败也持久化。验证 APK 的 debuggable 配置和测试签名不能用于生产应用。
 
 ### 已执行的原生验证
+
+关闭通知回归修复验证（2026-09-30）：
+
+- Windows x64 IPv4：`cargo test --all-features --all-targets` **164 通过、0 失败**；新增回归同时覆盖一个对象上的多个等待者、后续注册项，以及 Waker／panic payload 析构 panic。`runtime_services -- --workers 2` 实跑通过。
+- WSL Debian／Linux x86_64 **6.18.33.2-microsoft-standard-WSL2**：全 feature 的 `io_behavior`／`sync_behavior` 分别 **8／10 通过**，`cargo test --all-features --lib io::tests` 过滤后的 **4 项通过**，包含 helper 回调等待另一注册项关闭及 helper 自身关闭。
+- 精简构建外部消费者实跑：Windows 在首个关闭 Waker panic 后仍唤醒第二个等待者并返回 `BrokenPipe`；Linux 在握手确认 helper 已等待另一注册项后销毁 Runtime，正常返回 `BrokenPipe`，不再超时。临时消费者源码在验证后删除。
+- Windows／Linux 全 feature／all-targets 严格 Clippy 和 Android ARM64 全 feature／all-targets 编译检查通过。未运行本次完整 Linux 网络套件、Windows IPv6 或 Android 原生场景；交叉编译不是原生执行，未修改宿主内核、网络或安全策略。
 
 全库审查修复的本轮验证（2026-09-30）：
 

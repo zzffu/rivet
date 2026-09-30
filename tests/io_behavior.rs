@@ -128,7 +128,14 @@ fn io_reentrant_child() {
 
 #[test]
 fn native_callbacks_and_close_allow_synchronous_waker_reentry() {
-    for case in ["callback", "close", "shutdown"] {
+    let cases = [
+        "callback",
+        "close",
+        "shutdown",
+        #[cfg(unix)]
+        "shutdown-waits-for-helper",
+    ];
+    for case in cases {
         let mut child = ChildGuard(
             Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -407,6 +414,10 @@ mod unix {
     }
 
     pub(super) fn exercise_reentry(case: &str) {
+        if case == "shutdown-waits-for-helper" {
+            exercise_shutdown_waiting_callback();
+            return;
+        }
         let mut runtime = runtime(2);
         if case == "callback" {
             runtime.block_on(async {
@@ -461,6 +472,72 @@ mod unix {
         );
         assert!(OTHER.with(|slot| slot.borrow().is_none()));
         drop(object);
+    }
+
+    fn exercise_shutdown_waiting_callback() {
+        struct WaitForClose {
+            waiting: Mutex<Option<PendingWait>>,
+            entered: mpsc::SyncSender<()>,
+            finished: mpsc::SyncSender<io::ErrorKind>,
+        }
+        impl Wake for WaitForClose {
+            fn wake(self: Arc<Self>) {
+                let Some(mut waiting) = self.waiting.lock().take() else {
+                    return;
+                };
+                let mut announced = false;
+                let result = block_on(std::future::poll_fn(|cx| {
+                    let result = waiting.as_mut().poll(cx);
+                    if result.is_pending() && !announced {
+                        announced = true;
+                        self.entered.send(()).unwrap();
+                    }
+                    result
+                }));
+                self.finished.send(result.unwrap_err().kind()).unwrap();
+            }
+        }
+
+        let mut runtime = runtime(2);
+        let (other_reader, _other_writer) = pipe(true);
+        let (reader, writer) = pipe(true);
+        let (other, object) = runtime.block_on(async {
+            (
+                AsyncFd::import(other_reader).unwrap(),
+                AsyncFd::import(reader).unwrap(),
+            )
+        });
+        let (entered, receive_entered) = mpsc::sync_channel(1);
+        let (finished, receive_finished) = mpsc::sync_channel(1);
+        let waker = Waker::from(Arc::new(WaitForClose {
+            waiting: Mutex::new(Some(Box::pin(other.readable()))),
+            entered,
+            finished,
+        }));
+        let mut waiting = pin!(object.readable());
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        write(writer.as_raw_fd(), b"wake").unwrap();
+        // The helper has polled the other wait to Pending. Runtime shutdown
+        // must wake that wait before joining the helper executing this Waker.
+        receive_entered
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        drop(runtime);
+        assert_eq!(
+            receive_finished
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            block_on(waiting).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 }
 
@@ -648,6 +725,80 @@ mod windows {
             block_on(object.wait()).unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    #[test]
+    fn shutdown_notifies_every_waiter_when_a_waker_or_its_panic_payload_panics() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct PanicPayload;
+        impl Drop for PanicPayload {
+            fn drop(&mut self) {
+                panic!("intentional shutdown panic-payload destructor panic");
+            }
+        }
+        struct PanicWake {
+            payload_panics: bool,
+            called: AtomicBool,
+        }
+        impl Wake for PanicWake {
+            fn wake(self: Arc<Self>) {
+                self.called.store(true, Ordering::Release);
+                if self.payload_panics {
+                    std::panic::panic_any(PanicPayload);
+                }
+                panic!("intentional shutdown waker panic");
+            }
+        }
+
+        for payload_panics in [false, true] {
+            let mut runtime = runtime(2);
+            let (first, second) = runtime.block_on(async {
+                let (first, _first_control) = event(false, false);
+                let (second, _second_control) = event(false, false);
+                (
+                    AsyncHandle::import(first).unwrap(),
+                    AsyncHandle::import(second).unwrap(),
+                )
+            });
+            let panicking = Arc::new(PanicWake {
+                payload_panics,
+                called: AtomicBool::new(false),
+            });
+            let panic_waker = Waker::from(panicking.clone());
+            let (same_waker, same_notified) = notice();
+            let (other_waker, other_notified) = notice();
+            let mut first_wait = pin!(first.wait());
+            let mut same_wait = pin!(first.wait());
+            let mut other_wait = pin!(second.wait());
+            for (mut waiting, waker) in [
+                (first_wait.as_mut(), &panic_waker),
+                (same_wait.as_mut(), &same_waker),
+                (other_wait.as_mut(), &other_waker),
+            ] {
+                assert!(
+                    waiting
+                        .as_mut()
+                        .poll(&mut Context::from_waker(waker))
+                        .is_pending()
+                );
+            }
+            drop(runtime);
+            assert!(panicking.called.load(Ordering::Acquire));
+            // Catching once per registration is insufficient: the first native
+            // object has a second waiter that must also receive shutdown.
+            same_notified.recv_timeout(Duration::from_secs(5)).unwrap();
+            other_notified.recv_timeout(Duration::from_secs(5)).unwrap();
+            for waiting in [first_wait.as_mut(), same_wait.as_mut(), other_wait.as_mut()] {
+                assert_eq!(
+                    block_on(poll_once(waiting))
+                        .expect("shutdown left a notified waiter pending")
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+            }
+        }
     }
 
     thread_local! {

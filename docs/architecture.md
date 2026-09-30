@@ -236,7 +236,7 @@ Runtime 拥有独立阻塞池；`RuntimeConfig` 指定线程上限和排队上�
 
 注册返回前验证容量和原生句柄；失败返还所有权。事件使用不可复用的代际身份，避免迟到通知命中复用的描述符。取消等待不关闭描述符，也不丢掉尚未消费的 readiness；关闭或 Runtime 停止注销原生等待并唤醒等待者。注册表按需使用共享原生等待设施，不为每个 FD 创建线程。Unix 非 socket readiness 的专用等待路径不是 Linux TCP/UDP 的 epoll 回退。
 
-注销先完成原生删除和关闭状态发布，再释放注册表 lifecycle 锁并通知等待者。Unix helper 在自己的回调中关闭注册表时不能 join 自身；Windows threadpool callback 在结束原生访问并保留独立 Entry 所有权后 disassociate，再调用用户 Waker。close 等待原生访问收敛，不要求已经脱离原生资源的用户回调在返回前结束。
+注销先完成原生删除和关闭状态发布，再释放注册表 lifecycle 锁并通知等待者。Runtime 关闭必须先发送这些通知，再 join Unix helper，避免 helper 的用户回调正在等待另一注册项关闭时互等；helper 在自己的回调中关闭注册表时仍不能 join 自身。关闭广播逐个隔离 Waker 及其 panic payload 的析构 panic，继续通知同一对象和其他注册项的等待者，不改变普通广播的 panic 传播。Windows threadpool callback 在结束原生访问并保留独立 Entry 所有权后 disassociate，再调用用户 Waker。close 等待原生访问收敛，不要求已经脱离原生资源的用户回调在返回前结束。
 
 ### 8.3 TCP 中止
 
