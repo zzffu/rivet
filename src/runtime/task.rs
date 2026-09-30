@@ -1,4 +1,4 @@
-use super::{Worker, WorkerShared};
+use super::{Worker, WorkerShared, blocking};
 use crate::driver::Arena;
 use parking_lot::Mutex;
 use std::{
@@ -75,17 +75,21 @@ impl<T> JoinCell<T> {
         })
     }
     fn complete(&self, result: Result<T, JoinError>) {
-        let wake = {
-            let mut state = self.state.lock();
-            if state.receiver {
-                state.result = Some(result);
-            }
-            self.control.done.store(true, Ordering::Release);
-            state.waiter.take()
-        };
-        self.control.wake.lock().take();
+        let mut state = self.state.lock();
+        if state.receiver {
+            state.result = Some(result);
+        } else {
+            drop(state);
+            blocking::drop_safely(result);
+            state = self.state.lock();
+        }
+        self.control.done.store(true, Ordering::Release);
+        let wake = state.waiter.take();
+        drop(state);
+        let control_wake = self.control.wake.lock().take();
+        drop(control_wake);
         if let Some(wake) = wake {
-            wake.wake();
+            blocking::ignore_panic(|| wake.wake());
         }
     }
 }
@@ -150,6 +154,8 @@ impl<T> Unpin for JoinHandle<T> {}
 impl<T> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Both cloning the new Waker and dropping a replaced one may reenter.
+        let mut replacement = Some(cx.waker().clone());
         let mut state = self.cell.state.lock();
         if let Some(result) = state.result.take() {
             return Poll::Ready(result);
@@ -158,13 +164,17 @@ impl<T> Future for JoinHandle<T> {
             !self.cell.control.done.load(Ordering::Acquire),
             "JoinHandle polled after completion"
         );
-        if !state
+        let previous = if !state
             .waiter
             .as_ref()
             .is_some_and(|w| w.will_wake(cx.waker()))
         {
-            state.waiter = Some(cx.waker().clone());
-        }
+            std::mem::replace(&mut state.waiter, replacement.take())
+        } else {
+            None
+        };
+        drop(state);
+        blocking::drop_safely(previous);
         Poll::Pending
     }
 }
@@ -175,8 +185,11 @@ impl<T> Drop for JoinHandle<T> {
         }
         let mut state = self.cell.state.lock();
         state.receiver = false;
-        state.waiter = None;
-        state.result = None;
+        let waiter = state.waiter.take();
+        let result = state.result.take();
+        drop(state);
+        blocking::drop_safely(waiter);
+        blocking::drop_safely(result);
     }
 }
 
@@ -271,16 +284,18 @@ impl<F: Future> Body for TypedBody<F> {
         let result = self.as_mut().project().result.take();
         // Publish only after all future captures have been destroyed. Joining
         // an aborted task therefore proves its socket guards have run.
-        let destroyed = catch_unwind(AssertUnwindSafe(|| drop(self)));
+        let destroyed = match catch_unwind(AssertUnwindSafe(|| drop(self))) {
+            Ok(()) => false,
+            Err(panic) => {
+                blocking::discard_panic(panic);
+                true
+            }
+        };
         // Cancellation keeps its established classification even when cleanup
         // panics; otherwise destruction is part of successful task completion.
-        let error = error.or_else(|| destroyed.is_err().then_some(JoinError::Panicked));
-        if let Some(mut error) = error {
-            if catch_unwind(AssertUnwindSafe(|| drop(result))).is_err()
-                && error != JoinError::Cancelled
-            {
-                error = JoinError::Panicked;
-            }
+        let error = error.or_else(|| destroyed.then_some(JoinError::Panicked));
+        if let Some(error) = error {
+            blocking::drop_safely(result);
             cell.complete(Err(error));
         } else {
             cell.complete(Ok(result.expect("completed task has a result")));
@@ -311,7 +326,7 @@ pub(crate) struct Completed {
 }
 impl Completed {
     pub fn complete(self) {
-        let _ = catch_unwind(AssertUnwindSafe(|| self.body.complete(self.error)));
+        blocking::ignore_panic(|| self.body.complete(self.error));
     }
 }
 impl TaskSet {
@@ -417,8 +432,9 @@ impl Running {
         match catch_unwind(AssertUnwindSafe(|| self.body.as_mut().poll(&mut cx))) {
             Ok(Poll::Ready(())) => true,
             Ok(Poll::Pending) => false,
-            Err(_) => {
+            Err(panic) => {
                 self.error = Some(JoinError::Panicked);
+                blocking::discard_panic(panic);
                 true
             }
         }
@@ -436,7 +452,7 @@ struct Factory<F, T> {
 impl<F, T> Drop for Factory<F, T> {
     fn drop(&mut self) {
         if let Some(factory) = self.factory.take() {
-            let _ = catch_unwind(AssertUnwindSafe(|| drop(factory)));
+            blocking::drop_safely(factory);
             self.admission.take();
             self.cell.complete(Err(JoinError::Cancelled));
         }
@@ -459,7 +475,8 @@ where
                 self.cell.clone(),
                 self.admission.take().unwrap(),
             ),
-            Err(_) => {
+            Err(panic) => {
+                blocking::discard_panic(panic);
                 self.admission.take();
                 self.cell.complete(Err(JoinError::Panicked));
             }

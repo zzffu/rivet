@@ -132,8 +132,100 @@ impl<T> Table<T> {
     fn values(&self) -> impl Iterator<Item = &T> {
         self.slots.iter().filter_map(|slot| slot.value.as_ref())
     }
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.slots.iter_mut().filter_map(|slot| slot.value.as_mut())
+    }
     fn into_values(self) -> impl Iterator<Item = T> {
         self.slots.into_iter().filter_map(|slot| slot.value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use parking_lot::Mutex;
+    use std::{
+        process::{Child, Command},
+        sync::{Arc, mpsc},
+        task::{Wake, Waker},
+        time::{Duration, Instant},
+    };
+
+    type Stop = Box<dyn FnOnce() + Send>;
+
+    struct StopOnWake {
+        stop: Mutex<Option<Stop>>,
+        completed: mpsc::SyncSender<()>,
+    }
+
+    impl Wake for StopOnWake {
+        fn wake(self: Arc<Self>) {
+            let stop = self.stop.lock().take();
+            if let Some(stop) = stop {
+                stop();
+                self.completed.send(()).unwrap();
+            }
+        }
+    }
+
+    pub(super) fn stop_waker(stop: impl FnOnce() + Send + 'static) -> (Waker, mpsc::Receiver<()>) {
+        let (completed, receive) = mpsc::sync_channel(1);
+        (
+            Waker::from(Arc::new(StopOnWake {
+                stop: Mutex::new(Some(Box::new(stop))),
+                completed,
+            })),
+            receive,
+        )
+    }
+
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn callback_shutdown_child() {
+        if std::env::var_os("RIVET_IO_CALLBACK_SHUTDOWN").is_none() {
+            return;
+        }
+        #[cfg(unix)]
+        super::unix::callback_shutdown();
+        #[cfg(windows)]
+        super::windows::callback_shutdown();
+    }
+
+    #[test]
+    fn native_dispatcher_can_stop_from_its_own_callback() {
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "io::tests::callback_shutdown_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("RIVET_IO_CALLBACK_SHUTDOWN", "1")
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "native callback shutdown failed: {status}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native callback shutdown deadlocked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

@@ -249,6 +249,19 @@ pub(super) fn connect(fd: RawFd, address: SocketAddr) -> io::Result<bool> {
     }
 }
 
+pub(super) fn half_close(fd: RawFd) -> io::Result<()> {
+    if unsafe { libc::shutdown(fd, libc::SHUT_WR) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    // A failed/in-progress connect, peer reset or AF_UNSPEC abort has no write half.
+    if error.raw_os_error() == Some(libc::ENOTCONN) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 pub(super) fn local_addr(fd: RawFd) -> io::Result<SocketAddr> {
     address(fd, false).map(Option::unwrap)
 }

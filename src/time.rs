@@ -101,7 +101,7 @@ impl Sleep {
             return Ok(None);
         };
         let owner = owner.upgrade().ok_or_else(timer_stopped)?;
-        if owner.timers.borrow().is_closed() {
+        if owner.is_stopping() || owner.timers.borrow().is_closed() {
             return Err(timer_stopped());
         }
         if let Ok(active) = current()
@@ -120,7 +120,7 @@ impl Sleep {
             return Ok(owner);
         }
         let owner = current()?;
-        if owner.timers.borrow().is_closed() {
+        if owner.is_stopping() || owner.timers.borrow().is_closed() {
             return Err(timer_stopped());
         }
         self.owner = Some(Rc::downgrade(&owner));
@@ -152,13 +152,16 @@ impl Future for Sleep {
         };
         if Instant::now() >= deadline {
             if let Some(token) = self.token.take() {
-                owner.timers.borrow_mut().remove(token);
+                let removed = owner.timers.borrow_mut().remove(token);
+                drop(removed);
             }
             self.done = true;
             return Poll::Ready(Ok(()));
         }
+        let mut waker = Some(cx.waker().clone());
         if let Some(token) = self.token {
-            if owner.timers.borrow_mut().update(token, cx.waker()) {
+            let active = owner.timers.borrow_mut().update(token, &mut waker);
+            if active {
                 return Poll::Pending;
             }
             self.done = true;
@@ -167,11 +170,8 @@ impl Future for Sleep {
                 "timer cancelled by runtime shutdown",
             )));
         }
-        match owner
-            .timers
-            .borrow_mut()
-            .insert(deadline, cx.waker().clone())
-        {
+        let result = owner.timers.borrow_mut().insert(deadline, &mut waker);
+        match result {
             Ok(token) => {
                 self.token = Some(token);
                 Poll::Pending
@@ -189,7 +189,8 @@ impl Drop for Sleep {
             self.owner.as_ref().and_then(Weak::upgrade),
             self.token.take(),
         ) {
-            owner.timers.borrow_mut().remove(token);
+            let removed = owner.timers.borrow_mut().remove(token);
+            drop(removed);
         }
     }
 }

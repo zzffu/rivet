@@ -170,3 +170,191 @@ fn interval_wakes_with_planned_instants_and_cancelled_wait_does_not_skip_tick() 
         assert_eq!(interval.tick().await.unwrap(), start + period);
     });
 }
+
+thread_local! {
+    #[cfg_attr(
+        target_os = "android",
+        allow(
+            clippy::missing_const_for_thread_local,
+            reason = "Already const; Android std TLS false positive (rust-lang/rust-clippy#13422)."
+        )
+    )]
+    static CANCELLED_SLEEP: std::cell::RefCell<Option<time::Sleep>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn cancel_registered_sleep() -> bool {
+    let sleep = CANCELLED_SLEEP.with(|slot| slot.borrow_mut().take());
+    let cancelled = sleep.is_some();
+    drop(sleep);
+    cancelled
+}
+
+struct CancelSleepWake {
+    cancelled: std::sync::atomic::AtomicBool,
+    root: std::task::Waker,
+}
+
+impl std::task::Wake for CancelSleepWake {
+    fn wake(self: std::sync::Arc<Self>) {
+        if cancel_registered_sleep() {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.root.wake_by_ref();
+    }
+}
+
+#[test]
+fn timer_wake_can_destroy_its_sleep_on_expiry_and_runtime_shutdown() {
+    use std::{
+        future::{Future, poll_fn},
+        pin::Pin,
+        sync::{Arc, atomic::Ordering},
+        task::{Context, Poll, Waker},
+    };
+    for shutdown in [false, true] {
+        let mut owner = runtime(1);
+        let notice = owner.block_on(async {
+            let mut sleep = time::sleep(Duration::from_secs(3600));
+            let notice = poll_fn(|cx| {
+                let notice = Arc::new(CancelSleepWake {
+                    cancelled: std::sync::atomic::AtomicBool::new(false),
+                    root: cx.waker().clone(),
+                });
+                let waker = Waker::from(notice.clone());
+                assert!(
+                    Pin::new(&mut sleep)
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                Poll::Ready(notice)
+            })
+            .await;
+            if !shutdown {
+                sleep.reset(Instant::now()).unwrap();
+            }
+            CANCELLED_SLEEP.with(|slot| *slot.borrow_mut() = Some(sleep));
+            notice
+        });
+        if !shutdown {
+            owner.block_on(async {
+                // Resetting an admitted timer to the past deterministically
+                // expires it on the next turn; no wall-clock sleep is evidence.
+                runtime::yield_now().await;
+                assert!(notice.cancelled.load(Ordering::Acquire));
+                let mut replacement = time::sleep(Duration::from_secs(3600));
+                assert!(poll_once(&mut replacement).await.is_none());
+            });
+        }
+        drop(owner);
+        assert!(notice.cancelled.load(Ordering::Acquire));
+        assert!(!cancel_registered_sleep());
+    }
+}
+
+struct CancelSleepOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl std::task::Wake for CancelSleepOnDrop {
+    fn wake(self: std::sync::Arc<Self>) {
+        // The last owned reference runs the cancellation destructor below.
+        drop(self);
+    }
+}
+impl Drop for CancelSleepOnDrop {
+    fn drop(&mut self) {
+        self.0.store(
+            cancel_registered_sleep(),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
+#[test]
+fn replacing_or_removing_a_timer_waker_can_cancel_another_timer() {
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Waker},
+    };
+    for replace in [false, true] {
+        let mut owner = runtime(2);
+        owner.block_on(async {
+            let mut victim = time::sleep(Duration::from_secs(3600));
+            assert!(poll_once(&mut victim).await.is_none());
+            CANCELLED_SLEEP.with(|slot| *slot.borrow_mut() = Some(victim));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let mut trigger = time::sleep(Duration::from_secs(3600));
+            {
+                let waker = Waker::from(Arc::new(CancelSleepOnDrop(cancelled.clone())));
+                assert!(
+                    Pin::new(&mut trigger)
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            }
+            if replace {
+                assert!(
+                    Pin::new(&mut trigger)
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            } else {
+                drop(trigger);
+            }
+            assert!(cancelled.load(Ordering::Acquire));
+            let mut replacement = time::sleep(Duration::from_secs(3600));
+            assert!(poll_once(&mut replacement).await.is_none());
+        });
+    }
+}
+
+#[test]
+fn cloning_a_timer_waker_can_cancel_another_timer() {
+    use std::{
+        future::Future,
+        mem::ManuallyDrop,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, RawWaker, RawWakerVTable, Waker},
+    };
+    struct CloneWake(AtomicBool);
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        // Every raw pointer owns an Arc; cloning borrows that ownership and
+        // creates exactly one additional reference, including foreign calls.
+        let state = ManuallyDrop::new(unsafe { Arc::<CloneWake>::from_raw(data.cast()) });
+        if state.0.swap(false, Ordering::AcqRel) {
+            assert!(cancel_registered_sleep());
+        }
+        RawWaker::new(Arc::into_raw(Arc::clone(&state)).cast(), &VTABLE)
+    }
+    unsafe fn consume(data: *const ()) {
+        drop(unsafe { Arc::<CloneWake>::from_raw(data.cast()) });
+    }
+    unsafe fn wake_by_ref(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, consume, wake_by_ref, consume);
+
+    let mut owner = runtime(1);
+    owner.block_on(async {
+        let mut victim = time::sleep(Duration::from_secs(3600));
+        assert!(poll_once(&mut victim).await.is_none());
+        CANCELLED_SLEEP.with(|slot| *slot.borrow_mut() = Some(victim));
+        let state = Arc::new(CloneWake(AtomicBool::new(true)));
+        let raw = RawWaker::new(Arc::into_raw(state.clone()).cast(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw) };
+        let mut trigger = time::sleep(Duration::from_secs(3600));
+        assert!(
+            Pin::new(&mut trigger)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert!(!state.0.load(Ordering::Acquire));
+        assert!(!cancel_registered_sleep());
+    });
+}

@@ -1,12 +1,14 @@
 use futures_lite::future::{block_on, poll_once};
+use parking_lot::Mutex;
 use rivet::{Runtime, RuntimeConfig, time};
 use std::{
     future::Future,
     io,
-    pin::pin,
+    pin::{Pin, pin},
+    process::{Child, Command},
     sync::{Arc, mpsc},
     task::{Context, Wake, Waker},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn runtime(capacity: usize) -> Runtime {
@@ -40,6 +42,118 @@ async fn ready(future: impl Future<Output = io::Result<()>>) {
         .await
         .unwrap()
         .unwrap();
+}
+
+type PendingWait = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
+
+struct CancelWait {
+    wait: Mutex<Option<PendingWait>>,
+    completed: mpsc::SyncSender<()>,
+}
+
+impl Wake for CancelWait {
+    fn wake(self: Arc<Self>) {
+        let wait = self.wait.lock().take();
+        drop(wait);
+        let _ = self.completed.try_send(());
+    }
+}
+
+fn cancel_on_wake(
+    wait: impl Future<Output = io::Result<()>> + Send + 'static,
+) -> (Arc<CancelWait>, mpsc::Receiver<()>) {
+    let (completed, receive) = mpsc::sync_channel(1);
+    let cancel = Arc::new(CancelWait {
+        wait: Mutex::new(None),
+        completed,
+    });
+    let waker = Waker::from(cancel.clone());
+    let mut wait: PendingWait = Box::pin(wait);
+    assert!(
+        wait.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    *cancel.wait.lock() = Some(wait);
+    (cancel, receive)
+}
+
+struct ReenterRegistry {
+    action: fn(),
+    owner: std::thread::ThreadId,
+    completed: mpsc::SyncSender<()>,
+}
+
+impl Wake for ReenterRegistry {
+    fn wake(self: Arc<Self>) {
+        // The Waker itself is Send + Sync. Local objects are only reached via
+        // the current thread's TLS, never transferred through the Waker.
+        assert_eq!(self.owner, std::thread::current().id());
+        (self.action)();
+        let _ = self.completed.try_send(());
+    }
+}
+
+fn reenter_on_wake(action: fn()) -> (Waker, mpsc::Receiver<()>) {
+    let (completed, receive) = mpsc::sync_channel(1);
+    (
+        Waker::from(Arc::new(ReenterRegistry {
+            action,
+            owner: std::thread::current().id(),
+            completed,
+        })),
+        receive,
+    )
+}
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn io_reentrant_child() {
+    let Ok(case) = std::env::var("RIVET_IO_REENTRANT_CASE") else {
+        return;
+    };
+    #[cfg(unix)]
+    unix::exercise_reentry(&case);
+    #[cfg(windows)]
+    windows::exercise_reentry(&case);
+}
+
+#[test]
+fn native_callbacks_and_close_allow_synchronous_waker_reentry() {
+    for case in ["callback", "close", "shutdown"] {
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "io_reentrant_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("RIVET_IO_REENTRANT_CASE", case)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "native I/O child {case} failed: {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native I/O child {case} deadlocked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -269,6 +383,85 @@ mod unix {
             io::ErrorKind::BrokenPipe
         );
     }
+
+    thread_local! {
+        #[cfg_attr(
+            target_os = "android",
+            allow(
+                clippy::missing_const_for_thread_local,
+                reason = "Already const; Android std TLS false positive (rust-lang/rust-clippy#13422)."
+            )
+        )]
+        static OTHER: std::cell::RefCell<Option<AsyncFd>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn drop_other() {
+        let other = OTHER.with(|slot| slot.borrow_mut().take());
+        other.unwrap().close().unwrap();
+    }
+
+    fn replace_other() {
+        drop_other();
+        let (reader, _writer) = pipe(true);
+        AsyncFd::import(reader).unwrap().close().unwrap();
+    }
+
+    pub(super) fn exercise_reentry(case: &str) {
+        let mut runtime = runtime(2);
+        if case == "callback" {
+            runtime.block_on(async {
+                let (reader, writer) = pipe(true);
+                let object = AsyncFd::import(reader).unwrap();
+                let (cancel, completed) = cancel_on_wake(object.readable());
+                write(writer.as_raw_fd(), b"retained").unwrap();
+                completed.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(cancel.wait.lock().is_none());
+                ready(object.readable()).await;
+                let mut bytes = [0; 8];
+                assert_eq!(
+                    object
+                        .try_io(Interest::Readable, |fd| read(fd, &mut bytes))
+                        .unwrap(),
+                    8
+                );
+                assert_eq!(&bytes, b"retained");
+                object.close().unwrap();
+            });
+            return;
+        }
+        let (object, mut waiting, completed, _writer) = runtime.block_on(async {
+            let (reader, writer) = pipe(true);
+            let object = AsyncFd::import(reader).unwrap();
+            let (other, _other_writer) = pipe(true);
+            OTHER.with(|slot| *slot.borrow_mut() = Some(AsyncFd::import(other).unwrap()));
+            let (waker, completed) = reenter_on_wake(if case == "close" {
+                replace_other
+            } else {
+                drop_other
+            });
+            let mut waiting = Box::pin(object.readable());
+            assert!(
+                waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            if case == "close" {
+                object.close().unwrap();
+                (None, waiting, completed, writer)
+            } else {
+                (Some(object), waiting, completed, writer)
+            }
+        });
+        drop(runtime);
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            block_on(waiting.as_mut()).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(OTHER.with(|slot| slot.borrow().is_none()));
+        drop(object);
+    }
 }
 
 #[cfg(windows)]
@@ -455,5 +648,70 @@ mod windows {
             block_on(object.wait()).unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    thread_local! {
+        static OTHER: std::cell::RefCell<Option<AsyncHandle>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn drop_other() {
+        let other = OTHER.with(|slot| slot.borrow_mut().take());
+        other.unwrap().close().unwrap();
+    }
+
+    fn replace_other() {
+        drop_other();
+        let (handle, _control) = event(false, false);
+        AsyncHandle::import(handle).unwrap().close().unwrap();
+    }
+
+    pub(super) fn exercise_reentry(case: &str) {
+        let mut runtime = runtime(2);
+        if case == "callback" {
+            runtime.block_on(async {
+                let (handle, control) = event(false, false);
+                let object = AsyncHandle::import(handle).unwrap();
+                let (cancel, completed) = cancel_on_wake(object.wait());
+                signal(&control);
+                completed.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(cancel.wait.lock().is_none());
+                ready(object.wait()).await;
+                assert!(poll_once(object.wait()).await.is_none());
+                object.close().unwrap();
+            });
+            return;
+        }
+        let (object, mut waiting, completed) = runtime.block_on(async {
+            let (handle, _control) = event(false, false);
+            let object = AsyncHandle::import(handle).unwrap();
+            let (other, _other_control) = event(false, false);
+            OTHER.with(|slot| *slot.borrow_mut() = Some(AsyncHandle::import(other).unwrap()));
+            let (waker, completed) = reenter_on_wake(if case == "close" {
+                replace_other
+            } else {
+                drop_other
+            });
+            let mut waiting = Box::pin(object.wait());
+            assert!(
+                waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            if case == "close" {
+                object.close().unwrap();
+                (None, waiting, completed)
+            } else {
+                (Some(object), waiting, completed)
+            }
+        });
+        drop(runtime);
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            block_on(waiting.as_mut()).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(OTHER.with(|slot| slot.borrow().is_none()));
+        drop(object);
     }
 }

@@ -188,7 +188,6 @@ dependencies = [
  "async-channel",
  "async-lock",
  "crossbeam-queue",
- "event-listener",
  "futures-channel",
  "futures-util",
  "libc",

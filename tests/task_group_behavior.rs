@@ -161,6 +161,51 @@ fn cross_worker_join_waits_for_cleanup_and_cancelled_shutdown_keeps_failures() {
     assert!(no_early_join, "join returned before child cleanup finished");
 }
 
+#[test]
+fn shutdown_drains_results_when_a_panic_payload_destructor_also_panics() {
+    struct PanicPayload;
+    impl Drop for PanicPayload {
+        fn drop(&mut self) {
+            panic!("panic payload destructor");
+        }
+    }
+    struct Output {
+        drops: Rc<Cell<usize>>,
+        panics: bool,
+    }
+    impl Drop for Output {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            if self.panics {
+                std::panic::panic_any(PanicPayload);
+            }
+        }
+    }
+
+    let mut runtime = Runtime::new(config(1)).unwrap();
+    runtime.block_on(deadline(async {
+        let drops = Rc::new(Cell::new(0));
+        let mut group = TaskGroup::new(2).unwrap();
+        let mut controls = Vec::new();
+        for panics in [true, false] {
+            let drops = drops.clone();
+            controls.push(
+                group
+                    .spawn_local(async move { Output { drops, panics } })
+                    .unwrap(),
+            );
+        }
+        while !controls.iter().all(|control| control.is_finished()) {
+            runtime::yield_now().await;
+        }
+        assert_eq!(group.shutdown().await, Err(JoinError::Panicked));
+        assert!(group.is_empty());
+        assert_eq!(drops.get(), 2);
+        assert_eq!(group.shutdown().await, Err(JoinError::Panicked));
+        assert_eq!(drops.get(), 2);
+    }));
+}
+
 struct LocalDrop {
     drops: Rc<Cell<usize>>,
     notify: Option<oneshot::Sender<()>>,

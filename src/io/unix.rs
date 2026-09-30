@@ -1,5 +1,5 @@
 use super::{ImportError, Table, closed};
-use event_listener::Event;
+use crate::sync::notification::Event;
 use parking_lot::Mutex;
 use std::{
     fmt,
@@ -78,21 +78,26 @@ impl Entry {
         }
         for (index, changed) in self.changed.iter().enumerate() {
             if bits & (1 << index) != 0 {
-                changed.notify(usize::MAX);
+                changed.notify_all();
             }
         }
     }
-    fn fail(&self, failure: Failure) {
-        self.state.lock().failure = Some(failure);
+    fn set_failure(&self, failure: Failure) {
+        let mut state = self.state.lock();
+        if state.failure.is_none() || matches!(failure, Failure::Closed) {
+            state.failure = Some(failure);
+        }
+    }
+    fn notify_waiters(&self) {
         for changed in &self.changed {
-            changed.notify(usize::MAX);
+            changed.notify_all();
         }
     }
     async fn wait(self: Arc<Self>, interest: Interest) -> io::Result<()> {
         loop {
-            // A stack listener avoids allocating per readiness wait. Installing
-            // it before inspecting state closes the notification race.
-            event_listener::listener!(self.changed[interest.index()] => listener);
+            // Capture the notification generation before inspecting readiness;
+            // the stack-pinned listener closes the race without allocating.
+            let listener = self.changed[interest.index()].listen();
             {
                 let state = self.state.lock();
                 if let Some(failure) = state.failure {
@@ -260,37 +265,54 @@ impl Registry {
         Ok((key, entry))
     }
     fn unregister(&self, key: u64) -> io::Result<()> {
-        let _lifecycle = self.lifecycle.lock();
-        let (registration, poller) = {
-            let mut state = self.shared.state.lock();
-            let registration = state.table.as_mut().and_then(|table| table.remove(key));
-            (registration, state.poller.clone())
+        let (entry, result) = {
+            let _lifecycle = self.lifecycle.lock();
+            let (registration, poller) = {
+                let mut state = self.shared.state.lock();
+                let registration = state.table.as_mut().and_then(|table| table.remove(key));
+                (registration, state.poller.clone())
+            };
+            let Some(registration) = registration else {
+                return Ok(());
+            };
+            let result = poller.unwrap().remove(registration.fd);
+            registration.entry.set_failure(Failure::Closed);
+            (registration.entry, result)
         };
-        let Some(registration) = registration else {
-            return Ok(());
-        };
-        let result = poller.unwrap().remove(registration.fd);
-        registration.entry.fail(Failure::Closed);
+        entry.notify_waiters();
         result
     }
     pub(crate) fn shutdown(&self) {
-        let _lifecycle = self.lifecycle.lock();
         let (table, poller, helper) = {
-            let mut state = self.shared.state.lock();
-            (state.table.take(), state.poller.take(), state.helper.take())
+            let _lifecycle = self.lifecycle.lock();
+            let (table, poller, helper) = {
+                let mut state = self.shared.state.lock();
+                (state.table.take(), state.poller.take(), state.helper.take())
+            };
+            if let Some(table) = &table {
+                for registration in table.values() {
+                    if let Some(poller) = &poller {
+                        let _ = poller.remove(registration.fd);
+                    }
+                    registration.entry.set_failure(Failure::Closed);
+                }
+            }
+            // No imported descriptor remains registered when lifecycle unlocks.
+            // The helper owns its Poller until it has left the dispatch loop.
+            if let Some(poller) = &poller {
+                poller.wake();
+            }
+            (table, poller, helper)
         };
+        if let Some(helper) = helper
+            && helper.thread().id() != thread::current().id()
+        {
+            let _ = helper.join();
+        }
+        drop(poller);
         if let Some(table) = table {
             for registration in table.into_values() {
-                if let Some(poller) = &poller {
-                    let _ = poller.remove(registration.fd);
-                }
-                registration.entry.fail(Failure::Closed);
-            }
-        }
-        if let Some(poller) = poller {
-            poller.wake();
-            if let Some(helper) = helper {
-                let _ = helper.join();
+                registration.entry.notify_waiters();
             }
         }
     }
@@ -318,11 +340,23 @@ fn run(shared: Arc<Shared>, poller: Arc<Poller>) {
                 continue;
             }
             let error = error.raw_os_error().unwrap_or(libc::EIO);
-            let mut state = shared.state.lock();
-            state.failure = Some(error);
-            if let Some(table) = &state.table {
-                for registration in table.values() {
-                    registration.entry.fail(Failure::Native(error));
+            let capacity = {
+                let mut state = shared.state.lock();
+                state.failure = Some(error);
+                state.table.as_ref().map_or(0, |table| table.slots.len())
+            };
+            for index in 0..capacity {
+                let entry = {
+                    let state = shared.state.lock();
+                    state
+                        .table
+                        .as_ref()
+                        .and_then(|table| table.slots[index].value.as_ref())
+                        .map(|registration| registration.entry.clone())
+                };
+                if let Some(entry) = entry {
+                    entry.set_failure(Failure::Native(error));
+                    entry.notify_waiters();
                 }
             }
             return;
@@ -446,4 +480,41 @@ impl fmt::Debug for AsyncFd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AsyncFd").finish_non_exhaustive()
     }
+}
+
+#[cfg(test)]
+pub(super) fn callback_shutdown() {
+    use std::{pin::pin, task::Context, time::Duration};
+
+    let mut fds = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    // SAFETY: pipe2 returned two new owned descriptors.
+    let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let registry = Arc::new(Registry::new(1).unwrap());
+    let (_key, entry) = registry.register(reader.as_raw_fd()).unwrap();
+    let stopped = registry.clone();
+    let (waker, completed) = super::tests::stop_waker(move || stopped.shutdown());
+    let mut waiting = pin!(entry.wait(Interest::Readable));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert_eq!(
+        unsafe { libc::write(writer.as_raw_fd(), b"x".as_ptr().cast(), 1) },
+        1
+    );
+    completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        futures_lite::future::block_on(waiting).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        registry.register(reader.as_raw_fd()).err().unwrap().kind(),
+        io::ErrorKind::BrokenPipe
+    );
 }

@@ -756,8 +756,7 @@ impl Driver {
             // The final fallible ownership step: an RQ cannot be detached from
             // its socket. Later receive/commit failures belong to the accepted
             // runtime socket and are reported by its persistent receive token.
-            self.ensure_rq(info.id).map_err(|error| io::Error::new(error.kind(),
-                format!("RIO import rejected: create the original socket with WSA_FLAG_REGISTERED_IO; it must have no existing RIO request queue ({error})")))?;
+            self.ensure_rq(info.id)?;
             Ok::<_, io::Error>(())
         })();
         if let Err(error) = prepared {

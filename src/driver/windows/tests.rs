@@ -367,6 +367,86 @@ fn udp_zero_credits_retain_native_burst_and_cancel_stops_only_after_publication(
     }
 }
 
+unsafe extern "system" fn reject_request_queue(
+    _socket: SOCKET,
+    _receives: u32,
+    _receive_buffers: u32,
+    _sends: u32,
+    _send_buffers: u32,
+    _receive_cq: RIO_CQ,
+    _send_cq: RIO_CQ,
+    _context: *const core::ffi::c_void,
+) -> RIO_RQ {
+    unsafe {
+        WSASetLastError(WSAENOBUFS);
+    }
+    0
+}
+
+#[test]
+fn udp_request_queue_resource_failure_preserves_native_error_and_original_socket() {
+    let mut driver = driver(8);
+    let mut options = SocketOptions::udp();
+    options.receive_chunk = 1024;
+    let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let original = sys::new_socket(address, SocketKind::Udp).unwrap();
+    original.bind(&SockAddr::from(address)).unwrap();
+    let raw = original.as_raw_socket();
+    let local = original.local_addr().unwrap().as_socket().unwrap();
+    let resources = driver.resource_snapshot();
+    let pool = driver.pool.usage();
+    let native_create = driver
+        .rio
+        .table
+        .RIOCreateRequestQueue
+        .replace(reject_request_queue);
+    let error = driver
+        .import(original.into(), SocketKind::Udp, &options)
+        .unwrap_err();
+    driver.rio.table.RIOCreateRequestQueue = native_create;
+    assert_eq!(error.error.raw_os_error(), Some(WSAENOBUFS));
+    assert_eq!(error.socket.as_raw_socket(), raw);
+    assert_eq!(driver.resource_snapshot(), resources);
+    assert_eq!(driver.pool.usage(), pool);
+
+    // Retry the same socket through a real native RQ and receive, proving that
+    // failed queue creation returned its ownership and all window admission.
+    let receiver = driver
+        .import(error.socket, SocketKind::Udp, &options)
+        .unwrap();
+    assert_eq!(receiver.local_addr, local);
+    driver.start_recv(receiver.id, Token(40)).unwrap();
+    driver.receive_capacity(receiver.id, 4).unwrap();
+    let sender = std::net::UdpSocket::bind(address).unwrap();
+    sender
+        .send_to(b"retry after resource failure", local)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut events = Vec::new();
+    let received = loop {
+        assert!(
+            Instant::now() < deadline,
+            "retried RIO receive did not complete"
+        );
+        driver
+            .poll(Some(Duration::from_millis(10)), &mut events)
+            .unwrap();
+        let Some(event) = events.pop() else {
+            continue;
+        };
+        let Event::Received {
+            token: Token(40),
+            result,
+        } = event
+        else {
+            panic!("unexpected retried import completion");
+        };
+        break result.unwrap();
+    };
+    assert_eq!(received.data.as_slice(), b"retry after resource failure");
+    assert_eq!(received.peer, Some(sender.local_addr().unwrap()));
+}
+
 unsafe extern "system" fn reject_receive(
     _queue: RIO_RQ,
     _data: *const RIO_BUF,

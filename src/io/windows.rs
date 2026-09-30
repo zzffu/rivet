@@ -1,5 +1,5 @@
 use super::{ImportError, Table, closed};
-use event_listener::Event;
+use crate::sync::notification::Event;
 use parking_lot::Mutex;
 use std::{
     ffi::c_void,
@@ -15,8 +15,9 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{HANDLE, RtlNtStatusToDosError, WAIT_OBJECT_0},
     System::Threading::{
-        CloseThreadpoolWait, CreateThreadpoolWait, PTP_CALLBACK_INSTANCE, PTP_WAIT,
-        SYNCHRONIZATION_SYNCHRONIZE, SetThreadpoolWait, WaitForThreadpoolWaitCallbacks,
+        CloseThreadpoolWait, CreateThreadpoolWait, DisassociateCurrentThreadFromCallback,
+        PTP_CALLBACK_INSTANCE, PTP_WAIT, SYNCHRONIZATION_SYNCHRONIZE, SetThreadpoolWait,
+        WaitForThreadpoolWaitCallbacks,
     },
 };
 
@@ -156,18 +157,21 @@ struct Callback {
     entry: Arc<Entry>,
 }
 unsafe extern "system" fn notified(
-    _instance: PTP_CALLBACK_INSTANCE,
+    instance: PTP_CALLBACK_INSTANCE,
     context: *mut c_void,
     _wait: PTP_WAIT,
     result: u32,
 ) {
-    // The box survives until callbacks have been cancelled and joined. No
-    // application code is invoked here other than scheduling a standard Waker;
-    // its panic must never unwind across the native callback boundary.
+    // Keep only an owned Entry after publishing the native result. The callback
+    // is disassociated before invoking arbitrary Waker code, which may close
+    // this registration (or the whole Registry) on this very callback thread.
+    // A Waker panic must never unwind across the native callback boundary.
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        let callback = unsafe { &*context.cast::<Callback>() };
+        // SAFETY: Teardown joins callbacks before freeing this context. Clone
+        // the Entry before disassociation and never access context again.
+        let entry = unsafe { &*context.cast::<Callback>() }.entry.clone();
         {
-            let mut state = callback.entry.state.lock();
+            let mut state = entry.state.lock();
             if state.closed {
                 return;
             }
@@ -178,7 +182,11 @@ unsafe extern "system" fn notified(
                 state.failure = Some(result);
             }
         }
-        callback.entry.changed.notify(usize::MAX);
+        // SAFETY: Native state publication is finished; after disassociation we
+        // touch neither the native wait, its HANDLE, nor its callback context.
+        // Close can now join the native portion without self-joining user code.
+        unsafe { DisassociateCurrentThreadFromCallback(instance) };
+        entry.changed.notify_all();
     }));
 }
 struct NativeWait {
@@ -225,16 +233,22 @@ impl NativeWait {
         }
         Ok(false)
     }
+    fn stop(&mut self) {
+        let wait = std::mem::replace(&mut self.wait, 0);
+        if wait == 0 {
+            return;
+        }
+        self.callback.entry.state.lock().closed = true;
+        unsafe {
+            SetThreadpoolWait(wait, std::ptr::null_mut(), std::ptr::null());
+            WaitForThreadpoolWaitCallbacks(wait, 1);
+            CloseThreadpoolWait(wait);
+        }
+    }
 }
 impl Drop for NativeWait {
     fn drop(&mut self) {
-        self.callback.entry.state.lock().closed = true;
-        unsafe {
-            SetThreadpoolWait(self.wait, std::ptr::null_mut(), std::ptr::null());
-            WaitForThreadpoolWaitCallbacks(self.wait, 1);
-            CloseThreadpoolWait(self.wait);
-        }
-        self.callback.entry.changed.notify(usize::MAX);
+        self.stop();
     }
 }
 
@@ -272,20 +286,40 @@ impl Registry {
             .take_or_arm()
     }
     fn unregister(&self, key: u64) {
-        let _lifecycle = self.lifecycle.lock();
-        let wait = self
-            .table
-            .lock()
-            .as_mut()
-            .and_then(|table| table.remove(key));
-        // Never wait for callbacks or wake futures with the table lock held.
-        drop(wait);
+        let wait = {
+            let _lifecycle = self.lifecycle.lock();
+            let mut wait = self
+                .table
+                .lock()
+                .as_mut()
+                .and_then(|table| table.remove(key));
+            if let Some(wait) = &mut wait {
+                wait.stop();
+            }
+            wait
+        };
+        if let Some(wait) = wait {
+            wait.callback.entry.changed.notify_all();
+        }
     }
     pub(crate) fn shutdown(&self) {
-        let _lifecycle = self.lifecycle.lock();
-        let table = self.table.lock().take();
-        // Removing the whole table first prevents rearming during teardown.
-        drop(table);
+        let table = {
+            let _lifecycle = self.lifecycle.lock();
+            let mut table = self.table.lock().take();
+            // Removing the whole table first prevents rearming during teardown.
+            if let Some(table) = &mut table {
+                for wait in table.values_mut() {
+                    wait.stop();
+                }
+            }
+            table
+        };
+        // All native waits have stopped before any application callback runs.
+        if let Some(table) = table {
+            for wait in table.into_values() {
+                wait.callback.entry.changed.notify_all();
+            }
+        }
     }
 }
 impl Drop for Registry {
@@ -340,7 +374,7 @@ impl AsyncHandle {
         let key = self.key.unwrap();
         async move {
             loop {
-                event_listener::listener!(entry.changed => listener);
+                let listener = entry.changed.listen();
                 if registry.take_or_arm(key)? {
                     return Ok(());
                 }
@@ -348,7 +382,8 @@ impl AsyncHandle {
             }
         }
     }
-    /// Wait for native callbacks to finish before closing the owned handle.
+    /// Stops and joins native wait access before closing the owned handle.
+    /// A Waker already being invoked may finish after close returns.
     pub fn close(mut self) -> io::Result<()> {
         self.registry.unregister(self.key.take().unwrap());
         Ok(())
@@ -365,4 +400,41 @@ impl fmt::Debug for AsyncHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AsyncHandle").finish_non_exhaustive()
     }
+}
+
+#[cfg(test)]
+pub(super) fn callback_shutdown() {
+    use std::{os::windows::io::FromRawHandle, pin::pin, task::Context, time::Duration};
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+
+    let handle = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    assert!(!handle.is_null());
+    // SAFETY: CreateEventW returned a new owned HANDLE.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let registry = Arc::new(Registry::new(1).unwrap());
+    let (key, entry) = registry.register(handle.as_raw_handle()).unwrap();
+    let stopped = registry.clone();
+    let (waker, completed) = super::tests::stop_waker(move || stopped.shutdown());
+    let mut waiting = pin!(entry.changed.listen());
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert!(!registry.take_or_arm(key).unwrap());
+    assert_ne!(unsafe { SetEvent(handle.as_raw_handle()) }, 0);
+    completed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        registry.take_or_arm(key).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        registry
+            .register(handle.as_raw_handle())
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::BrokenPipe
+    );
 }

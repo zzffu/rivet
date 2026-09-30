@@ -599,7 +599,7 @@ pub fn zc_stats() -> stdio::Result<ZcStats> {
 /// The returned value owns no live resource and may be retained or sent elsewhere.
 ///
 /// Returns `NotConnected` outside a running worker. Reentry while Core or driver
-/// state is mutably borrowed (for example from a completion waker) returns
+/// state is mutably borrowed (for example from a native callback) returns
 /// `WouldBlock` rather than panicking or advancing I/O to obtain a snapshot.
 pub fn resource_snapshot() -> stdio::Result<crate::diagnostics::WorkerResources> {
     let worker = current()?;
@@ -654,6 +654,7 @@ pub(crate) struct Worker {
     config: Arc<RuntimeConfig>,
     events: RefCell<Vec<Event>>,
     shutting_down: std::cell::Cell<bool>,
+    waking_io: std::cell::Cell<bool>,
 }
 impl Worker {
     fn new(
@@ -686,7 +687,58 @@ impl Worker {
             events: RefCell::new(Vec::with_capacity(config.limits.completion_budget)),
             config,
             shutting_down: std::cell::Cell::new(false),
+            waking_io: std::cell::Cell::new(false),
         }))
+    }
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.shutting_down.get()
+            || self
+                .group
+                .upgrade()
+                .is_none_or(|group| group.stopping.load(Ordering::Acquire))
+    }
+    fn drop_io_registrations(&self) {
+        let callbacks = self.io.borrow_mut().take_callbacks();
+        for callback in callbacks.into_iter().flatten() {
+            callback.run();
+        }
+    }
+    fn drain_io_wakes(&self) {
+        if self.waking_io.replace(true) {
+            return;
+        }
+        struct Reset<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _reset = Reset(&self.waking_io);
+        loop {
+            let waker = self.io.borrow_mut().take_ready_waker();
+            let Some(waker) = waker else {
+                break;
+            };
+            // Reentrant I/O may queue more live sources, but does not recurse
+            // through this batch. No table/driver borrow crosses user code.
+            waker.wake();
+        }
+    }
+    pub(crate) fn with_io<T>(&self, action: impl FnOnce(&mut io::IoState, &mut Driver) -> T) -> T {
+        self.drop_io_registrations();
+        let (result, callbacks) = {
+            let mut io = self.io.borrow_mut();
+            let mut driver = self.driver.borrow_mut();
+            let result = action(&mut io, &mut driver);
+            (result, io.take_callbacks())
+        };
+        // Detached registrations cannot accumulate behind the wake guard:
+        // this call owns at most two, and drops them outside all table borrows.
+        for callback in callbacks.into_iter().flatten() {
+            callback.run();
+        }
+        self.drain_io_wakes();
+        result
     }
     fn run_background(self: &Rc<Self>) -> stdio::Result<()> {
         while !self
@@ -721,9 +773,14 @@ impl Worker {
             command.launch(self);
         }
         self.run_ready();
-        self.timers
-            .borrow_mut()
-            .expire(Instant::now(), self.config.limits.completion_budget);
+        let now = Instant::now();
+        for _ in 0..self.config.limits.completion_budget {
+            let waker = self.timers.borrow_mut().expire(now);
+            let Some(waker) = waker else {
+                break;
+            };
+            waker.wake();
+        }
         self.poll_driver(Some(Duration::ZERO))?;
         self.pool.flush_recycles();
         if self.immediate_work(root) {
@@ -770,21 +827,30 @@ impl Worker {
                 // A future's destructor may close sockets or spawn work. Never
                 // drop it while borrowing the task table or driver.
                 if let Some(body) = body {
-                    blocking::ignore_panic(|| body.complete());
+                    body.complete();
                 }
             }
         }
     }
     fn poll_driver(&self, timeout: Option<Duration>) -> stdio::Result<()> {
-        let mut events = self.events.borrow_mut();
-        self.driver.borrow_mut().poll(timeout, &mut events)?;
-        let mut io = self.io.borrow_mut();
-        let mut driver = self.driver.borrow_mut();
-        for event in events.drain(..) {
-            io.event(&mut driver, event);
+        self.drop_io_registrations();
+        self.drain_io_wakes();
+        // Own the reused event buffer while dispatching: discarding an event
+        // can release user-owned data, and must not hold the event-table borrow.
+        let mut events = self.events.take();
+        let result = self.driver.borrow_mut().poll(timeout, &mut events);
+        if result.is_ok() {
+            let mut io = self.io.borrow_mut();
+            let mut driver = self.driver.borrow_mut();
+            for event in events.drain(..) {
+                io.event(&mut driver, event);
+            }
+            io.flush_capacities(&mut driver);
         }
-        io.flush_capacities(&mut driver);
-        Ok(())
+        self.events.replace(events);
+        self.drop_io_registrations();
+        self.drain_io_wakes();
+        result
     }
     fn shutdown(self: &Rc<Self>) -> stdio::Result<()> {
         if self.shutting_down.replace(true) {
@@ -804,13 +870,25 @@ impl Worker {
         while !self.tasks.borrow().is_empty() {
             let body = self.tasks.borrow_mut().take_shutdown();
             if let Some(body) = body {
-                blocking::ignore_panic(|| body.complete());
+                body.complete();
             }
         }
-        self.timers.borrow_mut().clear();
-        self.io
-            .borrow_mut()
-            .begin_shutdown(&mut self.driver.borrow_mut());
+        loop {
+            let waker = self.timers.borrow_mut().clear();
+            let Some(waker) = waker else {
+                break;
+            };
+            waker.wake();
+        }
+        self.io.borrow_mut().begin_shutdown();
+        loop {
+            let key = self.io.borrow().next_socket();
+            let Some(key) = key else {
+                break;
+            };
+            self.with_io(|io, driver| io.close_socket(driver, key));
+        }
+        self.with_io(|io, driver| io.cancel_operations(driver));
         self.driver.borrow_mut().begin_shutdown();
         let mut first_error = None;
         loop {
@@ -835,7 +913,7 @@ impl Worker {
                 break;
             }
         }
-        self.io.borrow_mut().finish_shutdown();
+        self.with_io(|io, _| io.finish_shutdown());
         self.pool.flush_recycles();
         self.shared.notifier.close();
         match first_error {

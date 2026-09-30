@@ -2,9 +2,9 @@
 use super::super::SocketKind;
 #[cfg(any(feature = "udp-gso", feature = "udp-gro"))]
 use super::socket;
+use std::{io, mem};
 #[cfg(any(feature = "udp-gso", feature = "udp-gro"))]
 use std::{
-    io, mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::AsRawFd,
 };
@@ -23,10 +23,8 @@ pub(super) enum Offload {
 
 // cmsghdr must be naturally aligned, including on Android's 16 KiB-page builds.
 // Ancillary alignment is unrelated to the virtual-memory page size.
-#[cfg(any(feature = "udp-gso", feature = "udp-gro"))]
 pub(super) struct Control(pub [usize; 8]);
 
-#[cfg(any(feature = "udp-gso", feature = "udp-gro"))]
 impl Control {
     pub fn new() -> Self {
         Self([0; 8])
@@ -52,7 +50,6 @@ impl Control {
         }
     }
 
-    #[cfg(feature = "udp-gro")]
     pub fn gro_segment_size(&self, used: usize) -> io::Result<Option<u16>> {
         if used > self.capacity() {
             return Err(invalid_control());
@@ -96,13 +93,11 @@ impl Control {
     }
 }
 
-#[cfg(feature = "udp-gro")]
 fn aligned(value: usize) -> usize {
     let alignment = mem::size_of::<usize>();
     (value + alignment - 1) & !(alignment - 1)
 }
 
-#[cfg(feature = "udp-gro")]
 fn invalid_control() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid UDP ancillary data")
 }

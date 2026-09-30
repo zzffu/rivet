@@ -874,3 +874,368 @@ fn shutdown_drains_native_send_and_preserves_returned_immutable_ownership() {
         b"lease survives native shutdown"
     );
 }
+
+thread_local! {
+    static CANCELLED_IO: std::cell::RefCell<Option<std::pin::Pin<Box<dyn Future<Output = ()>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn cancel_registered_io() -> bool {
+    let future = CANCELLED_IO.with(|slot| slot.borrow_mut().take());
+    let cancelled = future.is_some();
+    drop(future);
+    cancelled
+}
+
+struct CancelIoWake {
+    cancelled: AtomicBool,
+    root: std::task::Waker,
+}
+impl std::task::Wake for CancelIoWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        if cancel_registered_io() {
+            self.cancelled.store(true, Ordering::Release);
+        }
+        self.root.wake_by_ref();
+    }
+}
+
+async fn cancel_on_io_wake(future: impl Future<Output = ()> + 'static) -> Arc<CancelIoWake> {
+    let mut future = Box::pin(future);
+    let notice = std::future::poll_fn(|cx| {
+        let notice = Arc::new(CancelIoWake {
+            cancelled: AtomicBool::new(false),
+            root: cx.waker().clone(),
+        });
+        let waker = std::task::Waker::from(notice.clone());
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(&waker))
+                .is_pending()
+        );
+        Poll::Ready(notice)
+    })
+    .await;
+    CANCELLED_IO.with(|slot| *slot.borrow_mut() = Some(future));
+    notice
+}
+
+async fn wait_for_io_cancellation(notice: &CancelIoWake) {
+    std::future::poll_fn(|_| {
+        if notice.cancelled.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+#[test]
+fn completion_wakers_can_destroy_pending_tcp_operations() {
+    use std::io::{Read, Write};
+    let mut owner = Runtime::new(config(1)).unwrap();
+    owner.block_on(async {
+        time::timeout(Duration::from_secs(10), async {
+            let listener = Rc::new(TcpListener::bind(address(false)).unwrap());
+            let accepting = listener.clone();
+            let notice = cancel_on_io_wake(async move {
+                let _ = accepting.accept().await;
+            })
+            .await;
+            let mut client = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            client
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            wait_for_io_cancellation(&notice).await;
+            // Accept cancellation must retain the newly queued connection.
+            let server = Rc::new(listener.accept().await.unwrap());
+
+            let receiving = server.clone();
+            let notice = cancel_on_io_wake(async move {
+                let _ = receiving.recv().await;
+            })
+            .await;
+            client.write_all(b"retained receive").unwrap();
+            wait_for_io_cancellation(&notice).await;
+            let received = blocks_exactly(&server, b"retained receive".len()).await;
+            assert_eq!(flatten(&received), b"retained receive");
+
+            let sending = server.clone();
+            let data = payload(b"submitted send");
+            let notice = cancel_on_io_wake(async move {
+                let _ = sending.send(data).await;
+            })
+            .await;
+            wait_for_io_cancellation(&notice).await;
+            let mut bytes = [0; 14];
+            client.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"submitted send");
+
+            let native_listener = std::net::TcpListener::bind(address(false)).unwrap();
+            let peer = native_listener.local_addr().unwrap();
+            let notice = cancel_on_io_wake(async move {
+                let _ = TcpStream::connect(peer).await;
+            })
+            .await;
+            wait_for_io_cancellation(&notice).await;
+            assert!(!cancel_registered_io());
+            assert_eq!(runtime::spawn_local(async { 17 }).unwrap().await, Ok(17));
+        })
+        .await
+        .unwrap();
+    });
+}
+
+struct CancelIoOnDrop(Arc<AtomicBool>);
+impl std::task::Wake for CancelIoOnDrop {
+    fn wake(self: Arc<Self>) {
+        // The last owned reference runs the cancellation destructor below.
+        drop(self);
+    }
+}
+impl Drop for CancelIoOnDrop {
+    fn drop(&mut self) {
+        self.0.store(cancel_registered_io(), Ordering::Release);
+    }
+}
+
+#[test]
+fn replacing_or_removing_an_io_waker_can_cancel_another_waiter() {
+    use std::{
+        pin::Pin,
+        task::{Context, Waker},
+    };
+    for replace in [false, true] {
+        let mut owner = Runtime::new(config(1)).unwrap();
+        owner.block_on(async {
+            let victim = Rc::new(UdpSocket::bind(address(false)).unwrap());
+            let receiving = victim.clone();
+            let _notice = cancel_on_io_wake(async move {
+                let _ = receiving.recv().await;
+            })
+            .await;
+            let socket = UdpSocket::bind(address(false)).unwrap();
+            let mut trigger = socket.recv();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            {
+                let waker = Waker::from(Arc::new(CancelIoOnDrop(cancelled.clone())));
+                assert!(
+                    Pin::new(&mut trigger)
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            }
+            if replace {
+                assert!(
+                    Pin::new(&mut trigger)
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            } else {
+                drop(trigger);
+            }
+            assert!(cancelled.load(Ordering::Acquire));
+            assert!(!victim.receive_snapshot().unwrap().waiter_registered());
+            let mut replacement = victim.recv();
+            assert!(poll_once(&mut replacement).await.is_none());
+        });
+    }
+}
+
+#[test]
+fn panicking_panic_payloads_do_not_strand_async_joins() {
+    use std::process::{Child, Command};
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Guard(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "async_panic_payload_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("RIVET_ASYNC_PANIC_PAYLOAD_CHILD", "1")
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "panic-payload child failed: {status}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "panic-payload child did not finish"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn async_panic_payload_child() {
+    use std::{pin::Pin, sync::atomic::AtomicUsize, task::Context};
+    if std::env::var_os("RIVET_ASYNC_PANIC_PAYLOAD_CHILD").is_none() {
+        return;
+    }
+    struct Payload(Arc<AtomicUsize>);
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            panic!("intentional panic-payload destructor panic");
+        }
+    }
+    struct DropFuture {
+        ready: bool,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Future for DropFuture {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if self.ready {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for DropFuture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+            std::panic::panic_any(Payload(self.drops.clone()));
+        }
+    }
+    for case in 0..7 {
+        let mut limits = config(1);
+        limits.limits.max_tasks = 1;
+        let mut owner = Runtime::new(limits).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let counter = drops.clone();
+        let mut task = None;
+        owner.block_on(async {
+            task = Some(match case {
+                0 => runtime::spawn_local(async move {
+                    std::panic::panic_any(Payload(counter));
+                })
+                .unwrap(),
+                1 => runtime::spawn(move || -> std::future::Ready<()> {
+                    std::panic::panic_any(Payload(counter));
+                })
+                .unwrap(),
+                2 | 3 | 5 => runtime::spawn_local(DropFuture {
+                    ready: case == 2,
+                    drops: counter,
+                })
+                .unwrap(),
+                4 | 6 => {
+                    let capture = DropFuture {
+                        ready: false,
+                        drops: counter,
+                    };
+                    runtime::spawn(move || async move {
+                        let _capture = capture;
+                        pending::<()>().await;
+                    })
+                    .unwrap()
+                }
+                _ => unreachable!(),
+            });
+        });
+        let task = task.unwrap();
+        let expected = if case < 3 {
+            JoinError::Panicked
+        } else {
+            JoinError::Cancelled
+        };
+        let finished = task.abort_handle();
+        if case >= 5 {
+            drop(owner);
+            assert_eq!(
+                futures_lite::future::block_on(poll_once(task)),
+                Some(Err(expected))
+            );
+        } else {
+            if case >= 3 {
+                task.abort();
+            }
+            owner.block_on(async {
+                assert_eq!(
+                    time::timeout(Duration::from_secs(5), task).await.unwrap(),
+                    Err(expected)
+                );
+                // Admission is returned exactly once, not leaked or doubled.
+                let replacement = runtime::spawn_local(pending::<()>()).unwrap();
+                assert_eq!(
+                    runtime::spawn_local(async {}).unwrap_err(),
+                    SpawnError::AtCapacity
+                );
+                assert_eq!(replacement.cancel().await, Err(JoinError::Cancelled));
+                assert_eq!(runtime::spawn_local(async { 23 }).unwrap().await, Ok(23));
+            });
+        }
+        assert!(finished.is_finished());
+        assert_eq!(drops.load(Ordering::Acquire), if case < 2 { 1 } else { 2 });
+    }
+}
+
+#[test]
+fn cloning_an_io_waker_can_cancel_another_waiter() {
+    use std::{
+        mem::ManuallyDrop,
+        pin::Pin,
+        task::{Context, RawWaker, RawWakerVTable, Waker},
+    };
+    struct CloneWake(AtomicBool);
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        // Each RawWaker owns one Arc. Its clone hook may synchronously run
+        // arbitrary owner-local code without making the Waker itself !Send.
+        let state = ManuallyDrop::new(unsafe { Arc::<CloneWake>::from_raw(data.cast()) });
+        if state.0.swap(false, Ordering::AcqRel) {
+            assert!(cancel_registered_io());
+        }
+        RawWaker::new(Arc::into_raw(Arc::clone(&state)).cast(), &VTABLE)
+    }
+    unsafe fn consume(data: *const ()) {
+        drop(unsafe { Arc::<CloneWake>::from_raw(data.cast()) });
+    }
+    unsafe fn wake_by_ref(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, consume, wake_by_ref, consume);
+
+    let mut owner = Runtime::new(config(1)).unwrap();
+    owner.block_on(async {
+        let victim = Rc::new(UdpSocket::bind(address(false)).unwrap());
+        let receiving = victim.clone();
+        let _notice = cancel_on_io_wake(async move {
+            let _ = receiving.recv().await;
+        })
+        .await;
+        let state = Arc::new(CloneWake(AtomicBool::new(true)));
+        let raw = RawWaker::new(Arc::into_raw(state.clone()).cast(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw) };
+        let trigger = UdpSocket::bind(address(false)).unwrap();
+        let mut receiving = trigger.recv();
+        assert!(
+            Pin::new(&mut receiving)
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert!(!state.0.load(Ordering::Acquire));
+        assert!(!victim.receive_snapshot().unwrap().waiter_registered());
+        let mut replacement = victim.recv();
+        assert!(poll_once(&mut replacement).await.is_none());
+    });
+}

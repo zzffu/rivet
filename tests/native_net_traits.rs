@@ -72,7 +72,10 @@ fn write_shutdown_is_lazy_and_preserves_reverse_response() {
 #[test]
 fn flush_validates_the_polling_worker_and_runtime_lifetime() {
     let mut owner = runtime();
-    let (stream, _peer) = owner.block_on(deadline(pair()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut retained_connect = TcpStream::connect(listener.local_addr().unwrap());
+    let stream = owner.block_on(deadline(&mut retained_connect)).unwrap();
+    let (_peer, _) = listener.accept().unwrap();
 
     // A future constructed in the owner must still reject a missing poll context.
     let flush = owner.block_on(std::future::poll_fn(|_| {
@@ -111,11 +114,42 @@ fn flush_validates_the_polling_worker_and_runtime_lifetime() {
     }));
     drop(owner);
     assert_eq!(
+        block_on(StreamSend::flush(&stream)).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        block_on(stream.recv()).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        stream.shutdown(Shutdown::Write).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
         other
             .block_on(poll_once(flush))
             .expect("native flush must complete on its first poll")
             .unwrap_err()
             .kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    other.block_on(async {
+        assert_eq!(
+            stream.recv().await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            StreamShutdown::shutdown_write(&stream)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    });
+    // Weak::upgrade starts failing only now; it must not change error identity.
+    drop(retained_connect);
+    assert_eq!(
+        block_on(StreamSend::flush(&stream)).unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
     );
 }

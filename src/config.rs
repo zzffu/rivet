@@ -552,6 +552,7 @@ impl RuntimeConfig {
             .map_err(|_| invalid("accept queue capacity exceeds addressable memory"))?;
         Layout::array::<Event>(l.completion_budget)
             .map_err(|_| invalid("completion queue capacity exceeds addressable memory"))?;
+        crate::runtime::io::wake_capacity(l)?;
         Layout::array::<Box<dyn FnOnce() + Send>>(self.blocking.queue_capacity)
             .map_err(|_| invalid("blocking queue capacity exceeds addressable memory"))?;
         Layout::array::<std::thread::JoinHandle<()>>(self.blocking.threads)

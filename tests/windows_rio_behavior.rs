@@ -412,6 +412,7 @@ fn import_rejects_non_rio_without_losing_the_original_socket() {
                 panic!("ordinary Winsock sockets must not be silently recreated as RIO sockets")
             }
             Err(error) => {
+                assert_eq!(error.error.raw_os_error(), Some(WSAEOPNOTSUPP));
                 assert_eq!(error.socket.as_raw_socket(), raw);
                 std::net::UdpSocket::from(error.socket)
             }
@@ -954,12 +955,14 @@ fn udp_operation_admission_rejects_import_before_native_queue_ownership() {
     configuration.limits.max_operations = 4;
     let mut options = SocketOptions::udp();
     options.receive_chunk = 1024;
+    // This host-owned socket must not borrow a runtime's Winsock lifetime.
+    let original = registered_udp();
+    let raw = original.as_raw_socket();
+    let local = original.local_addr().unwrap().as_socket().unwrap();
     let mut runtime = Runtime::new(configuration.clone()).unwrap();
     let original = runtime.block_on(async {
         let _first =
             UdpSocket::bind_with_options("127.0.0.1:0".parse().unwrap(), options.clone()).unwrap();
-        let original = registered_udp();
-        let raw = original.as_raw_socket();
         let error = UdpSocket::import(original.into(), options.clone()).unwrap_err();
         assert_eq!(error.error.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(error.socket.as_raw_socket(), raw);
@@ -968,9 +971,13 @@ fn udp_operation_admission_rejects_import_before_native_queue_ownership() {
     // Runtime drop drains all original receive lanes, without a timer or a
     // guessed cancellation delay. The rejected descriptor is still importable.
     drop(runtime);
+    let original = socket2::Socket::from(original);
+    assert_eq!(original.as_raw_socket(), raw);
+    assert_eq!(original.local_addr().unwrap().as_socket(), Some(local));
     let mut runtime = Runtime::new(configuration).unwrap();
     runtime.block_on(deadline(async {
-        let receiver = UdpSocket::import(original, options).unwrap();
+        let receiver = UdpSocket::import(original.into(), options).unwrap();
+        assert_eq!(receiver.local_addr(), local);
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         sender
             .send_to(b"operation slots reclaimed", receiver.local_addr())

@@ -347,6 +347,56 @@ fn registered_wait_preserves_timeouts_and_network_progress() {
 
 #[cfg(feature = "multishot-recv")]
 #[test]
+fn multishot_tcp_reset_waits_for_receive_credit() {
+    use std::io::Write;
+
+    let mut config = config();
+    for &optimization in Optimization::ALL {
+        config = config.with_policy(optimization, Policy::Off);
+    }
+    config = config
+        .enable(Optimization::ProvidedBuffers)
+        .enable(Optimization::MultishotRecv);
+    config.limits.completion_budget = 64;
+    let mut runtime = linux::runtime(config).unwrap();
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        let listener = std::net::TcpListener::bind(address).unwrap();
+        let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (native, _) = listener.accept().unwrap();
+        let alias = native.try_clone().unwrap();
+        runtime.block_on(deadline(async move {
+            let receiver = TcpStream::import(native.into(), SocketOptions::default()).unwrap();
+            let mut receive = receiver.recv();
+            assert!(poll_once(&mut receive).await.is_none());
+
+            let expected = b"data before reset";
+            peer.write_all(expected).unwrap();
+            socket2::SockRef::from(&peer)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(peer);
+            // Queue both data and reset before the worker submits its receive.
+            // POLLERR observes the reset without consuming SO_ERROR.
+            let mut readiness = libc::pollfd {
+                fd: alias.as_raw_fd(),
+                events: libc::POLLERR,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut readiness, 1, 1000) }, 1);
+            assert_ne!(readiness.revents & libc::POLLERR, 0);
+
+            let data = receive.await.unwrap().unwrap();
+            assert_eq!(data.as_slice(), expected);
+            let error = receiver.recv().await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+            assert_eq!(error.raw_os_error(), Some(libc::ECONNRESET));
+            assert_eq!(data.as_slice(), expected);
+        }));
+    }
+}
+
+#[cfg(feature = "multishot-recv")]
+#[test]
 fn provided_multishot_tcp_eof_preserves_payload_and_reverse_direction() {
     let configurations = [
         multishot_config(),
@@ -607,29 +657,39 @@ fn exercise_udp_metadata(config: RuntimeConfig, receive_chunk: usize) {
                 // raced multishot CQEs). Datagram metadata must follow its CQE.
                 rivet::time::sleep(Duration::from_millis(1)).await.unwrap();
                 drop((client, server));
-                let retained = receiver.recv().await.unwrap();
-                assert_eq!(retained.peer, Some(first.local_addr().unwrap()));
-                assert_eq!(retained.original_len, Some(9));
-                assert_eq!(
-                    retained.data.as_slice(),
-                    &large[..large.len().min(receive_chunk)]
-                );
-                assert_eq!(retained.truncated, large.len() > receive_chunk);
-                for (expected, source) in [(&next[..], &second), (b"", &first), (b"last", &second)]
-                {
+                // UDP does not promise a global order across sending sockets.
+                // Match each distinct packet, while still detecting duplicated,
+                // missing or mismatched payload/metadata and reused lease bytes.
+                let expected = [
+                    (first.local_addr().unwrap(), &large[..]),
+                    (second.local_addr().unwrap(), &next[..]),
+                    (first.local_addr().unwrap(), &b""[..]),
+                    (second.local_addr().unwrap(), &b"last"[..]),
+                ];
+                let mut retained: [Option<_>; 4] = std::array::from_fn(|_| None);
+                for _ in 0..expected.len() {
                     let packet = receiver.recv().await.unwrap();
+                    let index = expected
+                        .iter()
+                        .position(|(source, bytes)| {
+                            packet.peer == Some(*source) && packet.original_len == Some(bytes.len())
+                        })
+                        .expect("datagram source and original length do not match any input");
+                    assert!(retained[index].is_none(), "duplicate input datagram");
+                    let bytes = expected[index].1;
                     assert_eq!(
                         packet.data.as_slice(),
-                        &expected[..expected.len().min(receive_chunk)]
+                        &bytes[..bytes.len().min(receive_chunk)]
                     );
-                    assert_eq!(packet.peer, Some(source.local_addr().unwrap()));
-                    assert_eq!(packet.original_len, Some(expected.len()));
-                    assert_eq!(packet.truncated, expected.len() > receive_chunk);
+                    assert_eq!(packet.truncated, bytes.len() > receive_chunk);
+                    retained[index] = Some(packet);
                 }
-                assert_eq!(
-                    retained.data.as_slice(),
-                    &large[..large.len().min(receive_chunk)]
-                );
+                for (packet, (_, bytes)) in retained.into_iter().zip(expected) {
+                    assert_eq!(
+                        packet.unwrap().data.as_slice(),
+                        &bytes[..bytes.len().min(receive_chunk)]
+                    );
+                }
             }
         }));
     }

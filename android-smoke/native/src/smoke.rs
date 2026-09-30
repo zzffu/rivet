@@ -309,6 +309,42 @@ pub async fn import_ownership() -> io::Result<String> {
     Ok("wrong-kind import returned the exact usable owning fd; later successful import transferred ownership".to_owned())
 }
 
+pub async fn imported_tcp_close() -> io::Result<String> {
+    use std::io::Write;
+
+    for ip in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        for abort in [false, true] {
+            let listener = TcpListener::bind(SocketAddr::new(ip, 0))?;
+            let native = std::net::TcpStream::connect(listener.local_addr())?;
+            let mut alias = native.try_clone()?;
+            let peer = listener.accept().await?;
+            let imported = TcpStream::import(native.into(), SocketOptions::default())
+                .map_err(|error| error.error)?;
+            if abort {
+                imported.abort()?;
+                check(
+                    matches!(peer.recv().await, Err(error) if error.kind() == io::ErrorKind::ConnectionReset),
+                    "abort did not reset the peer while a native alias remained open",
+                )?;
+            } else {
+                drop(imported);
+                check(
+                    peer.recv().await?.is_none(),
+                    "ordinary Drop did not send FIN while a native alias remained open",
+                )?;
+                check(
+                    matches!(alias.write(b"after-close"), Err(error) if error.kind() == io::ErrorKind::BrokenPipe),
+                    "ordinary Drop left the native alias's write direction open",
+                )?;
+            }
+        }
+    }
+    Ok("IPv4/IPv6 imported TCP: ordinary Drop sent FIN and shut down native aliases' writes; abort retained peer-observed RST".to_owned())
+}
+
 fn descriptor_flags(fd: i32) -> io::Result<(i32, i32)> {
     let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if status < 0 {
@@ -899,6 +935,134 @@ pub fn capability_policy() -> io::Result<String> {
     Ok(detail)
 }
 
+fn set_udp_option(fd: i32, option: i32, value: i32) -> io::Result<()> {
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_UDP,
+            option,
+            (&value as *const i32).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn imported_udp_gro() -> io::Result<Option<String>> {
+    const UDP_SEGMENT: i32 = 103;
+    const UDP_GRO: i32 = 104;
+    let bytes = b"abcdEFGH";
+    for requested in [
+        config(),
+        config().with_policy(Optimization::UdpGro, Policy::Off),
+    ] {
+        let mut runtime = Runtime::new(requested)?;
+        check(
+            !runtime.capabilities()[0].enabled(Optimization::UdpGro),
+            "inherited GRO regression must run without actively enabling GRO",
+        )?;
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            for chunk in [8, 6, 2] {
+                let receiver = std::net::UdpSocket::bind(SocketAddr::new(ip, 0))?;
+                let sender = std::net::UdpSocket::bind(SocketAddr::new(ip, 0))?;
+                for (fd, option, value) in [
+                    (receiver.as_raw_fd(), UDP_GRO, 1),
+                    (receiver.as_raw_fd(), UDP_SEGMENT, 4),
+                    (sender.as_raw_fd(), UDP_SEGMENT, 4),
+                ] {
+                    if let Err(error) = set_udp_option(fd, option, value) {
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+                        ) {
+                            return Ok(None);
+                        }
+                        return Err(error);
+                    }
+                }
+                receiver.set_read_timeout(Some(Duration::from_secs(1)))?;
+                sender.set_read_timeout(Some(Duration::from_secs(1)))?;
+                let local = receiver.local_addr()?;
+                let peer = sender.local_addr()?;
+                check(
+                    sender.send_to(bytes, local)? == bytes.len(),
+                    "native segmented datagram send was incomplete",
+                )?;
+                // MSG_PEEK proves a real aggregate exists before import. Two
+                // ordinary datagrams must not make this regression pass.
+                let mut aggregate = [0; 16];
+                check(
+                    receiver.peek(&mut aggregate)? == bytes.len()
+                        && &aggregate[..bytes.len()] == bytes,
+                    "native receiver did not queue the expected GRO aggregate",
+                )?;
+                set_udp_option(sender.as_raw_fd(), UDP_SEGMENT, 0)?;
+                runtime
+                    .block_on(rivet::time::timeout(Duration::from_secs(8), async {
+                        let mut options = SocketOptions::udp();
+                        options.receive_chunk = chunk;
+                        let receiver = UdpSocket::import(receiver.into(), options)
+                            .map_err(|error| error.error)?;
+                        let first = receiver.recv().await?;
+                        check(
+                            first.data.as_slice() == &bytes[..chunk.min(4)]
+                                && first.peer == Some(peer)
+                                && first.original_len == Some(4)
+                                && first.gro_segment_size == Some(4)
+                                && first.truncated == (chunk < 4),
+                            "imported GRO lost the first datagram or its truncation metadata",
+                        )?;
+                        let second = receiver.recv().await?;
+                        check(
+                            second.data.as_slice() == &bytes[4..chunk.clamp(4, 8)]
+                                && second.peer == Some(peer)
+                                && second.original_len == Some(4)
+                                && second.gro_segment_size == Some(4)
+                                && second.truncated == (chunk < 8),
+                            "imported GRO lost the second datagram or its truncation metadata",
+                        )?;
+                        check(
+                            first.data.as_slice() == &bytes[..chunk.min(4)],
+                            "receiving a GRO remainder mutated a retained first segment",
+                        )?;
+                        check(
+                            sender.send_to(&[], local)? == 0,
+                            "native empty UDP send was not preserved",
+                        )?;
+                        let empty = receiver.recv().await?;
+                        check(
+                            empty.data.is_empty()
+                                && empty.peer == Some(peer)
+                                && empty.original_len == Some(0)
+                                && empty.gro_segment_size.is_none()
+                                && !empty.truncated,
+                            "inherited GRO confused an empty datagram with a truncated segment",
+                        )?;
+                        check(
+                            receiver.send_to(payload(bytes)?, peer).await.result? == bytes.len(),
+                            "plain send from imported UDP socket was incomplete",
+                        )?;
+                        let mut reply = [0; 16];
+                        let (length, source) = sender.recv_from(&mut reply)?;
+                        check(
+                            length == bytes.len() && &reply[..length] == bytes && source == local,
+                            "plain send retained inherited UDP_SEGMENT segmentation",
+                        )?;
+                        Ok::<_, io::Error>(())
+                    }))
+                    .map_err(|error| io::Error::other(error.to_string()))??;
+            }
+        }
+    }
+    Ok(Some("default/explicit Off preserved prequeued IPv4/IPv6 GRO at four-byte boundaries with receive_chunk 8/6/2, truncation, empty datagrams and retained leases; inherited UDP_SEGMENT was cleared for plain sends".to_owned()))
+}
+
 pub fn udp_offload() -> io::Result<Option<String>> {
     let requested = config()
         .with_policy(Optimization::UdpGso, Policy::Auto)
@@ -1017,6 +1181,11 @@ pub fn suite(network: u64) -> Vec<CaseResult> {
     );
     record_async("native_import_ownership", import_ownership(), &mut cases);
     record_async(
+        "imported_tcp_drop_fin_and_abort_rst_with_native_alias",
+        imported_tcp_close(),
+        &mut cases,
+    );
+    record_async(
         "inherited_tcp_linger_rejected_without_mutation",
         inherited_tcp_linger(),
         &mut cases,
@@ -1038,6 +1207,19 @@ pub fn suite(network: u64) -> Vec<CaseResult> {
         network_and_protection_errors(),
         &mut cases,
     );
+    match imported_udp_gro() {
+        Ok(Some(detail)) => cases.push(CaseResult {
+            name: "imported_udp_gro_with_off_policy",
+            status: "passed",
+            detail,
+        }),
+        Ok(None) => cases.push(CaseResult {
+            name: "imported_udp_gro_with_off_policy",
+            status: "skipped",
+            detail: "native UDP_GRO or UDP_SEGMENT socket option is unsupported; inherited GRO was not exercised".to_owned(),
+        }),
+        Err(error) => record("imported_udp_gro_with_off_policy", Err(error), &mut cases),
+    }
     match udp_offload() {
         Ok(Some(detail)) => cases.push(CaseResult {
             name: "optional_udp_gso_gro",

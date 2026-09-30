@@ -72,6 +72,36 @@ fn abort_reports_native_reset_while_ordinary_drop_still_reports_eof() {
 
 #[cfg(unix)]
 #[test]
+fn ordinary_drop_half_closes_imported_stream_while_native_alias_remains_open() {
+    use std::io::Write;
+
+    let mut runtime = Runtime::new(config()).unwrap();
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        let listener = std::net::TcpListener::bind(address).unwrap();
+        let native = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut alias = native.try_clone().unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer = thread::spawn(move || peer.read(&mut [0; 1]));
+
+        runtime.block_on(async {
+            drop(rivet::TcpStream::import(native.into(), SocketOptions::default()).unwrap());
+        });
+        assert_eq!(
+            peer.join().unwrap().unwrap(),
+            0,
+            "ordinary Drop must send FIN for {address} before the last native alias closes",
+        );
+        assert_eq!(
+            alias.write(b"after-close").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe,
+            "ordinary Drop must shut down the shared socket's write direction",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn abort_disconnects_imported_stream_while_native_alias_remains_open() {
     let mut runtime = Runtime::new(config()).unwrap();
     for address in ["127.0.0.1:0", "[::1]:0"] {

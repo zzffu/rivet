@@ -154,6 +154,20 @@ fn unaddressable_completion_queue_is_a_configuration_error() {
     );
 }
 
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn combined_io_wake_capacity_is_checked_before_worker_allocation() {
+    for sockets in [usize::MAX, usize::MAX / 16] {
+        let mut config = RuntimeConfig::single_thread();
+        config.limits.max_sockets = sockets;
+        config.limits.max_operations = sockets;
+        assert_eq!(
+            config.normalized().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+}
+
 #[test]
 fn windows_udp_payload_estimate_uses_exact_allocations_and_the_shared_pool_minimum() {
     let mut limits = rivet::config::Limits {

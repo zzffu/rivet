@@ -149,6 +149,9 @@ struct Socket {
 impl Socket {
     fn owner(&self) -> io::Result<Rc<Worker>> {
         let owner = self.owner.upgrade().ok_or_else(gone)?;
+        if owner.is_stopping() {
+            return Err(gone());
+        }
         let current = runtime::current()?;
         if !Rc::ptr_eq(&owner, &current) {
             return Err(io::Error::new(
@@ -173,10 +176,7 @@ impl Socket {
             }
         };
         #[cfg(target_os = "windows")]
-        owner
-            .io
-            .borrow_mut()
-            .prime_udp(&mut owner.driver.borrow_mut(), key);
+        owner.with_io(|io, driver| io.prime_udp(driver, key));
         Ok(Self {
             owner: Rc::downgrade(owner),
             key: Cell::new(Some(key)),
@@ -206,10 +206,7 @@ impl Socket {
             .register(info.clone())
             .expect("reserved core socket capacity");
         #[cfg(target_os = "windows")]
-        owner
-            .io
-            .borrow_mut()
-            .prime_udp(&mut owner.driver.borrow_mut(), key);
+        owner.with_io(|io, driver| io.prime_udp(driver, key));
         Ok(Self {
             owner: Rc::downgrade(&owner),
             key: Cell::new(Some(key)),
@@ -224,7 +221,7 @@ impl Socket {
         let owner = self.owner()?;
         owner.io.borrow().is_idle_socket(self.key())?;
         let socket = owner.driver.borrow_mut().take_idle_socket(self.info.id)?;
-        owner.io.borrow_mut().forget_idle(self.key());
+        owner.with_io(|io, _| io.forget_idle(self.key()));
         self.key.set(None);
         Ok(socket)
     }
@@ -232,10 +229,7 @@ impl Socket {
 impl Drop for Socket {
     fn drop(&mut self) {
         if let (Some(owner), Some(key)) = (self.owner.upgrade(), self.key.take()) {
-            owner
-                .io
-                .borrow_mut()
-                .close_socket(&mut owner.driver.borrow_mut(), key);
+            owner.with_io(|io, driver| io.close_socket(driver, key));
         }
     }
 }
@@ -404,14 +398,11 @@ impl Future for Connect {
             }
         }
         let owner = self.owner.as_ref().unwrap().clone();
+        let mut waker = Some(cx.waker().clone());
         if self.token.is_none() {
-            match owner.io.borrow_mut().connect(
-                &mut owner.driver.borrow_mut(),
-                self.address,
-                self.local,
-                &self.options,
-                cx.waker(),
-            ) {
+            match owner.with_io(|io, driver| {
+                io.connect(driver, self.address, self.local, &self.options, &mut waker)
+            }) {
                 Ok(token) => self.token = Some(token),
                 Err(error) => {
                     self.done = true;
@@ -419,7 +410,7 @@ impl Future for Connect {
                 }
             }
         }
-        let result = owner.io.borrow_mut().poll_connect(self.token.unwrap(), cx);
+        let result = owner.with_io(|io, _| io.poll_connect(self.token.unwrap(), &mut waker));
         match result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
@@ -437,10 +428,7 @@ impl Future for Connect {
 impl Drop for Connect {
     fn drop(&mut self) {
         if let (Some(owner), Some(token)) = (&self.owner, self.token.take()) {
-            owner
-                .io
-                .borrow_mut()
-                .abandon_connect(&mut owner.driver.borrow_mut(), token);
+            owner.with_io(|io, driver| io.abandon_connect(driver, token));
         }
     }
 }
@@ -640,12 +628,9 @@ impl Future for Accept<'_> {
             }
         };
         let key = self.listener.socket.key();
-        let result = owner.io.borrow_mut().poll_accept(
-            &mut owner.driver.borrow_mut(),
-            key,
-            &mut self.waiter,
-            cx,
-        );
+        let mut waker = Some(cx.waker().clone());
+        let result =
+            owner.with_io(|io, driver| io.poll_accept(driver, key, &mut self.waiter, &mut waker));
         match result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
@@ -664,10 +649,7 @@ impl Drop for Accept<'_> {
         if let (Some(owner), Some(waiter)) =
             (self.listener.socket.owner.upgrade(), self.waiter.take())
         {
-            owner
-                .io
-                .borrow_mut()
-                .cancel_waiter(self.listener.socket.key(), waiter, true);
+            owner.with_io(|io, _| io.cancel_waiter(self.listener.socket.key(), waiter, true));
         }
     }
 }
@@ -690,12 +672,9 @@ impl Future for Recv<'_> {
             }
         };
         let key = self.socket.key();
-        let result = owner.io.borrow_mut().poll_receive(
-            &mut owner.driver.borrow_mut(),
-            key,
-            &mut self.waiter,
-            cx,
-        );
+        let mut waker = Some(cx.waker().clone());
+        let result =
+            owner.with_io(|io, driver| io.poll_receive(driver, key, &mut self.waiter, &mut waker));
         match result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
@@ -708,10 +687,7 @@ impl Future for Recv<'_> {
 impl Drop for Recv<'_> {
     fn drop(&mut self) {
         if let (Some(owner), Some(waiter)) = (self.socket.owner.upgrade(), self.waiter.take()) {
-            owner
-                .io
-                .borrow_mut()
-                .cancel_waiter(self.socket.key(), waiter, false);
+            owner.with_io(|io, _| io.cancel_waiter(self.socket.key(), waiter, false));
         }
     }
 }
@@ -766,6 +742,7 @@ impl Future for Send<'_> {
                 }
             },
         };
+        let mut waker = Some(cx.waker().clone());
         if self.token.is_none() {
             let data = self.data.take().unwrap();
             if let Some(segment) = self.segment_size {
@@ -791,12 +768,9 @@ impl Future for Send<'_> {
                 segment_size: self.segment_size,
                 group: self.group,
             };
-            match owner.io.borrow_mut().send(
-                &mut owner.driver.borrow_mut(),
-                self.socket.key(),
-                request,
-                cx.waker(),
-            ) {
+            match owner
+                .with_io(|io, driver| io.send(driver, self.socket.key(), request, &mut waker))
+            {
                 Ok(token) => self.token = Some(token),
                 Err(outcome) => {
                     self.done = true;
@@ -804,7 +778,7 @@ impl Future for Send<'_> {
                 }
             }
         }
-        let result = owner.io.borrow_mut().poll_send(self.token.unwrap(), cx);
+        let result = owner.with_io(|io, _| io.poll_send(self.token.unwrap(), &mut waker));
         if result.is_ready() {
             self.token = None;
             self.done = true;
@@ -815,10 +789,7 @@ impl Future for Send<'_> {
 impl Drop for Send<'_> {
     fn drop(&mut self) {
         if let (Some(owner), Some(token)) = (self.owner.as_ref(), self.token.take()) {
-            owner
-                .io
-                .borrow_mut()
-                .abandon_send(&mut owner.driver.borrow_mut(), token);
+            owner.with_io(|io, driver| io.abandon_send(driver, token));
         }
     }
 }
@@ -901,21 +872,14 @@ impl Future for SendAll<'_> {
 impl SendAll<'_> {
     fn release_group(&mut self) {
         if let (Some(owner), Some(group)) = (self.send.socket.owner.upgrade(), self.group.take()) {
-            owner.io.borrow_mut().finish_send_group(
-                &mut owner.driver.borrow_mut(),
-                self.send.socket.key(),
-                group,
-            );
+            owner.with_io(|io, driver| io.finish_send_group(driver, self.send.socket.key(), group));
         }
     }
 }
 impl Drop for SendAll<'_> {
     fn drop(&mut self) {
         if let (Some(owner), Some(token)) = (self.send.owner.as_ref(), self.send.token.take()) {
-            owner
-                .io
-                .borrow_mut()
-                .abandon_send(&mut owner.driver.borrow_mut(), token);
+            owner.with_io(|io, driver| io.abandon_send(driver, token));
         }
         self.release_group();
     }
@@ -1077,12 +1041,9 @@ impl Future for RecvDatagram<'_> {
             }
         };
         let key = self.socket.key();
-        let result = owner.io.borrow_mut().poll_receive(
-            &mut owner.driver.borrow_mut(),
-            key,
-            &mut self.waiter,
-            cx,
-        );
+        let mut waker = Some(cx.waker().clone());
+        let result =
+            owner.with_io(|io, driver| io.poll_receive(driver, key, &mut self.waiter, &mut waker));
         match result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
@@ -1099,10 +1060,7 @@ impl Future for RecvDatagram<'_> {
 impl Drop for RecvDatagram<'_> {
     fn drop(&mut self) {
         if let (Some(owner), Some(waiter)) = (self.socket.owner.upgrade(), self.waiter.take()) {
-            owner
-                .io
-                .borrow_mut()
-                .cancel_waiter(self.socket.key(), waiter, false);
+            owner.with_io(|io, _| io.cancel_waiter(self.socket.key(), waiter, false));
         }
     }
 }
@@ -1138,12 +1096,9 @@ impl Future for RecvBatch<'_> {
         let key = self.socket.key();
         let mut count = 0;
         while count < self.output.len() {
-            let result = owner.io.borrow_mut().poll_receive(
-                &mut owner.driver.borrow_mut(),
-                key,
-                &mut self.waiter,
-                cx,
-            );
+            let mut waker = Some(cx.waker().clone());
+            let result = owner
+                .with_io(|io, driver| io.poll_receive(driver, key, &mut self.waiter, &mut waker));
             match result {
                 Poll::Pending if count == 0 => return Poll::Pending,
                 Poll::Pending => break,
@@ -1158,11 +1113,7 @@ impl Future for RecvBatch<'_> {
                 Poll::Ready(Err(error)) => {
                     // A partial batch remains visible; retain this error for
                     // the next receive rather than hiding it behind the count.
-                    owner.io.borrow_mut().restore_receive_error(
-                        &mut owner.driver.borrow_mut(),
-                        key,
-                        error,
-                    );
+                    owner.with_io(|io, driver| io.restore_receive_error(driver, key, error));
                     break;
                 }
                 Poll::Ready(Ok(None)) => {
@@ -1175,7 +1126,7 @@ impl Future for RecvBatch<'_> {
             }
         }
         if let Some(waiter) = self.waiter.take() {
-            owner.io.borrow_mut().cancel_waiter(key, waiter, false);
+            owner.with_io(|io, _| io.cancel_waiter(key, waiter, false));
         }
         self.done = true;
         Poll::Ready(Ok(count))
@@ -1184,10 +1135,7 @@ impl Future for RecvBatch<'_> {
 impl Drop for RecvBatch<'_> {
     fn drop(&mut self) {
         if let (Some(owner), Some(waiter)) = (self.socket.owner.upgrade(), self.waiter.take()) {
-            owner
-                .io
-                .borrow_mut()
-                .cancel_waiter(self.socket.key(), waiter, false);
+            owner.with_io(|io, _| io.cancel_waiter(self.socket.key(), waiter, false));
         }
     }
 }
@@ -1249,6 +1197,8 @@ impl Future for SendBatch<'_> {
         let key = self.socket.key();
         let mut complete = 0;
         for packet in self.packets.iter_mut() {
+            let mut waker =
+                (packet.data.is_some() || packet.token.is_some()).then(|| cx.waker().clone());
             if let Some(data) = packet.data.take() {
                 let request = SendRequest {
                     data,
@@ -1256,18 +1206,13 @@ impl Future for SendBatch<'_> {
                     segment_size: None,
                     group: None,
                 };
-                match owner.io.borrow_mut().send(
-                    &mut owner.driver.borrow_mut(),
-                    key,
-                    request,
-                    cx.waker(),
-                ) {
+                match owner.with_io(|io, driver| io.send(driver, key, request, &mut waker)) {
                     Ok(token) => packet.token = Some(token),
                     Err(outcome) => packet.outcome = Some(outcome),
                 }
             }
             if let Some(token) = packet.token
-                && let Poll::Ready(outcome) = owner.io.borrow_mut().poll_send(token, cx)
+                && let Poll::Ready(outcome) = owner.with_io(|io, _| io.poll_send(token, &mut waker))
             {
                 packet.token = None;
                 packet.outcome = Some(outcome);
@@ -1289,10 +1234,7 @@ impl Drop for SendBatch<'_> {
         if let Some(owner) = self.owner.as_ref() {
             for packet in self.packets.iter_mut() {
                 if let Some(token) = packet.token.take() {
-                    owner
-                        .io
-                        .borrow_mut()
-                        .abandon_send(&mut owner.driver.borrow_mut(), token);
+                    owner.with_io(|io, driver| io.abandon_send(driver, token));
                 }
             }
         }
@@ -1327,14 +1269,17 @@ impl Future for Splice<'_> {
                 return Poll::Ready(Err(error));
             }
         };
+        let mut waker = Some(cx.waker().clone());
         if self.token.is_none() {
-            match owner.io.borrow_mut().splice(
-                &mut owner.driver.borrow_mut(),
-                self.source.key(),
-                self.destination.key(),
-                self.bytes,
-                cx.waker(),
-            ) {
+            match owner.with_io(|io, driver| {
+                io.splice(
+                    driver,
+                    self.source.key(),
+                    self.destination.key(),
+                    self.bytes,
+                    &mut waker,
+                )
+            }) {
                 Ok(token) => self.token = Some(token),
                 Err(error) => {
                     self.done = true;
@@ -1342,7 +1287,7 @@ impl Future for Splice<'_> {
                 }
             }
         }
-        let result = owner.io.borrow_mut().poll_splice(self.token.unwrap(), cx);
+        let result = owner.with_io(|io, _| io.poll_splice(self.token.unwrap(), &mut waker));
         if result.is_ready() {
             self.token = None;
             self.done = true;
@@ -1353,10 +1298,7 @@ impl Future for Splice<'_> {
 impl Drop for Splice<'_> {
     fn drop(&mut self) {
         if let (Some(owner), Some(token)) = (self.source.owner.upgrade(), self.token.take()) {
-            owner
-                .io
-                .borrow_mut()
-                .abandon_splice(&mut owner.driver.borrow_mut(), token);
+            owner.with_io(|io, driver| io.abandon_splice(driver, token));
         }
     }
 }

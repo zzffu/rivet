@@ -1,7 +1,7 @@
 //! Latest-value broadcast. Updates coalesce; the final unread value remains
 //! observable after the last sender closes. Wait cancellation consumes no update.
 
-use event_listener::Event;
+use super::notification::Event;
 use parking_lot::{RwLock, RwLockReadGuard};
 use std::{
     fmt,
@@ -109,7 +109,7 @@ impl<T> Sender<T> {
             current.version = version;
             previous
         };
-        self.shared.changed.notify(usize::MAX);
+        self.shared.changed.notify_all();
         previous
     }
 
@@ -182,7 +182,7 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if self.shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.shared.changed.notify(usize::MAX);
+            self.shared.changed.notify_all();
         }
     }
 }

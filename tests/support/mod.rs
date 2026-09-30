@@ -9,20 +9,12 @@ pub fn family_count() -> usize {
 
 #[cfg(windows)]
 pub fn registered_udp() -> socket2::Socket {
-    use std::os::windows::io::FromRawSocket;
-    use windows_sys::Win32::Networking::WinSock::*;
-    let raw = unsafe {
-        WSASocketW(
-            AF_INET as i32,
-            SOCK_DGRAM,
-            IPPROTO_UDP,
-            std::ptr::null(),
-            0,
-            WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO | WSA_FLAG_NO_HANDLE_INHERIT,
-        )
-    };
-    assert_ne!(raw, INVALID_SOCKET);
-    let socket = unsafe { socket2::Socket::from_raw_socket(raw as _) };
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM.registered_io(),
+        Some(socket2::Protocol::UDP),
+    )
+    .unwrap();
     socket
         .bind(&socket2::SockAddr::from(
             "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),

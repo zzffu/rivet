@@ -28,15 +28,12 @@ pub mod mpsc {
 
 pub mod watch;
 
-use event_listener::Event;
-use std::{
-    future::{Future, poll_fn},
-    pin::pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    task::Poll,
+pub(crate) mod notification;
+
+use notification::Event;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 /// Sticky cooperative cancellation shared by tasks on any executor.
@@ -64,7 +61,7 @@ impl CancellationToken {
     /// Requests cancellation once and wakes every current waiter.
     pub fn cancel(&self) {
         if !self.state.cancelled.swap(true, Ordering::AcqRel) {
-            self.state.event.notify(usize::MAX);
+            self.state.event.notify_all();
         }
     }
 
@@ -85,10 +82,7 @@ impl CancellationToken {
 /// Dropping a wait does not consume a permit. `notify_waiters` stores no permit.
 #[derive(Debug)]
 pub struct Notify {
-    sender: async_channel::Sender<()>,
-    receiver: async_channel::Receiver<()>,
-    broadcast: Event,
-    generation: AtomicU64,
+    event: Event,
 }
 
 impl Default for Notify {
@@ -99,48 +93,22 @@ impl Default for Notify {
 
 impl Notify {
     pub fn new() -> Self {
-        let (sender, receiver) = async_channel::bounded(1);
         Self {
-            sender,
-            receiver,
-            broadcast: Event::new(),
-            generation: AtomicU64::new(0),
+            event: Event::new(),
         }
     }
 
     /// Wakes one waiter or preserves a single permit for a future waiter.
     pub fn notify_one(&self) {
-        let _ = self.sender.try_send(());
+        self.event.notify_one();
     }
 
     /// Wakes waits that have been polled, without notifying subsequent waits.
     pub fn notify_waiters(&self) {
-        self.generation.fetch_add(1, Ordering::Release);
-        self.broadcast.notify(usize::MAX);
+        self.event.notify_all();
     }
 
     pub async fn notified(&self) {
-        let generation = self.generation.load(Ordering::Acquire);
-        loop {
-            let listener = self.broadcast.listen();
-            if self.generation.load(Ordering::Acquire) != generation {
-                return;
-            }
-            let mut listener = pin!(listener);
-            let mut receive = pin!(self.receiver.recv());
-            let broadcast = poll_fn(|cx| {
-                // A broadcast must not consume an independent stored permit.
-                if listener.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(true);
-                }
-                receive.as_mut().poll(cx).map(|_| false)
-            })
-            .await;
-            if !broadcast {
-                return;
-            }
-            // EventListener forwards unconsumed notifications on cancellation.
-            // The generation prevents a forwarded broadcast waking a new wait.
-        }
+        self.event.listen().await;
     }
 }

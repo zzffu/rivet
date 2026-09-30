@@ -579,6 +579,11 @@ impl Driver {
         let Some(state) = self.sockets.get(socket.0) else {
             return Ok(());
         };
+        let half_close = if state.kind == SocketKind::TcpStream {
+            socket::half_close(state.socket.as_raw_fd())
+        } else {
+            Ok(())
+        };
         let result = socket::cvt(unsafe {
             libc::epoll_ctl(
                 self.epoll.as_raw_fd(),
@@ -621,7 +626,7 @@ impl Driver {
         }
         // No kernel-owned payload references survive any nonblocking syscall.
         drop(state);
-        result
+        result.and(half_close)
     }
 
     pub fn cancel(&mut self, token: Token) -> io::Result<()> {
@@ -755,22 +760,20 @@ impl Driver {
     }
 
     fn configure_udp(&self, fd: RawFd) -> io::Result<()> {
-        // Imported sockets (or host hooks) may carry offload defaults. Plain
-        // send must never inherit implicit segmentation, and GRO must follow
-        // the explicit runtime selection rather than an unrelated fd setting.
-        #[cfg(feature = "udp-gro")]
-        let gro = i32::from(self.capabilities.enabled(Optimization::UdpGro));
-        #[cfg(not(feature = "udp-gro"))]
-        let gro = 0;
-        for (option, desired) in [(udp::UDP_SEGMENT, 0), (udp::UDP_GRO, gro)] {
-            match socket::get_int(fd, libc::IPPROTO_UDP, option) {
-                Ok(current) if current != desired => {
-                    socket::set_int(fd, libc::IPPROTO_UDP, option, desired)?
-                }
-                Ok(_) => {}
-                Err(error) if desired == 0 && error.raw_os_error() == Some(libc::ENOPROTOOPT) => {}
-                Err(error) => return Err(error),
+        // Imported sockets and host hooks may carry offload defaults. Plain
+        // sends must not inherit implicit segmentation. Preserve inherited GRO:
+        // disabling it can hide the boundaries of already queued aggregates.
+        match socket::get_int(fd, libc::IPPROTO_UDP, udp::UDP_SEGMENT) {
+            Ok(current) if current != 0 => {
+                socket::set_int(fd, libc::IPPROTO_UDP, udp::UDP_SEGMENT, 0)?
             }
+            Ok(_) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ENOPROTOOPT) => {}
+            Err(error) => return Err(error),
+        }
+        #[cfg(feature = "udp-gro")]
+        if self.capabilities.enabled(Optimization::UdpGro) {
+            socket::set_int(fd, libc::IPPROTO_UDP, udp::UDP_GRO, 1)?;
         }
         Ok(())
     }
@@ -1145,7 +1148,6 @@ impl Driver {
             iov_base: buffer.as_mut_ptr().cast(),
             iov_len: chunk.min(buffer.capacity()),
         };
-        #[cfg(feature = "udp-gro")]
         let mut control = udp::Control::new();
         let mut message: libc::msghdr = unsafe { mem::zeroed() };
         message.msg_iov = &mut iovec;
@@ -1153,11 +1155,8 @@ impl Driver {
         if kind == SocketKind::Udp {
             message.msg_name = (&mut source as *mut libc::sockaddr_storage).cast();
             message.msg_namelen = mem::size_of_val(&source) as _;
-            #[cfg(feature = "udp-gro")]
-            {
-                message.msg_control = control.as_mut_ptr();
-                message.msg_controllen = control.capacity();
-            }
+            message.msg_control = control.as_mut_ptr();
+            message.msg_controllen = control.capacity();
         }
         let flags = libc::MSG_DONTWAIT
             | if kind == SocketKind::Udp {
@@ -1189,26 +1188,17 @@ impl Driver {
             buffer.set_initialized_len(length.min(iovec.iov_len));
         }
         let metadata = if kind == SocketKind::Udp {
-            #[cfg(feature = "udp-gro")]
-            {
-                if message.msg_flags & libc::MSG_CTRUNC != 0 {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "truncated ancillary data cannot preserve UDP GRO boundaries",
-                    ))
-                } else {
-                    socket::decode(&source, message.msg_namelen).and_then(|peer| {
-                        control
-                            .gro_segment_size(message.msg_controllen)
-                            .map(|segment| (Some(peer), segment))
-                    })
-                }
-            }
-            #[cfg(not(feature = "udp-gro"))]
-            {
-                // configure_udp disables inherited GRO; baseline datagrams do
-                // not need optional ancillary metadata to retain boundaries.
-                socket::decode(&source, message.msg_namelen).map(|peer| (Some(peer), None))
+            if message.msg_flags & libc::MSG_CTRUNC != 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated ancillary data cannot preserve UDP GRO boundaries",
+                ))
+            } else {
+                socket::decode(&source, message.msg_namelen).and_then(|peer| {
+                    control
+                        .gro_segment_size(message.msg_controllen)
+                        .map(|segment| (Some(peer), segment))
+                })
             }
         } else {
             Ok((None, None))

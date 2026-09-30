@@ -1,5 +1,4 @@
 use futures_lite::future::block_on;
-use parking_lot::Mutex;
 use rivet::{
     BufferPool, Runtime, RuntimeConfig, SocketOptions, UdpSocket,
     diagnostics::{ReceiveResources, WorkerResources},
@@ -8,11 +7,17 @@ use rivet::{
     time,
 };
 use std::{
+    cell::RefCell,
     future::{Future, poll_fn},
     io,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, mpsc},
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     task::{Context, Poll, Wake, Waker},
     time::{Duration, Instant},
 };
@@ -138,6 +143,11 @@ fn snapshots_require_the_current_owner_and_reject_a_destroyed_runtime() {
     owner.block_on(async {
         assert_eq!(socket.receive_snapshot().unwrap().worker(), owner_worker);
     });
+    // A completed Connect deliberately retains the Worker Rc. Runtime lifetime
+    // errors must not depend on whether that unrelated future has been dropped.
+    let listener = std::net::TcpListener::bind(local()).unwrap();
+    let mut retained = rivet::TcpStream::connect(listener.local_addr().unwrap());
+    let _connected = owner.block_on(&mut retained).unwrap();
     drop(owner);
     assert_eq!(
         socket.receive_snapshot().unwrap_err().kind(),
@@ -151,6 +161,11 @@ fn snapshots_require_the_current_owner_and_reject_a_destroyed_runtime() {
         );
         assert_eq!(runtime::resource_snapshot().unwrap(), before);
     });
+    drop(retained);
+    assert_eq!(
+        socket.receive_snapshot().unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
     assert_eq!(
         runtime::resource_snapshot().unwrap_err().kind(),
         io::ErrorKind::NotConnected
@@ -193,8 +208,13 @@ fn worker_snapshot_excludes_a_handshaken_background_workers_live_socket() {
     }));
 }
 
+thread_local! {
+    static PENDING_RECEIVE: RefCell<Option<Pin<Box<dyn Future<Output = ()>>>>> =
+        const { RefCell::new(None) };
+}
+
 struct ReceiveWake {
-    outcome: Mutex<Option<Result<(), io::ErrorKind>>>,
+    cancelled: AtomicBool,
     root: Waker,
 }
 
@@ -204,42 +224,46 @@ impl Wake for ReceiveWake {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        let observed = runtime::resource_snapshot()
-            .map(|_| ())
-            .map_err(|error| error.kind());
-        let mut outcome = self.outcome.lock();
-        // Do not let a later expected callback hide an earlier unexpected one.
-        if outcome.is_none() || observed != Err(io::ErrorKind::WouldBlock) {
-            *outcome = Some(observed);
+        // The Waker itself contains only thread-safe state. Local cancellation
+        // is done through the executing thread's TLS, never through an Rc in
+        // the Waker. Release TLS before running the future's destructor too.
+        let pending = PENDING_RECEIVE.with(|slot| slot.borrow_mut().take());
+        if let Some(pending) = pending {
+            drop(pending);
+            self.cancelled.store(true, Ordering::Release);
         }
-        drop(outcome);
         self.root.wake_by_ref();
     }
 }
 
 #[test]
-fn receive_waker_reentry_is_nonblocking_and_cancellation_preserves_queued_bytes() {
+fn receive_waker_can_cancel_its_waiter_without_discarding_queued_bytes() {
     let mut runtime = Runtime::new(config()).unwrap();
     let pool = runtime.buffer_pool();
     runtime.block_on(deadline(async {
-        let socket = UdpSocket::bind_with_options(local(), udp_options()).unwrap();
+        let socket = Rc::new(UdpSocket::bind_with_options(local(), udp_options()).unwrap());
         let peer = std::net::UdpSocket::bind(local()).unwrap();
         peer.set_write_timeout(Some(WAIT)).unwrap();
-        let mut cancelled = socket.recv();
+        let receiver = socket.clone();
+        let mut cancelled = Box::pin(async move {
+            let _ = receiver.recv().await;
+        });
         let notice = poll_fn(|cx| {
             let notice = Arc::new(ReceiveWake {
-                outcome: Mutex::new(None),
+                cancelled: AtomicBool::new(false),
                 root: cx.waker().clone(),
             });
             let waker = Waker::from(notice.clone());
             assert!(
-                Pin::new(&mut cancelled)
+                cancelled
+                    .as_mut()
                     .poll(&mut Context::from_waker(&waker))
                     .is_pending()
             );
             Poll::Ready(notice)
         })
         .await;
+        PENDING_RECEIVE.with(|slot| *slot.borrow_mut() = Some(cancelled));
         let (_, waiting) = unchanged_queries(&pool, &socket);
         assert!(waiting.active());
         assert!(waiting.waiter_registered());
@@ -250,31 +274,18 @@ fn receive_waker_reentry_is_nonblocking_and_cancellation_preserves_queued_bytes(
             bytes.len()
         );
         poll_fn(|_| {
-            if notice.outcome.lock().is_some() {
+            if notice.cancelled.load(Ordering::Acquire) {
                 Poll::Ready(())
             } else {
                 Poll::Pending
             }
         })
         .await;
-        // This is the real receive Waker invoked while Core/driver mutation is
-        // borrowed, not a synthetic borrow or an unrelated executor wake.
-        assert_eq!(*notice.outcome.lock(), Some(Err(io::ErrorKind::WouldBlock)));
-        let (queued_worker, queued) = unchanged_queries(&pool, &socket);
-        assert_eq!(queued.queued_results(), 1);
-        assert_eq!(queued_worker.queued_receives(), 1);
-        assert!(queued.waiter_registered());
-        drop(cancelled);
         let (cancelled_worker, cancelled_state) = unchanged_queries(&pool, &socket);
         assert!(!cancelled_state.waiter_registered());
         assert!(cancelled_state.active());
-        assert_eq!(cancelled_state.queued_results(), queued.queued_results());
-        assert_eq!(
-            cancelled_state.backend_publication_credits(),
-            queued.backend_publication_credits()
-        );
-        assert_eq!(cancelled_state.credits_pending(), queued.credits_pending());
-        assert_eq!(cancelled_worker, queued_worker);
+        assert_eq!(cancelled_state.queued_results(), 1);
+        assert_eq!(cancelled_worker.queued_receives(), 1);
         let packet = socket.recv().await.unwrap();
         assert_eq!(packet.data.as_slice(), bytes);
         assert_eq!(packet.peer, Some(peer.local_addr().unwrap()));

@@ -31,7 +31,7 @@ impl TimerQueue {
             closed: false,
         }
     }
-    pub fn insert(&mut self, deadline: Instant, waker: Waker) -> io::Result<u64> {
+    pub fn insert(&mut self, deadline: Instant, waker: &mut Option<Waker>) -> io::Result<u64> {
         if self.closed {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -46,14 +46,14 @@ impl TimerQueue {
         let token = (u64::from(slot.generation) << 32) | u64::from(index);
         slot.entry = Some(Entry {
             deadline,
-            waker,
+            waker: waker.take().expect("timer insertion requires a waker"),
             heap_index: position,
         });
         self.heap.push(index);
         self.up(position);
         Ok(token)
     }
-    pub fn update(&mut self, token: u64, waker: &Waker) -> bool {
+    pub fn update(&mut self, token: u64, waker: &mut Option<Waker>) -> bool {
         let Some(slot) = self.slots.get_mut(token as u32 as usize) else {
             return false;
         };
@@ -63,8 +63,8 @@ impl TimerQueue {
         let Some(entry) = slot.entry.as_mut() else {
             return false;
         };
-        if !entry.waker.will_wake(waker) {
-            entry.waker = waker.clone();
+        if !entry.waker.will_wake(waker.as_ref().unwrap()) {
+            std::mem::swap(&mut entry.waker, waker.as_mut().unwrap());
         }
         true
     }
@@ -88,19 +88,14 @@ impl TimerQueue {
         }
         true
     }
-    pub fn remove(&mut self, token: u64) {
+    pub fn remove(&mut self, token: u64) -> Option<Waker> {
         let index = token as u32 as usize;
-        let Some(slot) = self.slots.get(index) else {
-            return;
-        };
+        let slot = self.slots.get(index)?;
         if slot.generation != (token >> 32) as u32 {
-            return;
+            return None;
         }
-        let Some(entry) = slot.entry.as_ref() else {
-            return;
-        };
-        let position = entry.heap_index;
-        self.remove_at(position);
+        let position = slot.entry.as_ref()?.heap_index;
+        Some(self.remove_at(position))
     }
     fn remove_at(&mut self, position: usize) -> Waker {
         let index = self.heap.swap_remove(position);
@@ -181,21 +176,21 @@ impl TimerQueue {
             .first()
             .map(|&i| self.slots[i as usize].entry.as_ref().unwrap().deadline)
     }
-    pub fn expire(&mut self, now: Instant, budget: usize) {
-        for _ in 0..budget {
-            if self.next_deadline().is_none_or(|deadline| deadline > now) {
-                break;
-            }
-            self.remove_at(0).wake();
+    pub fn expire(&mut self, now: Instant) -> Option<Waker> {
+        if self.next_deadline().is_none_or(|deadline| deadline > now) {
+            return None;
         }
+        Some(self.remove_at(0))
     }
     pub fn is_closed(&self) -> bool {
         self.closed
     }
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self) -> Option<Waker> {
         self.closed = true;
-        while !self.heap.is_empty() {
-            self.remove_at(0).wake();
+        if self.heap.is_empty() {
+            None
+        } else {
+            Some(self.remove_at(0))
         }
     }
 }
@@ -225,6 +220,21 @@ mod tests {
         }
     }
 
+    fn expire(timers: &mut TimerQueue, now: Instant, budget: usize) {
+        for _ in 0..budget {
+            let Some(waker) = timers.expire(now) else {
+                break;
+            };
+            waker.wake();
+        }
+    }
+
+    fn clear(timers: &mut TimerQueue) {
+        while let Some(waker) = timers.clear() {
+            waker.wake();
+        }
+    }
+
     #[test]
     fn reset_moves_deadlines_in_both_heap_directions() {
         let now = Instant::now();
@@ -233,27 +243,36 @@ mod tests {
         let second = Arc::new(WakeCount::default());
         let third = Arc::new(WakeCount::default());
         let first_token = timers
-            .insert(now + Duration::from_secs(20), Waker::from(first.clone()))
+            .insert(
+                now + Duration::from_secs(20),
+                &mut Some(Waker::from(first.clone())),
+            )
             .unwrap();
         timers
-            .insert(now + Duration::from_secs(30), Waker::from(second.clone()))
+            .insert(
+                now + Duration::from_secs(30),
+                &mut Some(Waker::from(second.clone())),
+            )
             .unwrap();
         let third_token = timers
-            .insert(now + Duration::from_secs(40), Waker::from(third.clone()))
+            .insert(
+                now + Duration::from_secs(40),
+                &mut Some(Waker::from(third.clone())),
+            )
             .unwrap();
 
         assert!(timers.reset(third_token, now + Duration::from_secs(10)));
-        timers.expire(now + Duration::from_secs(9), 3);
+        expire(&mut timers, now + Duration::from_secs(9), 3);
         assert_eq!((first.count(), second.count(), third.count()), (0, 0, 0));
-        timers.expire(now + Duration::from_secs(10), 3);
+        expire(&mut timers, now + Duration::from_secs(10), 3);
         assert_eq!((first.count(), second.count(), third.count()), (0, 0, 1));
 
         assert!(timers.reset(first_token, now + Duration::from_secs(50)));
-        timers.expire(now + Duration::from_secs(30), 3);
+        expire(&mut timers, now + Duration::from_secs(30), 3);
         assert_eq!((first.count(), second.count(), third.count()), (0, 1, 1));
-        timers.expire(now + Duration::from_secs(49), 3);
+        expire(&mut timers, now + Duration::from_secs(49), 3);
         assert_eq!(first.count(), 0);
-        timers.expire(now + Duration::from_secs(50), 3);
+        expire(&mut timers, now + Duration::from_secs(50), 3);
         assert_eq!(first.count(), 1);
         assert!(timers.next_deadline().is_none());
     }
@@ -266,7 +285,7 @@ mod tests {
         let wakes = Arc::new(WakeCount::default());
         let waker = Waker::from(wakes.clone());
         let token = timers
-            .insert(now + Duration::from_secs(10), waker.clone())
+            .insert(now + Duration::from_secs(10), &mut Some(waker.clone()))
             .unwrap();
         for iteration in 0..8192 {
             let seconds = if iteration % 2 == 0 { 5 } else { 10 };
@@ -275,20 +294,25 @@ mod tests {
         assert_eq!(timers.heap.len(), 1);
         assert_eq!(timers.heap.capacity(), heap_capacity);
         assert_eq!(
-            timers.insert(now, waker.clone()).unwrap_err().kind(),
+            timers
+                .insert(now, &mut Some(waker.clone()))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::WouldBlock
         );
-        timers.expire(now + Duration::from_secs(9), 1);
+        expire(&mut timers, now + Duration::from_secs(9), 1);
         assert_eq!(wakes.count(), 0);
-        timers.expire(now + Duration::from_secs(10), 1);
+        expire(&mut timers, now + Duration::from_secs(10), 1);
         assert_eq!(wakes.count(), 1);
 
-        timers.insert(now + Duration::from_secs(20), waker).unwrap();
+        timers
+            .insert(now + Duration::from_secs(20), &mut Some(waker))
+            .unwrap();
         assert!(!timers.reset(token, now));
-        timers.remove(token);
-        timers.expire(now + Duration::from_secs(19), 1);
+        drop(timers.remove(token));
+        expire(&mut timers, now + Duration::from_secs(19), 1);
         assert_eq!(wakes.count(), 1);
-        timers.expire(now + Duration::from_secs(20), 1);
+        expire(&mut timers, now + Duration::from_secs(20), 1);
         assert_eq!(wakes.count(), 2);
     }
 
@@ -297,13 +321,18 @@ mod tests {
         let mut timers = TimerQueue::new(1);
         let wakes = Arc::new(WakeCount::default());
         let waker = Waker::from(wakes.clone());
-        timers.insert(Instant::now(), waker.clone()).unwrap();
-        timers.clear();
-        timers.clear();
+        timers
+            .insert(Instant::now(), &mut Some(waker.clone()))
+            .unwrap();
+        clear(&mut timers);
+        clear(&mut timers);
         assert_eq!(wakes.count(), 1);
         assert!(timers.is_closed());
         assert_eq!(
-            timers.insert(Instant::now(), waker).unwrap_err().kind(),
+            timers
+                .insert(Instant::now(), &mut Some(waker))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::BrokenPipe
         );
     }

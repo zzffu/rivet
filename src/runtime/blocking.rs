@@ -106,6 +106,7 @@ impl<T> Future for BlockingJoinHandle<T> {
     type Output = Result<T, JoinError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut replacement = Some(cx.waker().clone());
         let mut state = self.cell.state.lock();
         if let Some(result) = state.result.take() {
             return Poll::Ready(result);
@@ -119,7 +120,7 @@ impl<T> Future for BlockingJoinHandle<T> {
             .as_ref()
             .is_some_and(|waiter| waiter.will_wake(cx.waker()))
         {
-            let previous = state.waiter.replace(cx.waker().clone());
+            let previous = std::mem::replace(&mut state.waiter, replacement.take());
             drop(state);
             drop_safely(previous);
         }
@@ -391,7 +392,7 @@ pub(super) fn ignore_panic(action: impl FnOnce()) {
 pub(super) fn drop_safely<T>(value: T) {
     ignore_panic(|| drop(value));
 }
-fn discard_panic(panic: Box<dyn Any + Send>) {
+pub(super) fn discard_panic(panic: Box<dyn Any + Send>) {
     // A panic payload can itself have a panicking destructor. Do not let that
     // second panic bypass the rest of shutdown or kill a pool thread.
     if let Err(nested) = catch_unwind(AssertUnwindSafe(|| drop(panic))) {

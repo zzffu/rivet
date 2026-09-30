@@ -102,3 +102,13 @@ fn linux_only_capabilities_are_strict_or_explicitly_auto_unavailable() {
 fn udp_offload_preserves_boundaries_when_the_real_probe_succeeds() {
     smoke::udp_offload().expect("selected Android UDP offload semantics");
 }
+
+#[test]
+fn imported_udp_gro_preserves_prequeued_boundaries_with_off_policy() {
+    if smoke::imported_udp_gro()
+        .expect("inherited Android GRO semantics with Off policy")
+        .is_none()
+    {
+        eprintln!("native UDP_GRO or UDP_SEGMENT option is unsupported; inherited GRO skipped");
+    }
+}

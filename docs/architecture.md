@@ -70,9 +70,11 @@ Driver 是内部 Interface；公开 Interface 不暴露内核队列、buffer ID 
 
 标准 Waker 必须线程安全。不得用 `Rc` 构造可跨线程使用的 Waker，不得通过错误的 `unsafe Send` 迁移本地状态。任务销毁也发生在归属 worker。
 
+Core 先处理完整完成批次并更新绝对发布额度，再释放 Core／driver／事件表借用并分发有界、带代际身份的唤醒。取消和消费会移除旧唤醒源；回调内的 I/O 不递归展开剩余批次。计时器先移除节点和归还额度，再在借用外唤醒。Waker 的 clone／wake／drop 均可能运行用户代码，不能跨这些调用持有上述借用或等待者锁。
+
 任务放置的负载快照只是候选提示。候选 worker 的活跃状态复核、资源准入和工厂入队使用同一 inbox 锁，与 worker 0 退出 `block_on` 的失活转换串行化；候选失活或满额时，在一次有界扫描内尝试其他 worker。不能因一个候选失活而忽略仍可用的后台 worker，也不能在锁内销毁用户工厂。
 
-任务生命周期从尚未调用的工厂开始。取消和 Runtime shutdown 均在所属线程销毁捕获值，并隔离其析构 panic；一个工厂清理失败不能阻断后续任务清理或泄漏准入额度。
+任务生命周期从尚未调用的工厂开始。取消和 Runtime shutdown 均在所属线程销毁捕获值，并隔离其析构 panic；一个工厂清理失败不能阻断后续任务清理或泄漏准入额度。panic payload 自身的析构再次 panic，也不得绕过任务回执、任务组结果排空或准入回收。
 
 Linux Driver 区分“等待完成或资源”和“SQ 满导致尚欠提交”。只有后者要求继续非阻塞推进，包括数据操作、取消和唤醒请求；额度不足、缓冲区不足和未到重试期限不能因此变成无限自旋。
 
@@ -143,7 +145,7 @@ Windows 单 UDP socket 的 RIO 分区报告已准入 lane、完成后待发布�
 
 成功查询只读现有 owner-local 状态：不分配、复制 payload、持有全局锁、增加逐包原子计数或调用 OS；不 poll、回收、试分配、重投、消耗 credits 或唤醒任务。池扫描 free extents，worker 扫描有界 socket／operation 表，单 RIO socket 只遍历自己的 lane；成本按需发生，不维护成功 I/O 的镜像统计。查询返回值可跨线程传递，但不因此使 Runtime／socket／lease 可迁移。跨 worker 采集不是同一时刻的原子视图，时间戳、序列化、展示和告警属于调用方。
 
-验收围绕可见转移：字节足够但 lease 耗尽、总空闲足够但连续 extent 不足、provider 拒绝回收、旧 RX 租约阻止补挂及释放后恢复、已排队 waiter 取消、关闭后的 native 退役、join 结果继续拥有租约，以及重入查询明确失败。查询前后资源和交付行为必须相同，重复成功查询必须无分配。Windows 原生回环与各平台编译／原生证据分别记录，不用静态检查冒充 native 生命周期证明。
+验收围绕可见转移：字节足够但 lease 耗尽、总空闲足够但连续 extent 不足、provider 拒绝回收、旧 RX 租约阻止补挂及释放后恢复、已排队 waiter 取消、关闭后的 native 退役和 join 结果继续拥有租约。仅实际借用冲突时查询返回 `WouldBlock`；借用已释放的完成回调可以查询及取消等待者，不把特定回调时机固定成错误。查询前后资源和交付行为必须相同，重复成功查询必须无分配。Windows 原生回环与各平台编译／原生证据分别记录，不用静态检查冒充 native 生命周期证明。
 
 关闭轮询可能在同一轮软件 service 中释放最后一个尚未投递的窗口，且不生成应用完成事件。Windows 在 shutdown 期间必须于进入 IOCP 等待前再次确认 driver 是否已经 idle；已收敛时只做非阻塞收割，不能等待一个再也不会到达的完成。该检查不把正常 idle 运行改成自旋，也不伪造 native 完成或释放。
 
@@ -214,7 +216,7 @@ Linux 的配置表保存调用者覆盖：未指定项继承均衡、空闲可�
 
 外部 socket 使用拥有型平台句柄传入。成功后由运行时负责关闭；失败返回原句柄和错误。导入时验证类型、状态和后端约束，不偷偷重建连接。内部用于新连接初始分配的 idle socket 移交与任意运行中迁移不同；有数据 I/O 的对象不得未经完整收敛就迁移。
 
-Linux 的 UDP 分段元数据解析属于数据报语义，不属于可选的优化启用策略。接管时保留已有 GRO 设置及队列，所有构建均解析内核返回的 `UDP_GRO` 元数据并还原数据报；`udp-gro` feature 与策略只控制运行时主动启用该优化。
+Linux／Android 的 UDP 分段元数据解析属于数据报语义，不属于可选的优化启用策略。接管时保留已有 GRO 设置及队列，所有构建均解析内核返回的 `UDP_GRO` 元数据并还原数据报；`udp-gro` feature 与策略只控制运行时主动启用该优化。不能通过关闭 GRO 假定既有队列已重新分段，也不承诺不同发送 socket 之间的 UDP 全局到达顺序。
 
 Android 允许指定 Network，并提供连接/首次发送前的宿主保护钩子。宿主负责 Android 权限和 Java/JNI 对象生命周期。保护或绑定失败必须阻止继续连接。核心不附带 Kotlin SDK、VPN 应用、TUN 或后台保活机制。
 
@@ -233,6 +235,8 @@ Runtime 拥有独立阻塞池；`RuntimeConfig` 指定线程上限和排队上�
 `io` Module 为每个 Runtime 管理有界原生注册表，独立于 TCP/UDP driver。Linux/Android 提供拥有型 `AsyncFd`：仅接管可轮询的非阻塞描述符，分别等待读/写 readiness，通过同步 `try_io` 闭包执行实际操作；`WouldBlock` 清除相应 readiness 后重新等待。Windows 提供拥有型 `AsyncHandle`，异步等待原生可等待对象；不把普通文件或任意 HANDLE 冒充 socket 或异步文件。
 
 注册返回前验证容量和原生句柄；失败返还所有权。事件使用不可复用的代际身份，避免迟到通知命中复用的描述符。取消等待不关闭描述符，也不丢掉尚未消费的 readiness；关闭或 Runtime 停止注销原生等待并唤醒等待者。注册表按需使用共享原生等待设施，不为每个 FD 创建线程。Unix 非 socket readiness 的专用等待路径不是 Linux TCP/UDP 的 epoll 回退。
+
+注销先完成原生删除和关闭状态发布，再释放注册表 lifecycle 锁并通知等待者。Unix helper 在自己的回调中关闭注册表时不能 join 自身；Windows threadpool callback 在结束原生访问并保留独立 Entry 所有权后 disassociate，再调用用户 Waker。close 等待原生访问收敛，不要求已经脱离原生资源的用户回调在返回前结束。
 
 ### 8.3 TCP 中止
 
@@ -253,6 +257,8 @@ abort／Drop 是取消请求；join 证明子任务 Future／captures 的析构�
 ### 8.5 执行器无关的同步
 
 `sync` Module 选用成熟、执行器无关的有界 channel、oneshot、Mutex、RwLock 和 Semaphore 实现，不重写其竞争算法。补充 watch 最新值广播、Notify 和协作 `CancellationToken`。所有等待通过标准 Waker；注册等待与再次检查状态必须闭合丢失唤醒窗口。channel 背压、关闭后排空、watch 合并更新、Notify 单个保留许可与取消广播分别具有明确契约。同步原语不需要当前 Runtime，也不把 `!Send` payload 伪装成可跨线程数据。
+
+watch、Notify、CancellationToken 及非 socket 等待共用私有的 pinned 监听器通知 Module；监听器随 Future 存储，通知和取消不额外分配。摘链、代际与许可状态先在短锁内完成，锁外执行 Waker；唤醒后不再访问原节点或缓存的 next 指针。广播以既有代际为界，回调新注册的等待者不属于旧广播，取消单次通知不会消费保留许可。公开的 async-channel／async-lock／futures-channel 类型仍直接重导出，不替换其类型身份。
 
 ### 8.6 定时器
 

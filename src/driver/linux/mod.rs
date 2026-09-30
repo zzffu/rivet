@@ -3006,6 +3006,12 @@ impl Driver {
                 return Ok(true);
             }
             if !stopping {
+                let entry = self.sockets.get_mut(socket.0).unwrap();
+                if entry.accept_credits == 0 {
+                    self.schedule(key);
+                    return Ok(false);
+                }
+                entry.accept_credits -= 1;
                 events.push(Event::Accepted {
                     token,
                     result: Err(io::Error::from_raw_os_error(errno)),
@@ -3095,22 +3101,27 @@ impl Driver {
         let use_zc = op.use_zc;
         let udp = self.sockets.get(socket.0).unwrap().kind == SocketKind::Udp;
         if cqe.res < 0 {
+            let errno = -cqe.res;
+            let retry = matches!(
+                errno,
+                libc::ECANCELED
+                    | libc::ENOBUFS
+                    | libc::ENOMEM
+                    | libc::ENOSPC
+                    | libc::EAGAIN
+                    | libc::EINTR
+            );
+            if !stopping && !retry && self.sockets.get(socket.0).unwrap().receive_credits == 0 {
+                self.schedule(key);
+                return Ok(false);
+            }
+            // A deferred error still owns its selected range until publication
+            // or explicit stop; replay must not recycle it a second time.
             #[cfg(feature = "provided-buffers")]
-            if let Some(range) = pending.provided {
+            if let Some(range) = pending.provided.take() {
                 self.provided.as_ref().unwrap().discard(range);
             }
-            let errno = -cqe.res;
-            if !stopping
-                && matches!(
-                    errno,
-                    libc::ECANCELED
-                        | libc::ENOBUFS
-                        | libc::ENOMEM
-                        | libc::ENOSPC
-                        | libc::EAGAIN
-                        | libc::EINTR
-                )
-            {
+            if !stopping && retry {
                 if errno != libc::ECANCELED {
                     self.op_mut(key).unwrap().retry_at =
                         Some(Instant::now() + Duration::from_millis(1));
@@ -3119,6 +3130,7 @@ impl Driver {
                 return Ok(true);
             }
             if !stopping {
+                self.sockets.get_mut(socket.0).unwrap().receive_credits -= 1;
                 events.push(Event::Received {
                     token,
                     result: Err(io::Error::from_raw_os_error(errno)),
@@ -3807,5 +3819,225 @@ mod selection_tests {
             rebuilt.state(Optimization::ZcRx).unwrap().reason.as_deref(),
             Some("registered IFQ failed"),
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use std::process::{Child, Command};
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Retirement regressions must not hang the test runner if Driver::drop
+    // waits forever for a completion incorrectly retained at zero credits.
+    fn isolated(test: &str) -> bool {
+        const CHILD: &str = "RIVET_LINUX_COMPLETION_CHILD";
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::{test}");
+        if std::env::var(CHILD).ok().as_deref() == Some(test.as_str()) {
+            return true;
+        }
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, &test)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "{test} failed: {status}");
+                return false;
+            }
+            assert!(Instant::now() < deadline, "{test} did not retire");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn driver(features: &[Optimization]) -> Driver {
+        let mut config = RuntimeConfig::single_thread();
+        for &optimization in Optimization::ALL {
+            config = config.with_policy(optimization, Policy::Off);
+        }
+        for &optimization in features {
+            config = config.enable(optimization);
+        }
+        config.limits.max_tasks = 8;
+        config.limits.max_sockets = 8;
+        config.limits.max_operations = 16;
+        config.limits.max_pending_receives = 2;
+        config.limits.max_pending_accepts = 2;
+        config.limits.completion_budget = 64;
+        config.limits.pool.bytes = 1024 * 1024;
+        config.limits.pool.block_size = 4096;
+        config.limits.pool.max_leases = 16;
+        config.linux.sq_entries = 8;
+        config.linux.cq_entries = 32;
+        let pool = BufferPool::new(config.limits.pool).unwrap();
+        Driver::new(
+            &config,
+            0,
+            pool,
+            Arc::new(Notifier::new().unwrap()),
+            Arc::new(Shared::new(1)),
+        )
+        .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum End {
+        Publish,
+        Cancel,
+        Shutdown,
+    }
+
+    #[test]
+    fn accept_error_waits_for_credit_and_retires() {
+        if !isolated("accept_error_waits_for_credit_and_retires") {
+            return;
+        }
+        for end in [End::Publish, End::Cancel, End::Shutdown] {
+            let mut driver = driver(&[]);
+            let socket = driver
+                .listen("127.0.0.1:0".parse().unwrap(), &SocketOptions::default())
+                .unwrap();
+            // A shut-down listener produces a real, deterministic EINVAL CQE.
+            driver.shutdown(socket.id, Shutdown::Read).unwrap();
+            let token = Token(1);
+            driver.start_accept(socket.id, token).unwrap();
+            driver.accept_capacity(socket.id, 1).unwrap();
+            let key = driver.tokens[&token];
+            let mut events = Vec::with_capacity(64);
+            driver.drive_ready(&mut events, 64).unwrap();
+            driver.ring.wait(Some(Duration::from_secs(1))).unwrap();
+            let cqe = driver.ring.pop().expect("missing native accept error");
+            driver.enqueue_completion(cqe).unwrap();
+            assert_eq!(cqe.user_data, key);
+            assert_eq!(cqe.res, -libc::EINVAL);
+            assert!(!driver.op(key).unwrap().native_pending);
+            assert_eq!(driver.sockets.get(socket.id.0).unwrap().native_pending, 0);
+
+            driver.accept_capacity(socket.id, 0).unwrap();
+            for _ in 0..3 {
+                driver.poll(Some(Duration::ZERO), &mut events).unwrap();
+                assert!(events.is_empty());
+                assert_eq!(driver.deferred.len(), 1);
+                let op = driver.op(key).unwrap();
+                assert_eq!(op.pending, 1);
+                assert_eq!(op.completed_sequence, 0);
+                assert!(!op.finished);
+            }
+            match end {
+                End::Publish => driver.accept_capacity(socket.id, 2).unwrap(),
+                End::Cancel => driver.cancel(token).unwrap(),
+                End::Shutdown => driver.begin_shutdown(),
+            }
+            driver.poll(Some(Duration::ZERO), &mut events).unwrap();
+            if matches!(end, End::Publish) {
+                let Event::Accepted {
+                    token: actual,
+                    result: Err(error),
+                } = &events[0]
+                else {
+                    panic!("retained accept error was not published");
+                };
+                assert_eq!(*actual, token);
+                assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+                assert_eq!(driver.sockets.get(socket.id.0).unwrap().accept_credits, 1);
+                events.remove(0);
+            }
+            assert!(matches!(
+                events.as_slice(),
+                [Event::Stopped { token: actual, result: Ok(()) }] if *actual == token
+            ));
+            assert!(driver.op(key).is_none());
+            assert!(driver.is_idle());
+            assert_eq!(
+                driver.free_operations.len(),
+                driver.config.limits.max_operations
+            );
+        }
+    }
+
+    #[cfg(feature = "provided-buffers")]
+    #[test]
+    fn receive_error_retains_selected_buffer_until_publication_or_stop() {
+        if !isolated("receive_error_retains_selected_buffer_until_publication_or_stop") {
+            return;
+        }
+        for end in [End::Publish, End::Cancel, End::Shutdown] {
+            let mut driver = driver(&[Optimization::ProvidedBuffers]);
+            let socket = driver
+                .bind_udp("127.0.0.1:0".parse().unwrap(), None, &SocketOptions::udp())
+                .unwrap();
+            let token = Token(1);
+            driver.start_recv(socket.id, token).unwrap();
+            let key = driver.tokens[&token];
+            // Exercise the native boundary where an error still carries an
+            // owned buffer selection. No native receive is submitted here.
+            driver
+                .enqueue_completion(Cqe {
+                    user_data: key,
+                    res: -libc::ECONNRESET,
+                    flags: IORING_CQE_F_BUFFER,
+                    ..Cqe::default()
+                })
+                .unwrap();
+            let mut events = Vec::with_capacity(64);
+            for _ in 0..3 {
+                driver.drain_deferred(&mut events, 64).unwrap();
+                driver.drive_ready(&mut events, 64).unwrap();
+                assert!(events.is_empty());
+                assert_eq!(driver.deferred.len(), 1);
+                let op = driver.op(key).unwrap();
+                assert_eq!(op.pending, 1);
+                assert_eq!(op.completed_sequence, 0);
+                assert!(!op.finished);
+                assert_eq!(driver.provided.as_mut().unwrap().flush(), 0);
+            }
+            match end {
+                End::Publish => driver.receive_capacity(socket.id, 2).unwrap(),
+                End::Cancel => driver.cancel(token).unwrap(),
+                End::Shutdown => driver.begin_shutdown(),
+            }
+            driver.drain_deferred(&mut events, 64).unwrap();
+            assert_eq!(driver.op(key).unwrap().pending, 0);
+            assert_eq!(driver.op(key).unwrap().completed_sequence, 1);
+            assert_eq!(driver.provided.as_mut().unwrap().flush(), 1);
+            assert_eq!(driver.provided.as_mut().unwrap().flush(), 0);
+            driver.drive_ready(&mut events, 64).unwrap();
+            if matches!(end, End::Publish) {
+                let Event::Received {
+                    token: actual,
+                    result: Err(error),
+                } = &events[0]
+                else {
+                    panic!("retained receive error was not published");
+                };
+                assert_eq!(*actual, token);
+                assert_eq!(error.raw_os_error(), Some(libc::ECONNRESET));
+                assert_eq!(driver.sockets.get(socket.id.0).unwrap().receive_credits, 1);
+                events.remove(0);
+            }
+            assert!(matches!(
+                events.as_slice(),
+                [Event::Stopped { token: actual, result: Ok(()) }] if *actual == token
+            ));
+            assert!(driver.op(key).is_none());
+            assert!(driver.is_idle());
+            assert_eq!(
+                driver.free_operations.len(),
+                driver.config.limits.max_operations
+            );
+        }
     }
 }

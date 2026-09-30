@@ -161,7 +161,8 @@ impl<T> TaskGroup<T> {
         self.closing = true;
         self.abort_all();
         while let Some(result) = self.join_next().await {
-            if catch_unwind(AssertUnwindSafe(|| drop(result))).is_err() {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(result))) {
+                super::blocking::discard_panic(panic);
                 self.shutdown_error = Some(JoinError::Panicked);
             }
         }

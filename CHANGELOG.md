@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- 修复全库审查复现的回调重入问题：Core 在完整完成批次和额度更新后通过有界、带代际身份的唤醒源交付通知；计时器释放节点后唤醒；Waker clone／wake／drop 不再跨内部借用。自有同步及非 socket 等待改用私有 pinned 通知 Module，移除直接 `event-listener` 依赖，保留公开 async-* 类型；注销在 lifecycle 锁外通知，原生 helper／threadpool 回调可关闭自身而不 self-join。
+- 修复执行／工厂／析构 panic 的 payload 再次 panic 时绕过完成发布的问题；任务组继续排空失败结果，取消分类和准入回收不变。socket 根据实际停止状态返回 `BrokenPipe`，不再由保留的完成 Future 是否持有 Worker 强引用决定错误类别。
+- Linux 接收／接受错误同样消耗发布额度；零额度保留终态错误及其 selected-buffer 所有权，停止时仍可退役，避免远端 RST 触发 Core 队列断言或重放时重复回收。UDP 元数据回归移除已由原生 socket 反证的跨发送者全局到达顺序假设，继续逐包检查内容、来源、原长、截断、唯一性和保留租约。
+- Android 所有 feature 配置均保留并解析导入队列的 GRO 元数据；普通 TCP Drop 在宿主仍持有 FD 别名时发起写半关闭，idle handoff 和 abort/RST 不变。Windows RIO 导入保留原生错误码与失败 socket；registered-I/O 测试 helper 独立初始化 Winsock，跨 Runtime 重试不再依赖其他测试顺序。
+- 修复前冻结消费者及独立回归证实上述十项问题，修复后外部消费者通过。Windows IPv4 默认及全 feature／all-targets 各 163 项通过；隔离 Linux 6.18.54-1-lts TCG guest 的全 feature／精简构建分别 184／151 项通过；Android API37／x86_64／16KiB 页 shell 下两种构建各 159 项通过，普通 App 的 20 项场景通过，包含新增 GRO 与别名 FIN/RST 场景。原生、编译及环境限制详见 README 本轮证据；保留失败日志和 guest 校验报告，不以 WSL 的 GRO 输入前置条件失败冒充库路径失败或跳过后成功。
+
 - 按系统架构与实现契约新增按需、只读的 `BufferPool::usage()`、当前 worker 的 `runtime::resource_snapshot()` 和单个 UDP 的 `receive_snapshot()`。结果类型集中在 `diagnostics`，采用私有字段和 getter；不增加全局聚合、后台采样、资源租约或公开构造义务，保持 0.2.x 的源兼容边界。
 - 快照区分普通 payload／lease 元数据／待回收、逻辑队列／原生占用／关闭退休，以及 RIO 窗口中的 ready、idle、最近分配受阻和真实重投分配失败累计值。Linux 原生占用同时考虑尚未释放的 ZC 内存 guard；Android 不伪造异步内核占用，平台无对应语义时返回 `None`。成功采集不分配、不执行 I/O、不推进回收、不触发回调；worker／driver 正在可变借用的重入查询返回 `WouldBlock`，而不是借用 panic。
 - 资源回归发现并修复 Windows teardown 的无限等待：软件服务可在没有完成事件时退休最后一个未投递接收窗口；关闭中的 driver 已 idle 时，`poll` 不再无限等待 IOCP。保留触发旧行为的原生回归，不伪造完成、不提前释放 kernel guard，也不改变正常空闲休眠。

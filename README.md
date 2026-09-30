@@ -79,6 +79,7 @@ fn main() -> io::Result<()> {
 - `JoinHandle` 丢弃会取消任务；需要独立运行时显式 `detach()`。Future 与已准入但未启动的工厂捕获值均在所属线程销毁，之后才发布完成结果。取消／shutdown 隔离其析构 panic，仍报告 `Cancelled`；执行或正常完成时的析构 panic 报告 `Panicked`。
 - `runtime::buffer_pool()` 返回当前 worker 已有的池，适用于自动放置的工厂；不要为每个数据包创建新池。
 - 任务、socket、操作、接收队列和池均有界。不可寻址的接收／接受／完成队列容量在配置阶段返回 `InvalidInput`。`idle_spin` 默认零；可选自旋受时间预算及下一定时器期限约束。
+- 网络完成、计时器及自有同步／原生等待通知在内部借用和锁释放后执行用户 Waker，支持回调同步取消等待者。panic payload 的析构再次 panic 也不会跳过任务结果发布或任务组排空。保留已完成操作 Future 不会延长 Runtime 的运行状态，销毁后的 socket 仍返回 `BrokenPipe`。
 
 ## 面向上层库的原生 trait
 
@@ -140,10 +141,13 @@ where
 - Linux／Android：`io::AsyncFd::import(OwnedFd)` 接管已经非阻塞、可轮询的 FD。`readable`／`writable` 等待 readiness；`try_io(Interest, closure)` 临时借出 `BorrowedFd`，遇到 `WouldBlock` 清除对应 readiness。闭包不得关闭／保留句柄、改变非阻塞模式或执行阻塞工作。该专用等待路径不是 TCP／UDP 的 epoll 回退。
 - Windows：`io::AsyncHandle::import(OwnedHandle)` 支持具有 `SYNCHRONIZE` 权限的 Event、Semaphore、Timer、Process、Thread、Job。`wait` 缓存自动复位对象已经取得的通知，取消等待不会丢掉该通知；持续 signaled 不导致后台自旋。不接受普通文件和拥有线程归属的 mutex。
 - 对象保持 `!Send/!Sync`。等待 Future 不借用对象；`close`／Runtime 停止会唤醒它并返回 `BrokenPipe`。取消等待不关闭对象。Runtime 停止注销等待；外部对象仍拥有的句柄在该对象析构时释放。
+- 注销／关闭不会在注册表 lifecycle 锁内唤醒用户。Windows close 等待原生访问结束；已 disassociate、仅持有独立等待状态的用户 Waker 可以稍后返回，不再访问已关闭的 HANDLE。
 
 ### 协调、计时与退出事件
 
 `sync` 不要求当前 Runtime：提供有界 `mpsc::bounded`、`oneshot`、`Mutex`、`RwLock`、`Semaphore`、`watch::channel`、`Notify` 和 `CancellationToken`。channel／锁复用执行器无关的成熟实现；不是 Tokio 兼容层。watch 合并更新，最后发送者关闭后仍可读取最终未读值；不要跨 `.await` 持有同步 watch 借用。Notify 保存至多一个单次通知许可，`notify_waiters` 只唤醒已经开始等待的调用。
+
+自有 watch／Notify／CancellationToken 和非 socket 等待共用私有、无每次等待分配的 pinned 监听器通知实现，Waker 的 clone／wake／drop 均在锁外；公开 channel／锁／oneshot 的依赖类型不变。广播不会覆盖回调中新建的等待，取消单次等待不会消费尚未交付的许可。
 
 `Sleep::reset(Instant)` 原位调整计时器，完成后也能复用。`time::interval`／`interval_at` 返回周期计时器，`tick` 返回计划时刻；取消等待不消费 tick。`MissedTickBehavior` 支持 `Burst`、`Skip`、`Delay`，默认 `Skip`；零周期和时间溢出报错。
 
@@ -275,7 +279,7 @@ fn observe(udp: &rivet::UdpSocket) -> std::io::Result<()> {
 - native outstanding 计尚待完成／释放的应用 operation record，不是 SQE/CQE 总数或 NIC 可用槽。Linux 包含仍活跃的 ZC guard，Windows 包含 deferred RIO submission；Android 相应字段为 `None`。RIO 分区在其他平台或原生窗口已退役后为 `None`，不能把缺失当成零压力。
 - `last_pool_blocked_lanes()` 只记录上次补挂失败；内存刚归还但未再尝试时可仍非零。failure counter 只在真实替换分配 `WouldBlock` 时递增并饱和，worker 累计值跨 socket 关闭保留；它不是丢包数。
 
-成功查询无分配、不复制 payload、不调用 OS、不 poll／回收／重投／修改 credits／唤醒。它按需扫描有界表和 free extents，不能当作逐包热路径计数器。无运行中 worker 返回 `NotConnected`，错误 worker／销毁 Runtime 沿用 socket 上下文错误；完成回调重入遇到 Core／driver 可变借用时返回 `WouldBlock` 而非 panic。快照不持有资源，可以交给上层展示或序列化；跨 worker 不承诺同一时刻一致，也不附带采样线程、日志、exporter 或自动容量调整。
+成功查询无分配、不复制 payload、不调用 OS、不 poll／回收／重投／修改 credits／唤醒。它按需扫描有界表和 free extents，不能当作逐包热路径计数器。无运行中 worker 返回 `NotConnected`，错误 worker／销毁 Runtime 沿用 socket 上下文错误；实际遇到 Core／driver 可变借用时返回 `WouldBlock` 而非 panic，借用已释放后的完成回调可以成功查询。快照不持有资源，可以交给上层展示或序列化；跨 worker 不承诺同一时刻一致，也不附带采样线程、日志、exporter 或自动容量调整。
 
 ## Linux 优化策略
 
@@ -354,6 +358,16 @@ cargo run --release --all-features --example loopback -- --enable zc-rx-nodev --
 Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用普通 App，支持 `-Abi x86_64` 和 `-Abi arm64-v8a`，不依赖 Gradle。NDK 目标和 APK 最低版本为 API23，JNI 库采用 16KiB ELF／APK 对齐和真正未压缩的 ZIP 条目，并保留 API23 所需的 v1 签名。界面、`RivetSmoke` logcat 标签和私有 `files/smoke-result.json` 给出结构化结果；每次进程运行先清除旧成功状态，JNI 初始化失败也持久化。验证 APK 的 debuggable 配置和测试签名不能用于生产应用。
 
 ### 已执行的原生验证
+
+全库审查修复的本轮验证（2026-09-30）：
+
+- 修复前冻结的外部消费者及独立测试复现十项缺陷：Linux 错误发布越过额度、同步／原生注销重入死锁、Core／timer 取消重入、panic payload 二次 unwind、Android GRO／别名 FIN、已销毁 owner 的错误身份，以及 Windows RIO 错误码和 Winsock 测试生命周期。修复后相同消费者通过，并保留对应行为回归。
+- Windows x64 IPv4：默认与 `--all-features --all-targets` 各 **163 通过、0 失败**；跨 Runtime 的 registered UDP 回归另在独立新进程通过。`loopback`、`native_traits`、`runtime_services` 双 worker 实跑通过。
+- Linux x86_64：签名固定的 **6.18.54-1-lts** 隔离 TCG guest 内，全 feature 与精简构建分别 **184／151 通过、0 失败**，34 个测试 ELF 均校验 SHA-256、零退出码及最终关机；上述三个实际消费者也通过。包含真实 multishot 数据后 RST、零额度错误退休与接收存储回收。6.18 不具备的 incremental、普通 fixed SEND/RECV 和 SQ_REWIND 路径明确报告不可用，不计作这些优化的 native 证据。
+- Android API37／x86_64／16KiB 页、SELinux Enforcing：全 feature 与精简构建在 shell 下各 **159 通过、0 失败**；普通 App UID 10230 的 **20 项场景通过**，新增默认／Off GRO 导入的 IPv4／IPv6 分段和截断，以及保留宿主 FD 别名时的普通 FIN／abort RST。APK 完成 API23 下限、v1 签名与 16KiB 对齐检查；App 界面及持久化 JSON 都显示本轮通过。
+- Windows MSVC、Linux x86_64 musl、Android x86_64／ARM64 的全 feature／all-targets 严格 Clippy，以及严格 rustdoc、根包和独立 Android 包格式检查通过。ARM64 编译不冒充原生执行。
+- WSL 6.18.33.2 的直接探针证实修复前／后的 Linux credit 行为，但完整 suite 曾在导入前的 GRO 聚合前置条件失败（原生 peek 为 4 而非 8）；该失败日志保留，Linux 完整验收采用上述固定 guest，不通过重跑或放宽聚合断言掩盖。另一个跨发送者顺序假设已被不经过 Rivet 的原生 UDP 对照反证，回归现在逐包验证唯一内容／元数据而不要求全局到达顺序。
+- 未执行 Windows IPv6、Linux ARM64、Android ARM64／API23 本轮原生场景，也未执行物理 NIC／硬件零拷贝或吞吐验证；没有修改宿主网络、安全策略或内核。命令、修复前后结果和 guest 日志索引：`artifacts/full-fix-probes/verification-summary.json`。
 
 资源可观测性改进的本轮验证（2026-09-28）：
 
