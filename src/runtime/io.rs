@@ -265,6 +265,9 @@ impl IoState {
     pub(super) fn take_callbacks(&mut self) -> [Option<Callback>; 2] {
         std::mem::take(&mut self.callbacks.0)
     }
+    pub(super) fn has_retired_waiters(&self) -> bool {
+        !self.retired.is_empty()
+    }
     pub(super) fn take_deferred_callback(&mut self) -> Option<Callback> {
         let key = self.retired.pop_front()?;
         let slot = match key {

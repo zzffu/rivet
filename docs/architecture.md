@@ -72,7 +72,9 @@ Driver 是内部 Interface；公开 Interface 不暴露内核队列、buffer ID 
 
 Core 先处理完整完成批次并更新绝对发布额度，再释放 Core／driver／事件表借用并分发有界、带代际身份的唤醒。取消和消费会移除旧唤醒源；回调内的 I/O 不递归展开剩余批次。计时器先移除节点和归还额度，再在借用外唤醒。Waker 的 clone／wake／drop 均可能运行用户代码，不能跨这些调用持有上述借用或等待者锁。
 
-接收／接受 waiter 的取消只触碰 Core，立即释放逻辑 lane 并摘除旧唤醒源，不借用 Driver，也不顺带分发其他就绪源。若外层仍在执行原生 setup／poll，则将 waiter 标记为已取消，由预分配、至多 `2 * max_sockets` 个带代际 source 的退休队列保留 Waker；新 waiter 可替换该记录，快照不把它算作已注册 waiter。替换／关闭先移除退休 key，再在借用外销毁 Waker，因此重入不能累积历史注册，也不递归清空整个退休批次。
+接收／接受 waiter 的取消在 Core 中立即释放逻辑 lane 并摘除旧唤醒源，不借用 Driver，也不顺带分发其他就绪源。若外层仍在执行原生 setup／poll，则将 waiter 标记为已取消，由预分配、至多 `2 * max_sockets` 个带代际 source 的退休队列保留 Waker；新 waiter 可替换该记录，快照不把它算作已注册 waiter。替换／关闭先移除退休 key，再在借用外销毁 Waker，因此重入不能累积历史注册，也不递归清空整个退休批次。
+
+退休队列从空变为非空时，Worker 通过既有 notifier 通知 native poll。宿主 hook 可能在 clear/recheck 之后、原生等待之前执行；待运行的析构本身也是工作，不能依靠 socket 完成、timer 或该析构稍后发出的用户唤醒才能退出等待。通知只解除原生等待，Waker 析构仍须等待借用结束和发布完成。
 
 bind/listen/import/Connect 和 Driver 轮询使用同一回调边界，覆盖 Windows AcceptEx 子 socket 的宿主 hook。成功时先完成 Core 发布／事件批次与额度更新，或把 Connect token 交给 Future，再销毁延期 Waker；同步拒绝和 hook unwind 同样排空。延期析构可重新进行原生 I/O；其正常运行期首个 panic 在其余清理完成后传播，已有 hook panic 不被析构／payload 的二次 panic 覆盖。hook 本身只承诺可取消保持 socket 存活的纯 waiter，不承诺任意原生 I/O 重入。
 

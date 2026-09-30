@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 修复延期 Waker 析构可能滞留在 Windows 无限 IOCP 等待中的死锁：退休队列从空转为非空即通知既有 worker notifier，不借用 Driver、不提前析构。新增无 peer、无 payload／runtime timer 的子进程回归：真实 accept 准备错误的 inline wake 在非阻塞 pass 后注册另一个 accept，其 hook 取消的 Waker 析构是 root 唯一通知源；外部 watchdog 不参与运行时唤醒。
 - 补全宿主 hook 取消 waiter 后的 Waker 析构边界：bind／import／Connect 及 Driver poll（含 Windows AcceptEx 子 socket hook）先完成 Core 发布／token 交接再销毁 Waker；采用预分配、保留 source 身份的有界退休队列，支持析构中的原生 I/O、lane 替换和反复回滚，不累积历史注册。错误／unwind 也排空，正常首个 panic 仍传播。
 - 析构重入补全验证：Windows 三种构建各 173 项，Linux 6.18 全 feature／精简 195／159 项，Android API37 两种构建的相关套件各 50 项通过；三平台真实消费者各四种组合通过，严格 Clippy／格式／rustdoc 通过。补充建连握手修正既有 Linux RST 回归的时序假设；具体证据和未执行平台见 README。
 - 修复宿主 hook 内取消 accept/TCP/UDP/batch waiter 的借用 panic 与 lane 遗留：纯取消只触碰 Core；Connect 分离准入与原生提交，hook 不再跨 Core 借用，同步拒绝回收 token/Waker。

@@ -732,10 +732,19 @@ impl Worker {
         }
     }
     pub(crate) fn cancel_io_waiter(&self, key: u64, id: u64, accept: bool) {
-        let waker = self
-            .io
-            .borrow_mut()
-            .cancel_waiter(key, id, accept, self.deferring_io.get());
+        let (waker, notify) = {
+            let mut io = self.io.borrow_mut();
+            let defer = self.deferring_io.get();
+            let was_empty = defer && !io.has_retired_waiters();
+            let waker = io.cancel_waiter(key, id, accept, defer);
+            (waker, was_empty && io.has_retired_waiters())
+        };
+        if notify {
+            // A hook can retire a waiter after the worker's clear/recheck,
+            // before Driver enters an indefinite wait. Its destructor is
+            // runnable work, even when no socket completion can arrive.
+            self.shared.notifier.notify();
+        }
         // Release the logical lane now, but defer user Drop until the outer
         // native setup has released Driver and published its resource.
         if let Some(waker) = waker {

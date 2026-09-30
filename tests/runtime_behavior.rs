@@ -2118,6 +2118,171 @@ mod hook_waker_destruction {
         });
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn deferred_hook_drop_wakes_an_idle_native_poll() {
+        const CHILD: &str = "RIVET_DEFERRED_HOOK_DROP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::process::{Child, Command};
+            struct Guard(Child);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = Guard(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "hook_waker_destruction::deferred_hook_drop_wakes_an_idle_native_poll",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap(),
+            );
+            // An external watchdog cannot supply an accidental timer/root wake.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "peerless hook child failed: {status}");
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "deferred destructor stranded in native poll without a peer"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[derive(Default)]
+        struct State {
+            armed: AtomicBool,
+            inline: AtomicBool,
+            in_hook: AtomicBool,
+            cancelled: AtomicBool,
+            dropped: AtomicBool,
+        }
+        struct DropRoot {
+            state: Arc<State>,
+            root: Waker,
+        }
+        impl Wake for DropRoot {
+            fn wake(self: Arc<Self>) {
+                panic!("no peer can complete the victim accept");
+            }
+        }
+        impl Drop for DropRoot {
+            fn drop(&mut self) {
+                assert!(!self.state.in_hook.load(Ordering::Acquire));
+                assert!(self.state.cancelled.load(Ordering::Acquire));
+                runtime::resource_snapshot().unwrap();
+                self.state.dropped.store(true, Ordering::Release);
+                self.root.wake_by_ref();
+            }
+        }
+        struct ArmAccept(Arc<State>);
+        impl Wake for ArmAccept {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                if self.0.inline.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let mut waiters = WAITERS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+                assert!(
+                    waiters[0]
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                WAITERS.with(|slot| *slot.borrow_mut() = waiters);
+            }
+        }
+
+        let mut limits = config(1);
+        limits.idle_spin = Duration::ZERO;
+        limits.limits.max_pending_accepts = 1;
+        limits.limits.completion_budget = 64;
+        let mut owner = Runtime::new(limits).unwrap();
+        owner.block_on(async {
+            let state = Arc::new(State::default());
+            let victim = Rc::new(TcpListener::bind(address(false)).unwrap());
+            let hook_state = state.clone();
+            let late = Rc::new(TcpListener::bind_with_options(address(false), SocketOptions {
+                hook: Some(Arc::new(move |_: rivet::socket::BorrowedSocket<'_>| {
+                    if hook_state.armed.swap(false, Ordering::AcqRel) {
+                        assert!(hook_state.inline.load(Ordering::Acquire));
+                        hook_state.in_hook.store(true, Ordering::Release);
+                        assert!(cancel_registered_io());
+                        hook_state.cancelled.store(true, Ordering::Release);
+                        assert!(!hook_state.dropped.load(Ordering::Acquire));
+                        hook_state.in_hook.store(false, Ordering::Release);
+                        eprintln!("accept hook retired its waiter; root awaits only its destructor");
+                    }
+                    Ok(())
+                })),
+                ..SocketOptions::default()
+            }).unwrap());
+            state.armed.store(true, Ordering::Release);
+
+            // Fail child preparation, not bind: the nonblocking driver pass
+            // publishes an accept error without any connection or payload.
+            let first = AtomicBool::new(true);
+            let trigger = TcpListener::bind_with_options(address(false), SocketOptions {
+                hook: Some(Arc::new(move |_: rivet::socket::BorrowedSocket<'_>| {
+                    if first.swap(false, Ordering::AcqRel) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                    }
+                })),
+                ..SocketOptions::default()
+            }).unwrap();
+            let mut trigger_accept = trigger.accept();
+            let mut started = false;
+            std::future::poll_fn(|cx| {
+                if !started {
+                    started = true;
+                    let listening = victim.clone();
+                    let mut accept = Box::pin(async move { let _ = listening.accept().await; });
+                    let waker = Waker::from(Arc::new(DropRoot {
+                        state: state.clone(),
+                        root: cx.waker().clone(),
+                    }));
+                    assert!(accept.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                    CANCELLED_IO.with(|slot| *slot.borrow_mut() = Some(accept));
+                    drop(waker);
+                    let listening = late.clone();
+                    WAITERS.with(|slot| slot.borrow_mut().push(Box::pin(async move {
+                        let _ = listening.accept().await;
+                    })));
+                    // Inline wake registers the next accept after the
+                    // nonblocking pass; it deliberately never wakes root.
+                    let waker = Waker::from(Arc::new(ArmAccept(state.clone())));
+                    assert!(Pin::new(&mut trigger_accept).poll(&mut Context::from_waker(&waker)).is_pending());
+                }
+                if state.dropped.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }).await;
+            assert!(state.inline.load(Ordering::Acquire));
+            assert!(state.cancelled.load(Ordering::Acquire));
+            assert_eq!(trigger_accept.await.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            let mut replacement = victim.accept();
+            assert!(Pin::new(&mut replacement).poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            drop(replacement);
+            let waiters = WAITERS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+            drop(waiters);
+        });
+    }
+
     fn replace_retired_lane_repeatedly() {
         struct Registration(Arc<AtomicUsize>);
         impl Wake for Registration {

@@ -360,6 +360,12 @@ Android 使用 [`android-smoke/build.ps1`](android-smoke/build.ps1) 构建专用
 
 ### 已执行的原生验证
 
+延期析构唤醒 native poll 的补充验证：
+
+- Windows 无 peer 消费者确认前述全 poll 延期存在活性缺口：在非阻塞 pass 的真实 accept 错误通知中注册后续 accept，其准备 hook 取消另一 waiter 后，修复前一直等在原生路径，8 秒外部 watchdog 终止；修复后仅由被取消 Waker 的析构通知 root，接受 lane 可重用，整个 Runtime 正常关闭。没有连接 peer、发送 payload 或注册 runtime timer。
+- Windows x64 IPv4：默认、全 feature、精简构建的 all-targets 各 **174 通过、0 失败**；五项 hook 回归（含外部 watchdog 隔离的新无 peer 回归）和三个双 worker 示例实跑通过。隔离 Linux **6.18.54-1-lts** TCG guest 中，`runtime_behavior` 全 feature／精简分别 **36／34 通过**，`native_traits` 实跑通过。
+- Windows／Linux x86_64／Android 双 ABI 严格 Clippy、格式和严格 rustdoc 通过。Android 本轮仅交叉检查；未重跑完整 Linux 套件、Windows IPv6、Android App／真机或物理 NIC 场景。修复前后冻结消费者及报告索引：`artifacts/deferred-poll-wake/verification-summary.json`；临时消费者源码在验证后删除。
+
 Waker 析构重入补全验证：
 
 - 修复前的安全 `Wake` 外部消费者中，accept／UDP recv 注册的最后一个 Waker 在 bind／Connect hook 内销毁并重新 bind，四种组合均触发 `RefCell already borrowed`；修复后四种组合在 Windows、Linux 和 Android 原生环境全部通过，并验证外层新连接、原 lane 的实际字节和 UDP 来源。修复前证据保留在 `artifacts/waker-hook-drop-probe/results.json`。
